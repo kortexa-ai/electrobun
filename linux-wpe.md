@@ -561,3 +561,92 @@ No research questions left at this level. Every dependency is installed and work
 - Phase 7 generalizes 2.5's launch infra.
 - Phase 8 reorganizes commits for upstream PR (Commit 1–3 first as a refactor, then 2.1–2.5 as the functional chunk).
 
+---
+
+## 12. Next session — Phase 2.2–2.5 focus brief
+
+**Picking up from commit `9a160c6e` on `kortexa/linux-wpe`.** Everything this session's work established is committed. Webcam feedback loop is confirmed working (`ffmpeg -f v4l2 -i /dev/video0 ...` on the Pi → readable JPG of the bar screen).
+
+### State at start of next session
+
+Already done:
+- Phase 0 (5/5 validation steps; results in §5).
+- Phase 1 Commits 1–3: `backend.h`, `Rect` migration in `nativeWrapper.cpp`, `abstract_view.h` with forward-declared `GtkWidget`.
+- Phase 2 backend classes (`DrmDisplay`, `InputDispatcher`, `WpeBackend`, `WpeWebViewImpl`) all written, compiling clean against installed system packages.
+- Phase 2 standalone test binaries (`drm_hello`, `wpe_hello`) proven end-to-end: HTML/CSS render, JS executes, touch→click works on a capacitive screen.
+- `~/src/hello-embedded/` sibling project: real Electrobun layout (`src/bun/index.ts`, `src/main/{index.html,index.ts}`, `electrobun.config.ts`, `package.json`, `tsconfig.json`). Portable — `bun run build` on stock Electrobun produces the normal desktop binary.
+
+Not done:
+- **Phase 2.2** — `nativeWrapper_wpe.cpp` (parallel FFI surface).
+- **Phase 2.3** — `package/build.ts` third Linux link step producing `libNativeWrapper_wpe.so`.
+- **Phase 2.4** — `package/src/cli/index.ts` — `build.linux.embedded: true` flag + target selection.
+- **Phase 2.5** — systemd unit, SIGINT/SIGTERM cleanup, `hello-embedded` working through `bun run build:embedded`.
+
+### Concrete exit criterion for the next session
+
+On the Pi, from a clean checkout:
+
+```bash
+cd ~/src/hello-embedded
+bun install
+bun run build:embedded
+sudo openvt -c 2 -s -f -- ./dist/linux-embedded/hello-embedded
+```
+
+A webcam snap of the bar screen shows "Hello, Electrobun." with the frame counter ticking and the click counter incrementing when the touchscreen is pressed — **delivered by Electrobun's own build pipeline, not by a throwaway test binary**.
+
+### Recommended order of attack
+
+1. **Phase 2.2 first.** Read `nativeWrapper.cpp` to inventory the 75 `ELECTROBUN_EXPORT` functions. Partition into three groups in `nativeWrapper_wpe.cpp`:
+   - **Real routings (~15):** `createGTKWindow` / `initWebview` / `loadURL*` / `loadHTML*` / `resizeWebview` / `startEventLoop` / `stopEventLoop` / `shutdownApplication` / `waitForShutdownComplete` / `setWindowTitle` / `showWindow` / `hideWindow` / `closeWindow` / `webviewGoBack` / `webviewGoForward` / `webviewReload` / `webviewCanGoBack` / `webviewCanGoForward`. These dispatch to `currentDisplayBackend()`, `currentWebviewBackend()`, or `AbstractView`'s virtual methods.
+   - **Implement-as-degenerate (~10):** `getAllDisplays` / `getPrimaryDisplay` / `getWindowFrame` / `getWindowSize` (one fullscreen display always; report `DrmDisplay::logicalWidth()` × `logicalHeight()`).
+   - **Noop stubs (~50):** clipboard, tray, file dialogs, global shortcuts, CEF-specific, menu bars, etc. Return 0/nullptr/false, log to stderr at WARN level on first call.
+
+2. **Phase 2.3** — read `package/build.ts` ~line 1860 for the existing Linux branch that compiles `nativeWrapper.cpp` and links twice (GTK + CEF). Add a third link step:
+   - Compile `nativeWrapper_wpe.cpp` + `wpe/wpe_backend.cpp` + `wpe/drm_display.cpp` + `wpe/input.cpp`.
+   - `pkg-config --libs wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0`.
+   - Output: `libNativeWrapper_wpe.so`.
+   - Add to the dist copy at ~line 669.
+
+3. **Phase 2.4** — `package/src/cli/index.ts`:
+   - Add `bundleWPE` / `build.linux.embedded` field in Linux defaults (~lines 1497/1511/1518).
+   - Binary selection at ~line 2739 picks `libNativeWrapper_wpe.so` when the flag is set.
+   - Arbitrate with `bundleCEF` (mutually exclusive).
+   - Target triple `linux-embedded-aarch64` registered for Zig self-extractor.
+
+4. **Phase 2.5** — packaging + launch:
+   - `hello-embedded/electrobun.config.ts` → add `build: { linux: { embedded: true } }`.
+   - `bun run build:embedded` script already exists in `package.json`.
+   - Systemd template (`hello-embedded.service`) — `ExecStart=/path/to/binary`, seat grabbing, `Restart=on-failure`.
+   - SIGINT/SIGTERM handler in `WpeBackend::teardown()` that `drmDropMaster()` before `close(fd)`.
+   - Document the "boot to kiosk" workflow in the hello-embedded README.
+
+### Things that will probably trip us up
+
+- **Bun FFI symbol resolution.** If any of the ~75 FFI functions is missing from `nativeWrapper_wpe.cpp`, `dlsym` fails at Bun startup and the app crashes before rendering anything. Easy fix; painful to diagnose at 2am. Inventory first, stub all 75, *then* write real implementations.
+- **`isCEFAvailable()` must return `false`** on the embedded `.so` and never touch CEF code paths. Bun's FFI layer probably guards on this.
+- **`views://` URL scheme handler.** Electrobun's views:// scheme is handled by the WebKit side (a URL scheme callback). Verify `WpeBackend::createWebview` wires this on WPE WebKit — likely `webkit_web_context_register_uri_scheme` on the shared `WebKitWebContext`, mirroring what `nativeWrapper.cpp` does for the GTK backend.
+- **ASAR resolution.** The project's built assets land inside an ASAR archive (see `shared/asar.h`). The WPE path has to resolve `views://main/index.html` out of ASAR the same way the GTK path does. Reuse `nativeWrapper.cpp`'s ASAR code via `shared/` includes.
+- **Startup order.** Bun calls `simpleTest()` → `startEventLoop()` (which blocks in `g_main_loop_run`). Windows and webviews are created *from* callbacks on the main loop, not before `startEventLoop`. `WpeBackend::createWindow` must be tolerant of being called before `runEventLoop`.
+- **Clean shutdown.** `drmDropMaster` before `close(fd)`, or the next VT's login session can't take the display. Install a signal handler that sets a flag and exits from the main loop rather than calling `exit()` directly.
+
+### Smoke-test plan once 2.2–2.4 are in
+
+Before doing packaging (2.5), smoke-test the build system in isolation:
+```bash
+cd ~/src/electrobun/package
+bun build.ts  # or the relevant build entry; verify libNativeWrapper_wpe.so appears
+ldd dist/.../libNativeWrapper_wpe.so  # confirm it links
+nm -D dist/.../libNativeWrapper_wpe.so | grep ELECTROBUN | head -5  # confirm FFI symbols exported
+```
+
+Then run `bun run build:embedded` on hello-embedded and inspect the produced `dist/linux-embedded/` tree. If the binary exists and links cleanly, the webcam-snap test is the final confirmation.
+
+### Context the next session should skip re-establishing
+
+- The 5 Phase 0 findings are locked; don't re-validate.
+- The class structure in `wpe/` is final for Phase 2; don't refactor for taste.
+- `hello-embedded` project shape is final; just wire `build: { linux: { embedded: true } }` when Phase 2.4 is ready.
+- Rotation strategy: CPU blit in Phase 2 (TODO(phase4)), shader in Phase 4. Don't second-guess.
+
+
