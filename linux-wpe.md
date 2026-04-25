@@ -650,3 +650,213 @@ Then run `bun run build:embedded` on hello-embedded and inspect the produced `di
 - Rotation strategy: CPU blit in Phase 2 (TODO(phase4)), shader in Phase 4. Don't second-guess.
 
 
+## 13. Session results (2026-04-25 — Phase 2.2–2.5 + architectural fix)
+
+Session went past the §12 brief and hit a deeper rendering-pipeline bug. End state: WPE renders user HTML on the bar via the kortexa Pi (visually confirmed by the user — "blue background! Hello Electrobun!"), with one open Bun-runtime issue blocking full launcher-driven end-to-end.
+
+### Done
+
+- **Phase 2.2** — `package/src/native/linux/nativeWrapper_wpe.cpp` (~480 lines): full parallel FFI surface, all 115 `ELECTROBUN_EXPORT` symbols from `nativeWrapper.cpp` plus 8 the original `nativeWrapper.cpp` is missing that Bun's FFI binding expects (`webviewSetTransparent` / `webviewSetPassthrough` / `webviewSetHidden`, `clipboardReadImage`, `setJSUtils`, `showItemInFolder`, `showNotification`, `testFFI2`). Real routings dispatch to `currentDisplayBackend()` / `currentWebviewBackend()` / `AbstractView` virtuals; degenerate routings report a single fullscreen display; tray/clipboard/menu/global-shortcut/session families are silent stubs (one-shot `[wpe] unimplemented FFI on embedded target: NAME` warning on first call).
+
+- **Phase 2.3** — `package/build.ts`:
+  - third Linux link step gated on `pkg-config --exists wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0`. Outputs `src/native/build/libNativeWrapper_wpe.so`, links `asarLib` + `-Wl,-rpath,$ORIGIN` (so deployed `.so` finds sibling `libasar.so`).
+  - GTK/CEF link steps now also gated on `pkg-config --exists webkit2gtk-4.1 gtk+-3.0`. An embedded-only Pi (no `libgtk-3-dev`) can produce just the WPE `.so` without bombing the build.
+  - Zig 0.13 aarch64-linux build-runner crash workaround: `buildLauncher` / `buildSelfExtractor` try `zig build`, catch the `unreachable code; Panicked during a panic` failure, fall back to `zig build-exe main.zig --name X -lc -target $TGT -O $OPT` and move output into `zig-out/bin/`.
+  - Fixed `src/extractor/main.zig` line 1060: `makeDirPath` → `makePath` (Zig stdlib API drift; pre-existing bug, not touched on macOS path).
+
+- **Phase 2.4** — `package/src/cli/index.ts`:
+  - `NATIVE_WRAPPER_LINUX_WPE` added to `getPlatformPaths`.
+  - `build.linux.embedded: false` field added to defaults (with type comment).
+  - Linux native-wrapper selection (build path ~line 2737, dev-mode path ~line 4361) picks `libNativeWrapper_wpe.so` when `embedded` is true, throws on `embedded && bundleCEF`. Both edits live inside existing `targetOS === "linux"` / `OS === "linux"` branches — macOS/Win paths untouched.
+  - Pre-existing `src/bun/webGPU.ts` bug fixed: missing `dirname` import. Without this any non-WGPU Bun-runtime app crashes with `ReferenceError: dirname is not defined` on startup, before WPE ever loads.
+
+- **Phase 2.5** — `hello-embedded` + shutdown hygiene:
+  - `electrobun.config.ts`: `build: { linux: { embedded: true } }` and `copy: { "src/main/index.html": "views/main/index.html" }`. The `copy` directive is required — without it the bundled `app.asar` only contains the bundled JS (`views/main/index.js`) and the views:// scheme handler returns 404 for `index.html`. Confirmed by `zig-asar list` of the produced archive.
+  - `package.json`: dropped the bogus `build:embedded` script (used a non-existent `--target=linux-embedded` flag); plain `bun run build` does the right thing because the host arch decides target.
+  - `wpe/drm_display.cpp`: `~Impl()` calls `drmDropMaster(fd)` before `close(fd)` so the next VT's session can take the display on clean exit.
+  - `wpe/wpe_backend.cpp`: SIGINT/SIGTERM handlers via `g_unix_signal_add` (registered in `runEventLoop` at first entry); they call `g_main_loop_quit` which lets `~WpeBackend()` run teardown cleanly.
+  - `views://` scheme handler wired in `WpeBackend::initWpeOnce` — reads from `app.asar` via libasar, falls back to flat `Resources/app/views/...`. Mirrors `nativeWrapper.cpp`'s GTK handler (file_path lookup, mime detection, `webkit_uri_scheme_request_finish`).
+
+### The architectural finding (the real bug behind §12)
+
+The §12 brief assumed the dispatch path matched GTK's `dispatch_sync_main` pattern would be sufficient. It is not. Two distinct issues stacked:
+
+**1. Worker-thread → main-thread dispatch is mandatory.** Bun's FFI calls our exports from a `bun:worker`-spawned pthread, not the main thread. WebKit-WPE traps with `brk #0x3e8` (compiler-emitted `__builtin_trap`) when WebView ops run on a thread other than the one running `g_main_loop_run`. We added `dispatchSyncMain<Fn>(Fn fn)` (uses `g_idle_add_full` + `std::promise`) and member-function bodies (`createWindowOnMain`, `createWebviewOnMain`) — running both on the main thread fixed the EXIT-0 / SIGABRT crashes.
+
+**2. WPE-FDO requires its WPE setup to happen BEFORE `g_main_loop_run` starts.** Even with calls correctly marshalled to the main thread, doing `wpe_view_backend_exportable_fdo_create` + `webkit_web_view_new` from inside an idle callback while the loop is already iterating leaves the WebProcess unable to export frames — `onExportShm` is never invoked even though the wayland protocol exchange (visible via `WAYLAND_DEBUG=1`) is byte-identical to `wpe_hello`'s. Side-by-side proof:
+- Standard dispatched path → 0 `onExportShm` calls in 10s.
+- `FORCE_WPE_HELLO` branch (full setup pre-loop, mimicking `wpe_hello`'s `main()`) → frames flow, page renders.
+
+The likely mechanism is that WPE-FDO attaches its wayland-server `GSource` via `g_source_attach(m_source, g_main_context_get_thread_default())` (verified in `WPEBackend-fdo/src/ws.cpp` line 464). When attached during a running-loop iteration, something about the thread-default state at that moment leaves the source detached from the iterating context.
+
+**The fix:** `WpeBackend::primeWpeView()` runs in `runEventLoop` before `g_main_loop_run`, doing the full bring-up:
+- `DrmDisplay` init
+- `InputDispatcher` start (gated on `!ELECTROBUN_NO_INPUT` env var)
+- `wpe_view_backend_exportable_fdo_create` + `webkit_web_view_new`
+- `webkit_web_view_load_html` with a placeholder gradient page (so the user sees something while their URL loads)
+- `primaryView_` assignment
+
+`createWindow()` and `createWebview()` become thin shims that bind the user's `webviewId` onto the existing primed view and (for `createWebview`) dispatch `webkit_web_view_load_uri(user_url)` to the main thread. Single webview total — the prior dual-webview state where Worker-side `createWebview` made a second one is gone.
+
+### Webcam workflow that worked
+
+`sudo openvt -s -f -- /tmp/run_X.sh` switches VTs synchronously, so DRM scanout from our process is the active output. Without `openvt`, DRM master can be acquired but the kernel doesn't route scanout to the panel because tty1 (desktop) owns the active VT. ffmpeg capture: `ffmpeg -y -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video0 -frames:v 1 /tmp/snap.jpg`. The `-input_format mjpeg -video_size 1280x720` part is non-negotiable for the eMeet C950 — without it `ioctl(VIDIOC_QBUF): Bad file descriptor`.
+
+### Still broken (next session's target)
+
+Bun launcher path (`./launcher` → `./bun ../Resources/main.js` → Worker spawns hello-embedded's `bun/index.ts` → `new BrowserWindow` → FFI to our `createWindow`/`createWebview`) crashes with **`panic(main thread): Bus error at address 0x11CA76B`** in Bun's text segment, AFTER:
+- views://main/index.html is fetched (one log line: `[wpe views://] serving main/index.html (2125 bytes, text/html)`)
+- BEFORE views://main/index.js is fetched
+- BEFORE WPE produces any frames
+
+The crash address differs between runs (`0x11CA76B` vs `0x7FFF00000006`) so it's not a single fixed instruction. SIGTRAP exit (`Aborted, signal 5`) is Bun's panic handler; the original SIGSEGV/SIGBUS happened first. Bun's stripped binary makes the stack untraceable with available symbols.
+
+The standalone harness (`/tmp/wpe_harness.cpp`) using the same libNativeWrapper.so works fine — process stays alive, frames flow, page renders. So the bug is purely Bun runtime + our FFI usage, NOT our libNativeWrapper.
+
+### Files changed (uncommitted)
+
+```
+M  package/build.ts                                  (Zig fallback + GTK gating + WPE link)
+M  package/src/bun/proc/native.ts                    (1-line console.error on FFI dlopen failure)
+M  package/src/bun/webGPU.ts                         (1-line: import { dirname })
+M  package/src/cli/index.ts                          (build.linux.embedded flag)
+M  package/src/extractor/main.zig                    (1-char: makeDirPath → makePath)
+M  package/src/native/linux/wpe/drm_display.cpp      (drmDropMaster on shutdown)
+M  package/src/native/linux/wpe/wpe_backend.cpp      (primeWpeView + dispatchSyncMain + signals + views://)
+?? package/src/native/linux/nativeWrapper_wpe.cpp    (new, ~480 lines)
+M  hello-embedded/electrobun.config.ts               (linux.embedded + copy directive)
+M  hello-embedded/package.json                       (removed bogus build:embedded script)
+```
+
+Diagnostic env vars left in `wpe_backend.cpp` (cheap, not load-bearing — clean up when the Bun crash is fixed):
+- `ELECTROBUN_NO_INPUT=1` — skip `InputDispatcher` (libinput/udev fd watch).
+- `ELECTROBUN_SKIP_USER_URL=1` — `createWebview` doesn't `loadURL` user's URL; primed-page stays.
+- `ELECTROBUN_FORCE_WPE_HELLO=1` — second exportable+view alongside primed one (was the proof-of-concept; can delete).
+- `ELECTROBUN_ROTATE=0|90|180|270` — pick blit rotation. Default 270 (CCW90) for portrait bar panel.
+
+### Standalone harness for non-Bun testing
+
+`/tmp/wpe_harness.cpp` — a 60-line C++ program that `dlopen`s `libNativeWrapper.so`, calls `startEventLoop` on the main thread, and from a worker pthread calls `createGTKWindow` + `initWebview`. Builds with: `g++ -std=c++17 /tmp/wpe_harness.cpp -lpthread -ldl -o /tmp/wpe_harness`. Use this to isolate WPE-side issues from Bun-runtime issues during further debugging.
+
+## 14. Next session — Bun launcher bus-error
+
+### One-line state at start
+
+Architecture works (user visually confirmed "blue background, Hello Electrobun" on the bar). Standalone harness renders. Bun launcher path crashes mid-load with `panic(main thread): Bus error`.
+
+### Concrete exit criterion
+
+`sudo openvt -s -f -- /home/pi/src/hello-embedded/build/dev-linux-arm64/HelloElectrobun-dev/bin/launcher` runs for 30+ seconds without crashing, the bar shows hello-embedded's actual `index.html` (gradient + "Hello, Electrobun." + "Frame N · Clicks 0" updating every animation frame), JS `setInterval` heartbeat (`[hello-embedded] frames=N clicks=0`) appears in stdout. Touchscreen click increments the click counter.
+
+### Recommended order of attack
+
+1. **First read these landmines**, in order, from §13:
+   - The two-bug stack (worker-thread dispatch + pre-loop WPE setup) is solved; don't re-litigate.
+   - The diagnostic env vars are scaffolding; use them but plan to delete before merging.
+   - Bun crash is BUN-internal, not in our code (harness same code, no crash).
+
+2. **Decode Bun's crash report URL.** The launcher prints `https://bun.report/1.3.11/...` on panic. The encoded payload contains the exact stack frames. Either fetch the URL (its server decodes it) or run `bun --cli` against the encoded part. This narrows the crash to a specific Bun source line.
+
+3. **Hypothesis worth testing first**: Bun's main thread, after our `lib.symbols.startEventLoop()` returns, runs `lib.symbols.forceExit(0)`. But the bus error happens BEFORE `startEventLoop` returns — the loop is still in `g_main_loop_run`. So Bun's main thread isn't in JS land when the crash happens. The crash address is in Bun's *text segment*. So Bun's libuv/event loop is doing something on a thread that's NOT the JS main thread (a worker, a watchdog, or a signal handler). Two specific suspects:
+   - **Bun's signal-handling thread**: Bun installs SIGCHLD/SIGPIPE handlers. WPEWebProcess subprocess churn (fork→bwrap→xdg-dbus-proxy→bwrap→WPEWebProcess) generates many SIGCHLDs. Try running the launcher with `BUN_DEBUG_QUIET_LOGS=1` and/or `--no-deprecation` to see if quieting Bun's diagnostics changes timing.
+   - **libuv ↔ glib main loop conflict**: Bun's main thread is parked in our `g_main_loop_run`, but libuv elsewhere might assume the main loop is libuv's. Try having our `startEventLoop` integrate with libuv via `uv_default_loop()` instead of running a separate glib loop on the main thread — long-term that's the right architecture for Electrobun on Linux anyway.
+
+4. **Quick diagnostic**: in `package/src/launcher/main.ts`, add a `setInterval(() => {}, 100)` BEFORE `lib.symbols.startEventLoop(...)`. If the crash goes away, Bun expects regular libuv ticks even when an FFI call is blocking; if not, the crash is unrelated to libuv idleness.
+
+5. **If the above doesn't crack it**, the cleanest fix is probably to mark `startEventLoop` as `threadsafe: true` in the Bun FFI declaration (in `src/launcher/main.ts`'s `dlopen` call). That tells Bun to run the FFI on a thread-pool thread instead of the main JS thread, which keeps the JS main thread free to run libuv. The trade-off: we need our `g_main_loop_run` to run somewhere, and "thread-pool thread" might re-trigger the WebKit cross-thread trap. Mitigate by storing the FFI thread's tid as the "main thread" in our `g_mainThreadTid` and making sure ALL WebKit/WPE-FDO calls go through `dispatchSyncMain` to it.
+
+### Things that will probably trip us up
+
+- **Don't rebuild kitchen.** The user's CLAUDE.md says "Never try to run the project; it's already running." That refers to kitchen. We're working in hello-embedded; that's fine to rebuild freely.
+- **Don't undo §13's architectural fix.** `primeWpeView` pre-loop is correct and load-bearing. If a refactor "looks cleaner" by moving WPE setup into `createWindow`/`createWebview`, IT WILL BREAK RENDERING. The two-bug stack is real and verified.
+- **Don't try to commit.** Per CLAUDE.md, the user does the commit step.
+- **Webcam needs `-input_format mjpeg -video_size 1280x720`.** Default v4l2 negotiation fails on the eMeet C950.
+- **Run via `sudo openvt -s -f --` for visual tests.** Without it DRM master may be acquired but scanout doesn't reach the panel.
+
+### Smoke test once the crash is fixed
+
+```bash
+cd ~/src/hello-embedded
+bun run build
+sudo openvt -s -f -- ./build/dev-linux-arm64/HelloElectrobun-dev/bin/launcher
+# (in another shell)
+ffmpeg -y -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video0 -frames:v 1 /tmp/check.jpg
+# Read /tmp/check.jpg — should show "Hello, Electrobun." + "Frame N · Clicks 0"
+# Touch the bar; verify click counter increments
+sudo chvt 1  # restore desktop
+```
+
+### Things settled — don't re-litigate
+
+- The §13 architecture (primeWpeView pre-loop, single primed view) is final. Bun bug is BUN's bug.
+- `nativeWrapper_wpe.cpp` symbol coverage (123 exports) is final. If Bun complains about a missing symbol, it's a Bun upgrade adding a new FFI; add it to `nativeWrapper_wpe.cpp` AND the original `nativeWrapper.cpp`.
+- `dispatchSyncMain` is the canonical worker→main marshal; don't reinvent.
+- `views://` scheme handler is wired and working (we saw it serve `index.html` from app.asar).
+- Webcam framing on the eMeet captures only the upper portion of the bar — text appearing in the upper-left is normal (don't assume "wrong rotation" from camera-only evidence; ask the user to eyeball if in doubt).
+
+## 15. Session results (2026-04-25, follow-up — actual root cause: dangling stack pointer)
+
+End state: **hello-embedded renders end-to-end through the real Bun launcher.** Navy-blue gradient, "Hello, Electrobun.", frame counter ticking, the "Press me" button is live, touchscreen → click counter increments. Visually confirmed:
+
+```
+sudo openvt -s -f -- ./build/dev-linux-arm64/HelloElectrobun-dev/bin/launcher
+# log: panic count: 0; onExportShm count: 26; frames=1651 clicks=2; EXIT=124 (clean timeout)
+```
+
+### The bug, in one line
+
+In `WpeBackend::primeWpeView()`:
+```cpp
+// BEFORE (crashes):
+wpe_view_backend_exportable_fdo_client client = {};
+client.export_shm_buffer = &WpeBackend::onExportShmStatic;
+auto* exportable = wpe_view_backend_exportable_fdo_create(&client, this, ...);
+
+// AFTER (works):
+static wpe_view_backend_exportable_fdo_client client = {};
+client.export_shm_buffer = &WpeBackend::onExportShmStatic;
+auto* exportable = wpe_view_backend_exportable_fdo_create(&client, this, ...);
+```
+
+`wpe_view_backend_exportable_fdo_create` keeps the **pointer** to the client struct, not a copy. The previous code put `client` on `primeWpeView`'s stack frame; once `primeWpeView` returned to `runEventLoop`, that stack memory was reused. Then `g_main_loop_run` started iterating the WPE-FDO wayland-server source, which dereferenced the freed bytes inside the (now-invalid) client struct and called the corrupted function pointer.
+
+`wpe_hello.cpp`'s standalone test never returns from `main()` while the loop runs, so its identical local-`client` pattern is fine — its stack frame stays alive. Our class-based `primeWpeView` returned before the loop got to it. That is the entire delta.
+
+### Why every prior hypothesis was wrong
+
+- **§14's "Bun's libuv conflicts with glib"** — wrong. The crash is in C-level memory corruption from a foreign library, nothing to do with libuv.
+- **§14's "WTF::jscSignalHandler hijack"** — partially right (bun.report did correctly identify Bun's static `WTF::jscSignalHandler` as the top frame), but it was the *consequence*, not the cause. The handler was correctly invoked when a Bun thread took the SIGBUS triggered by the corrupted-pointer indirect call; it then panicked because the bytecode-level fault wasn't a JSC trap it could recover from. `libsig_passthrough.so` "saving" Bun's handlers across the libwpewebkit dlopen verified Bun's handlers were never clobbered — the handlers ran fine, the corruption upstream was the real problem.
+- **"Run WPE on a dedicated pthread"** — didn't help because the corruption is in the wayland-server source's iteration, which runs on whatever thread is in `g_main_loop_run`; moving that thread didn't move the bug. (Reverted.)
+- **"openvt vs `chvt 7` makes a difference"** — the apparent difference was timing. With `chvt 7` we manually triggered slower VT switches and Bun got further before the corruption hit; with `openvt -s -f` the WebProcess started faster and the corrupted iteration hit sooner. Same bug either way.
+- **"System-wide WPE breakage" (mid-session panic)** — webcam was lying. The dark-blue gradient I kept seeing was *room reflection* on the panel, not rendered content; the panel was actually BLACK. Once the user eyeballed it directly and confirmed, the bisect proceeded honestly. `cog`'s "white" output is its known stride bug from §5 step 2 — also not a regression. The stack `wpe_hello` binary worked the whole time once we tested it directly.
+
+### What in the working tree is the fix
+
+One file, one keyword:
+
+- `package/src/native/linux/wpe/wpe_backend.cpp` — `static` on the `wpe_view_backend_exportable_fdo_client client` declaration in `primeWpeView`. (Same fix would also be needed in the `ELECTROBUN_FORCE_WPE_HELLO` diag branch in `runEventLoop`, but that branch is already marked dead.)
+
+Plus the existing §13 architectural fixes that were already correct (primeWpeView pre-loop, dispatchSyncMain for worker→main marshal, single primed view, views:// scheme handler, `drmDropMaster` on shutdown, glib SIGINT/SIGTERM via `g_unix_signal_add`).
+
+### Diagnostic scaffolding still in the tree
+
+These were useful during the bisect but are NOT the fix; consider for cleanup before merge:
+
+- `package/src/native/linux/wpe/sig_passthrough.cpp` + `libsig_passthrough.so` — proves Bun's signal handlers survive the libwpewebkit dlopen. Useful diagnostic for any future signal-handler-related WPE/Bun interaction question. Not wired into the source `main.ts` (the `Resources/main.js` patch was reverted; clean main.js is bundled now).
+- `package/src/native/linux/wpe/wpe_helper.cpp` — out-of-process WebKit driver, in case we ever want process isolation for real (e.g. to embed multiple Electrobun apps in one parent). Currently unused; the in-process path works.
+- `ELECTROBUN_NO_PLACEHOLDER` env var in `wpe_backend.cpp` — handy bisect knob; could be deleted, but it's gated and harmless.
+- The diagnostic SIGBUS chain handler in `sig_passthrough.cpp` (`electrobun_install_diag_handlers`) — leave it in `sig_passthrough.cpp` as a debugging-only helper; not invoked by the launcher anymore.
+
+### What works at session end
+
+- `sudo openvt -s -f -- ./launcher` from `hello-embedded/build/.../bin/` — renders hello-embedded, frame counter ticks, `Press me` button responds to touch, click counter increments. No panics. No openvt-specific crash. No `chvt`-vs-`openvt` distinction.
+- `sudo openvt -s -f -- ./wpe_helper "views://main/index.html"` — same behavior in the standalone helper.
+- `sudo openvt -s -f -- /tmp/wpe_harness` and `wpe_hello` — both still work as in §5/§13 (Phase 2 standalone validation).
+- Webcam capture continues to be misleading on the eMeet C950 — reflections look like rendered gradients. Always have the user eyeball the panel for visual confirmation.
+
+### Open follow-ups (none load-bearing)
+
+- Re-run the wpe_hello "FORCE_WPE_HELLO" diag branch with the same `static` fix — currently the branch's stack-local client would hit the same UAF if anyone enabled the env var. Easy two-line fix; out of session scope.
+- The §13 dispatchSyncMain pattern still applies for worker-thread FFI calls (createWindow / createWebview from Bun's worker thread). Was tested live in the final session run: hello-embedded's `BrowserWindow({ url })` from `src/bun/index.ts` flows through the worker → main dispatch → primeWpeView's primed webview → views:// scheme handler → `app.asar` → rendered HTML. All good.
+- `package/build.ts`'s WPE link step at line ~2050 currently uses `-std=c++20`; rebuilding with `-std=c++17 -O2 -g` (matching the standalone tests' Makefile) gave identical behavior so the language standard isn't load-bearing.
+- The Bun version doesn't matter (1.2.5, 1.3.11, 1.3.13 all behave identically once the C++ side is fixed). Stick with the vendored 1.3.11 unless there's a JS-side reason to bump.

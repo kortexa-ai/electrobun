@@ -131,6 +131,7 @@ function getPlatformPaths(
 		NATIVE_WRAPPER_WIN: join(platformDistDir, "libNativeWrapper.dll"),
 		NATIVE_WRAPPER_LINUX: join(platformDistDir, "libNativeWrapper.so"),
 		NATIVE_WRAPPER_LINUX_CEF: join(platformDistDir, "libNativeWrapper_cef.so"),
+		NATIVE_WRAPPER_LINUX_WPE: join(platformDistDir, "libNativeWrapper_wpe.so"),
 		WEBVIEW2LOADER_WIN: join(platformDistDir, "WebView2Loader.dll"),
 		BSPATCH: join(platformDistDir, "bspatch") + binExt,
 		EXTRACTOR: join(platformDistDir, "extractor") + binExt,
@@ -1607,6 +1608,10 @@ const defaultConfig = {
 		linux: {
 			bundleCEF: false,
 			bundleWGPU: false,
+			// Bare-DRM embedded target (Raspberry Pi kiosks, no compositor).
+			// When true, the Linux build uses libNativeWrapper_wpe.so instead of
+			// the GTK/CEF wrappers. Mutually exclusive with bundleCEF.
+			embedded: false,
 			icon: undefined as string | undefined,
 			defaultRenderer: undefined as "native" | "cef" | undefined,
 			chromiumFlags: undefined as Record<string, string | boolean> | undefined,
@@ -2888,14 +2893,25 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 			// copy webview2 system webview library
 			cpSync(webview2LibSource, webview2LibDestination, { dereference: true });
 		} else if (targetOS === "linux") {
-			// Choose the appropriate native wrapper based on bundleCEF setting
+			// Choose the appropriate native wrapper:
+			//   embedded → libNativeWrapper_wpe.so (bare-DRM kiosk build)
+			//   bundleCEF → libNativeWrapper_cef.so (GTK host, weak-linked CEF renderer)
+			//   otherwise → libNativeWrapper.so (GTK + WebKitGTK)
+			const embedded = config.build.linux?.embedded;
 			const useCEF = config.build.linux?.bundleCEF;
 			cpSync(targetPaths.CORE_LINUX, join(appBundleMacOSPath, "libElectrobunCore.so"), {
 				dereference: true,
 			});
-			const nativeWrapperLinuxSource = useCEF
-				? targetPaths.NATIVE_WRAPPER_LINUX_CEF
-				: targetPaths.NATIVE_WRAPPER_LINUX;
+			if (embedded && useCEF) {
+				throw new Error(
+					"build.linux.embedded and build.linux.bundleCEF are mutually exclusive",
+				);
+			}
+			const nativeWrapperLinuxSource = embedded
+				? targetPaths.NATIVE_WRAPPER_LINUX_WPE
+				: useCEF
+					? targetPaths.NATIVE_WRAPPER_LINUX_CEF
+					: targetPaths.NATIVE_WRAPPER_LINUX;
 			const nativeWrapperLinuxDestination = join(
 				appBundleMacOSPath,
 				"libNativeWrapper.so",
@@ -2906,11 +2922,14 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 					dereference: true,
 				});
 				console.log(
-					`Using ${useCEF ? "CEF (with weak linking)" : "GTK-only"} native wrapper for Linux`,
+					`Using ${embedded ? "WPE/DRM (embedded)" : useCEF ? "CEF (with weak linking)" : "GTK-only"} native wrapper for Linux`,
 				);
 			} else {
 				throw new Error(
-					`Native wrapper not found: ${nativeWrapperLinuxSource}`,
+					`Native wrapper not found: ${nativeWrapperLinuxSource}` +
+						(embedded
+							? " — is libwpewebkit-2.0-dev installed? The WPE build step in `bun build.ts` is gated on pkg-config."
+							: ""),
 				);
 			}
 
@@ -4562,15 +4581,18 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 			if (OS === "linux") {
 				const currentLibPath = join(bundleExecPath, "libNativeWrapper.so");
 				const targetPaths = getPlatformPaths("linux", ARCH);
-				const correctLibSource = config.build.linux?.bundleCEF
-					? targetPaths.NATIVE_WRAPPER_LINUX_CEF
-					: targetPaths.NATIVE_WRAPPER_LINUX;
+				const embedded = config.build.linux?.embedded;
+				const correctLibSource = embedded
+					? targetPaths.NATIVE_WRAPPER_LINUX_WPE
+					: config.build.linux?.bundleCEF
+						? targetPaths.NATIVE_WRAPPER_LINUX_CEF
+						: targetPaths.NATIVE_WRAPPER_LINUX;
 
 				if (existsSync(correctLibSource)) {
 					try {
 						cpSync(correctLibSource, currentLibPath, { dereference: true });
 						console.log(
-							`Updated libNativeWrapper.so for ${config.build.linux?.bundleCEF ? "CEF (with weak linking)" : "GTK-only"} mode`,
+							`Updated libNativeWrapper.so for ${embedded ? "WPE/DRM (embedded)" : config.build.linux?.bundleCEF ? "CEF (with weak linking)" : "GTK-only"} mode`,
 						);
 					} catch (error) {
 						console.warn("Failed to update libNativeWrapper.so:", error);

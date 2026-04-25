@@ -1083,6 +1083,7 @@ export const native = (() => {
 		});
 	} catch (err) {
 		// FFI not available — running as a carrot inside Bunny Ears or in a build-only context.
+		console.error("[electrobun] native FFI dlopen failed:", err);
 		return null;
 	}
 })();

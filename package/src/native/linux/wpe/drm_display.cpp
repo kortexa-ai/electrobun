@@ -72,7 +72,14 @@ struct DrmDisplay::Impl {
                 drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
             }
         }
-        if (fd >= 0) close(fd);
+        if (fd >= 0) {
+            // Drop DRM master before closing. Without this, the next VT's
+            // login session can't take the display on clean exit (the kernel
+            // only releases master on process death, which happens later than
+            // the user expects on a kiosk SIGTERM).
+            drmDropMaster(fd);
+            close(fd);
+        }
     }
 
     void setError(const std::string& msg) {

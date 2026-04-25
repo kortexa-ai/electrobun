@@ -84,6 +84,11 @@ static void blitRotateCCW(const uint8_t* src, int32_t srcStride,
 }
 
 static void onExportShm(void* data, wpe_fdo_shm_exported_buffer* buffer) {
+    static int n = 0;
+    ++n;
+    if (n <= 3 || (n % 60) == 0) {
+        fprintf(stderr, "[wpe_hello] onExportShm #%d\n", n); fflush(stderr);
+    }
     App* app = static_cast<App*>(data);
 
     wl_shm_buffer* shm = wpe_fdo_shm_exported_buffer_get_shm_buffer(buffer);

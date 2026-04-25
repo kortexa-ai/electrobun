@@ -15,6 +15,8 @@
 
 #include "../abstract_view.h"
 #include "../backend.h"
+#include "../../shared/asar.h"
+#include "../../shared/mime_types.h"
 
 #include "drm_display.h"
 #include "input.h"
@@ -26,11 +28,19 @@
 #include <wayland-server.h>
 
 #include <glib.h>
+#include <glib-unix.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +50,131 @@ namespace electrobun {
 namespace wpe {
 
 class WpeBackend;  // fwd
+
+// ---------------------------------------------------------------------------
+// Main-thread dispatch
+//
+// Bun's FFI calls our exports from a Worker thread (different OS thread from
+// the one running g_main_loop_run). WebKit-WPE requires all WebView ops to
+// run on the GMainLoop's thread — calling them off-thread crashes the
+// process inside libWPEWebKit. Mirror nativeWrapper.cpp's dispatch_sync_main
+// pattern: marshal the call to the main loop and block until it finishes.
+// ---------------------------------------------------------------------------
+
+static std::atomic<long> g_mainThreadTid{-1};
+
+static inline bool onMainThread() {
+    long t = g_mainThreadTid.load(std::memory_order_relaxed);
+    return t > 0 && (long)syscall(SYS_gettid) == t;
+}
+
+static void dispatchSyncMain(std::function<void()> fn) {
+    if (onMainThread()) { fn(); return; }
+
+    auto* heap = new std::function<void()>(std::move(fn));
+    std::promise<void> done;
+    auto fut = done.get_future();
+
+    struct Pack { std::function<void()>* fn; std::promise<void>* done; };
+    Pack* pack = new Pack{heap, &done};
+
+    g_idle_add_full(G_PRIORITY_DEFAULT, +[](gpointer ud) -> gboolean {
+        auto* p = static_cast<Pack*>(ud);
+        try { (*p->fn)(); } catch (...) {}
+        p->done->set_value();
+        return G_SOURCE_REMOVE;
+    }, pack, +[](gpointer ud) {
+        auto* p = static_cast<Pack*>(ud);
+        delete p->fn;
+        delete p;
+    });
+
+    fut.wait();
+}
+
+// ---------------------------------------------------------------------------
+// views:// URL scheme handler — reads from app.asar or the filesystem layout.
+// Mirrors the GTK-side handler in nativeWrapper.cpp so hello-embedded's
+// `views://main/index.html` resolves identically on both backends.
+// ---------------------------------------------------------------------------
+
+static AsarArchive*    g_asarArchive = nullptr;
+static std::once_flag  g_asarInitFlag;
+static std::mutex      g_asarReadMutex;
+
+static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
+    const char* fullPath = "index.html";
+    if (uri && std::strncmp(uri, "views://", 8) == 0) {
+        fullPath = uri + 8;
+    }
+
+    gchar* cwd = g_get_current_dir();
+    gchar* resourcesDir = g_build_filename(cwd, "..", "Resources", nullptr);
+    gchar* asarPath = g_build_filename(resourcesDir, "app.asar", nullptr);
+
+    gchar* fileContents = nullptr;
+    gsize  fileSize = 0;
+    bool   foundFile = false;
+
+    if (g_file_test(asarPath, G_FILE_TEST_EXISTS)) {
+        std::call_once(g_asarInitFlag, [asarPath]() {
+            g_asarArchive = asar_open(asarPath);
+            if (!g_asarArchive) {
+                fprintf(stderr, "[wpe] failed to open ASAR at %s\n", asarPath);
+            }
+        });
+        if (g_asarArchive) {
+            std::string asarFilePath = std::string("views/") + fullPath;
+            std::lock_guard<std::mutex> lock(g_asarReadMutex);
+            size_t asarFileSize = 0;
+            const uint8_t* data = asar_read_file(g_asarArchive, asarFilePath.c_str(), &asarFileSize);
+            if (data && asarFileSize > 0) {
+                fileContents = (gchar*)g_memdup2(data, asarFileSize);
+                fileSize = asarFileSize;
+                foundFile = true;
+                asar_free_buffer(data, asarFileSize);
+            }
+        }
+    }
+
+    if (!foundFile) {
+        // Flat-file fallback: Resources/app/views/<fullPath>
+        gchar* viewsDir = g_build_filename(resourcesDir, "app", "views", nullptr);
+        gchar* filePath = g_build_filename(viewsDir, fullPath, nullptr);
+        if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
+            GError* error = nullptr;
+            if (g_file_get_contents(filePath, &fileContents, &fileSize, &error)) {
+                foundFile = true;
+            } else if (error) {
+                fprintf(stderr, "[wpe] failed to read %s: %s\n", filePath, error->message);
+                g_error_free(error);
+            }
+        } else {
+            fprintf(stderr, "[wpe] views:// file not found: %s\n", filePath);
+        }
+        g_free(viewsDir);
+        g_free(filePath);
+    }
+
+    if (foundFile && fileContents) {
+        std::string mime = electrobun::getMimeTypeFromUrl(fullPath);
+        fprintf(stderr, "[wpe views://] serving %s (%zu bytes, %s)\n", fullPath, (size_t)fileSize, mime.c_str()); fflush(stderr);
+        GInputStream* stream = g_memory_input_stream_new_from_data(fileContents, fileSize, g_free);
+        webkit_uri_scheme_request_finish(request, stream, fileSize, mime.c_str());
+        g_object_unref(stream);
+    } else {
+        fprintf(stderr, "[wpe views://] 404 for %s\n", fullPath); fflush(stderr);
+        GError* err = g_error_new(G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "File not found: %s", fullPath);
+        webkit_uri_scheme_request_finish_error(request, err);
+        g_error_free(err);
+    }
+
+    g_free(cwd);
+    g_free(resourcesDir);
+    g_free(asarPath);
+}
 
 // ---------------------------------------------------------------------------
 // WpeWebViewImpl
@@ -69,6 +204,7 @@ public:
     // AbstractView
 
     void loadURL(const char* urlString) override {
+        fprintf(stderr, "[WpeWebViewImpl] loadURL %s (webView=%p)\n", urlString ? urlString : "(null)", (void*)webView_); fflush(stderr);
         if (webView_ && urlString) webkit_web_view_load_uri(webView_, urlString);
     }
     void loadHTML(const char* htmlString) override {
@@ -137,51 +273,70 @@ public:
     // IDisplayBackend
 
     void* createWindow(const WindowSpec& spec) override {
-        (void)spec;  // DRM uses the native display mode regardless.
-        if (display_) return display_.get();
-
-        initWpeOnce();
-
-        DrmDisplayConfig cfg{};
-        cfg.rotation = rotationFromEnv();
-        display_ = std::make_unique<DrmDisplay>(cfg);
-        if (!display_->init()) {
-            fprintf(stderr, "[WpeBackend] DrmDisplay::init failed: %s\n",
-                    display_->getLastError().c_str());
-            display_.reset();
+        (void)spec;  // DRM uses the native display mode; no per-window options.
+        // primeWpeView ran in runEventLoop before the loop started, so display_
+        // already exists. The kiosk has exactly one window — we return its
+        // opaque handle (the DrmDisplay pointer) on every call.
+        if (!display_) {
+            fprintf(stderr, "[WpeBackend] createWindow called before primeWpeView completed\n");
             return nullptr;
         }
-
-        // WPE view is laid out at landscape dims; we rotate-blit to the
-        // (portrait) DRM framebuffer. If DrmDisplay config.rotation is None
-        // and the panel's native mode is portrait, landscape == transpose.
-        rotationQuarters_ = static_cast<int>(cfg.rotation);
-        if (rotationQuarters_ == 1 || rotationQuarters_ == 3) {
-            // If DrmDisplay rotates internally, our logical is already post-rotation.
-            landscapeW_ = display_->logicalWidth();
-            landscapeH_ = display_->logicalHeight();
-        } else {
-            // DrmDisplay didn't rotate; we do. Webview at the swapped dims.
-            landscapeW_ = display_->logicalHeight();  // native vdisplay
-            landscapeH_ = display_->logicalWidth();   // native hdisplay
-        }
-
-        InputDispatcherConfig icfg{};
-        icfg.screenWidth          = display_->logicalWidth();
-        icfg.screenHeight         = display_->logicalHeight();
-        icfg.rotationQuarterTurns = rotationQuarters_;
-        input_ = std::make_unique<InputDispatcher>(icfg,
-            [this](const InputEvent& ev) { this->onInputEvent(ev); });
-        if (!input_->start()) {
-            fprintf(stderr, "[WpeBackend] InputDispatcher::start failed (continuing without input)\n");
-        }
-
         return display_.get();
     }
 
     void runEventLoop() override {
+        long tid = (long)syscall(SYS_gettid);
+        g_mainThreadTid.store(tid, std::memory_order_relaxed);
+        fprintf(stderr, "[WpeBackend] runEventLoop: entering on tid=%ld (recorded as main thread)\n", tid); fflush(stderr);
+
+        // WPE-FDO requires its wayland-server source AND the WebKitWebView to
+        // exist before g_main_loop_run starts iterating. Setting these up
+        // lazily from inside a dispatched callback (after the loop is already
+        // running) leaves the WebProcess unable to export frames — empirically
+        // zero onExportShm callbacks fire even though the wayland protocol
+        // exchange looks identical to wpe_hello's. So we do the full setup
+        // now, with a blank URL (the user's createWebview call later swaps in
+        // their URL).
+        primeWpeView();
+
+        if (g_getenv("ELECTROBUN_FORCE_WPE_HELLO")) {
+            fprintf(stderr, "[WpeBackend] FORCE: creating second exportable+view\n"); fflush(stderr);
+            wpe_view_backend_exportable_fdo_client client = {};
+            client.export_shm_buffer = &WpeBackend::onExportShmStatic;
+            auto* exportable2 = wpe_view_backend_exportable_fdo_create(&client, this, landscapeW_, landscapeH_);
+            auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable2);
+            WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
+            WebKitWebView* webView = webkit_web_view_new(webviewBackend);
+            WebKitSettings* settings = webkit_web_view_get_settings(webView);
+            webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+            webkit_web_view_load_html(webView,
+                "<html><body style='background:#1e2a56;color:#ffbe2e;font-size:140px;text-align:center;padding-top:120px;font-family:sans-serif'>FORCE 2nd</body></html>",
+                nullptr);
+            auto view2 = std::make_shared<WpeWebViewImpl>(2, this, webView, exportable2);
+            primaryView_ = view2.get();
+            views_.push_back(view2);
+            fprintf(stderr, "[WpeBackend] FORCE: second view ready, now primary=%p\n", (void*)view2.get()); fflush(stderr);
+        }
+
         if (!mainLoop_) mainLoop_ = g_main_loop_new(nullptr, FALSE);
+
+        auto quitFromSignal = +[](gpointer userData) -> gboolean {
+            auto* self = static_cast<WpeBackend*>(userData);
+            fprintf(stderr, "[WpeBackend] signal received, exiting event loop\n"); fflush(stderr);
+            if (self->mainLoop_ && g_main_loop_is_running(self->mainLoop_)) {
+                g_main_loop_quit(self->mainLoop_);
+            }
+            return G_SOURCE_REMOVE;
+        };
+        if (!signalsInstalled_) {
+            g_unix_signal_add(SIGINT,  quitFromSignal, this);
+            g_unix_signal_add(SIGTERM, quitFromSignal, this);
+            signalsInstalled_ = true;
+        }
+
+        fprintf(stderr, "[WpeBackend] runEventLoop: g_main_loop_run starting\n"); fflush(stderr);
         g_main_loop_run(mainLoop_);
+        fprintf(stderr, "[WpeBackend] runEventLoop: g_main_loop_run returned\n"); fflush(stderr);
     }
 
     void stopEventLoop() override {
@@ -193,77 +348,159 @@ public:
     // IWebviewBackend
 
     std::shared_ptr<AbstractView> createWebview(const WebviewSpec& spec) override {
-        if (!display_) {
-            fprintf(stderr, "[WpeBackend] createWebview called before createWindow\n");
+        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s'\n",
+                (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str()); fflush(stderr);
+        if (!primaryView_) {
+            fprintf(stderr, "[WpeBackend] createWebview: no primed view (primeWpeView didn't run)\n");
             return nullptr;
         }
-        initWpeOnce();
-
-        // First-window-wins: tie the one scanout plane to the first webview.
-        // Subsequent webviews get created but won't be displayed in Phase 2
-        // (multi-webview composition is Phase 4).
-        if (primaryView_) {
-            fprintf(stderr, "[WpeBackend] warning: only the first webview is displayed "
-                            "on bare-DRM (embedded target). webviewId=%u will not scan out.\n",
-                    spec.webviewId);
+        // Bind the user's webviewId onto the existing primed view, and ask
+        // WebKit to load the URL on the main thread (load_uri queues internally
+        // and the actual load happens during loop iterations).
+        primaryView_->webviewId = spec.webviewId;
+        if (!spec.url.empty() && !g_getenv("ELECTROBUN_SKIP_USER_URL")) {
+            std::string url = spec.url;  // capture by value
+            dispatchSyncMain([this, url]() {
+                fprintf(stderr, "[WpeBackend] createWebview: loadURL %s on main\n", url.c_str()); fflush(stderr);
+                primaryView_->loadURL(url.c_str());
+            });
         }
-
-        wpe_view_backend_exportable_fdo_client client = {};
-        client.export_shm_buffer = &WpeBackend::onExportShmStatic;
-
-        auto* exportable = wpe_view_backend_exportable_fdo_create(
-            &client, /*userData=*/this,
-            landscapeW_, landscapeH_);
-        if (!exportable) {
-            fprintf(stderr, "[WpeBackend] wpe_view_backend_exportable_fdo_create failed\n");
-            return nullptr;
+        // Find the shared_ptr we own for primaryView_ and return it (FFI keeps
+        // the AbstractView* alive so long as this WpeBackend lives).
+        for (auto& v : views_) {
+            if (v.get() == primaryView_) return v;
         }
-
-        auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable);
-        WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
-        WebKitWebView* webView = webkit_web_view_new(webviewBackend);
-
-        // Route console.log to the WebProcess's stdout so host-side logs can
-        // see JS activity (handy for kiosk debugging without devtools).
-        WebKitSettings* settings = webkit_web_view_get_settings(webView);
-        webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
-
-        auto view = std::make_shared<WpeWebViewImpl>(spec.webviewId, this, webView, exportable);
-        if (!spec.url.empty())        view->loadURL(spec.url.c_str());
-        if (!primaryView_)            primaryView_ = view.get();
-        views_.push_back(view);
-        return view;
+        return nullptr;
     }
 
 private:
+    // ---- Pre-loop WPE bring-up: DRM display + exportable + WebKitWebView. ----
+    //
+    // Must run before g_main_loop_run. The WebKitWebView and exportable are
+    // long-lived; the user's createWindow/createWebview FFI calls just bind
+    // the user's URL onto the existing view via load_uri (which is async and
+    // safe to call from any thread that can dispatch to the main loop).
+    void primeWpeView() {
+        if (display_) return;  // already primed
+        initWpeOnce();
+
+        DrmDisplayConfig cfg{};
+        cfg.rotation = Rotation::None;  // rotate in our blit
+        display_ = std::make_unique<DrmDisplay>(cfg);
+        if (!display_->init()) {
+            fprintf(stderr, "[WpeBackend] primeWpeView: DrmDisplay init failed: %s\n",
+                    display_->getLastError().c_str());
+            display_.reset();
+            return;
+        }
+        rotationQuarters_ = rotationFromEnvOrDefault();
+        if (rotationQuarters_ == 1 || rotationQuarters_ == 3) {
+            landscapeW_ = display_->logicalHeight();
+            landscapeH_ = display_->logicalWidth();
+        } else {
+            landscapeW_ = display_->logicalWidth();
+            landscapeH_ = display_->logicalHeight();
+        }
+        fprintf(stderr, "[WpeBackend] primeWpeView: wpe %ux%u, drm %ux%u, rot=%d\n",
+                landscapeW_, landscapeH_, display_->logicalWidth(), display_->logicalHeight(),
+                rotationQuarters_); fflush(stderr);
+
+        if (!g_getenv("ELECTROBUN_NO_INPUT")) {
+            InputDispatcherConfig icfg{};
+            icfg.screenWidth          = display_->logicalWidth();
+            icfg.screenHeight         = display_->logicalHeight();
+            icfg.rotationQuarterTurns = rotationQuarters_;
+            input_ = std::make_unique<InputDispatcher>(icfg,
+                [this](const InputEvent& ev) { this->onInputEvent(ev); });
+            if (!input_->start()) {
+                fprintf(stderr, "[WpeBackend] primeWpeView: InputDispatcher::start failed (continuing without input)\n");
+            }
+        } else {
+            fprintf(stderr, "[WpeBackend] primeWpeView: InputDispatcher SKIPPED\n"); fflush(stderr);
+        }
+
+        // The wpe_view_backend_exportable_fdo_client must out-live the
+        // exportable. WPE-FDO holds the pointer (does NOT copy the struct);
+        // if `client` is on primeWpeView's stack frame, after primeWpeView
+        // returns to runEventLoop the stack memory gets reused and WPE-FDO's
+        // callbacks dereference garbage → crash inside g_main_loop_run.
+        // Make the client struct a function-local static so it lives forever.
+        static wpe_view_backend_exportable_fdo_client client = {};
+        client.export_shm_buffer = &WpeBackend::onExportShmStatic;
+        auto* exportable = wpe_view_backend_exportable_fdo_create(&client, this, landscapeW_, landscapeH_);
+        if (!exportable) {
+            fprintf(stderr, "[WpeBackend] primeWpeView: exportable_fdo_create failed\n");
+            return;
+        }
+        auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable);
+        WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
+        WebKitWebView* webView = webkit_web_view_new(webviewBackend);
+        WebKitSettings* settings = webkit_web_view_get_settings(webView);
+        webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+
+        // Load a placeholder HTML so the webview has content before the user's
+        // createWebview swaps in their URL. Pre-loop load like wpe_hello.
+        if (!g_getenv("ELECTROBUN_NO_PLACEHOLDER")) {
+            webkit_web_view_load_html(webView,
+                "<html><head><style>html,body{margin:0;padding:0;width:100%;height:100%;}"
+                "body{background:linear-gradient(90deg,#1e2a56,#314580);"
+                "color:white;display:flex;align-items:center;justify-content:center;"
+                "font-family:sans-serif;font-weight:800;font-size:80px;letter-spacing:1px}"
+                ".dot{color:#ffbe2e}</style></head>"
+                "<body><span>Electrobun WPE<span class='dot'>.</span></span></body></html>",
+                nullptr);
+        }
+
+        auto view = std::make_shared<WpeWebViewImpl>(/*webviewId=*/1, this, webView, exportable);
+        primaryView_ = view.get();
+        views_.push_back(view);
+        fprintf(stderr, "[WpeBackend] primeWpeView: ready, primary=%p\n", (void*)view.get()); fflush(stderr);
+    }
+
+    int rotationFromEnvOrDefault() {
+        // Default CCW90 for the kortexa bar panel (480x1920 portrait native).
+        // Override via ELECTROBUN_ROTATE=0|90|180|270 (CW degrees from native).
+        const char* s = g_getenv("ELECTROBUN_ROTATE");
+        if (!s) return 3;  // CCW90 = 270° CW
+        int q = atoi(s);
+        switch (q) {
+            case 0:   return 0;
+            case 90:  return 1;
+            case 180: return 2;
+            case 270: return 3;
+            default:  return 3;
+        }
+    }
+
     // ---- WPE initialization (once per process) ----
     static void initWpeOnce() {
         static std::once_flag once;
         std::call_once(once, []() {
+            fprintf(stderr, "[WpeBackend] wpe_loader_init\n"); fflush(stderr);
             wpe_loader_init("libWPEBackend-fdo-1.0.so");
+            fprintf(stderr, "[WpeBackend] wpe_fdo_initialize_shm\n"); fflush(stderr);
             if (!wpe_fdo_initialize_shm()) {
                 fprintf(stderr, "[WpeBackend] wpe_fdo_initialize_shm failed\n");
             }
+            if (!g_getenv("ELECTROBUN_NO_VIEWS_SCHEME")) {
+                fprintf(stderr, "[WpeBackend] webkit_web_context_get_default\n"); fflush(stderr);
+                WebKitWebContext* ctx = webkit_web_context_get_default();
+                fprintf(stderr, "[WpeBackend] webkit_web_context_register_uri_scheme\n"); fflush(stderr);
+                webkit_web_context_register_uri_scheme(
+                    ctx, "views", handleViewsURIScheme, nullptr, nullptr);
+                fprintf(stderr, "[WpeBackend] views scheme registered\n"); fflush(stderr);
+            }
         });
-    }
-
-    Rotation rotationFromEnv() const {
-        // Phase 2 uses an env var; Phase 2.4 will replace with a CLI flag read
-        // from the app's electrobun.config.ts (build.linux.embedded.rotate).
-        const char* s = g_getenv("ELECTROBUN_ROTATE");
-        if (!s) return Rotation::None;
-        int q = atoi(s);
-        switch (q) {
-            case 90:  return Rotation::CW90;
-            case 180: return Rotation::Rot180;
-            case 270: return Rotation::CCW90;
-            default:  return Rotation::None;
-        }
     }
 
     // ---- SHM export → DRM blit ----
 
     static void onExportShmStatic(void* userData, struct wpe_fdo_shm_exported_buffer* buffer) {
+        static std::atomic<int> n{0};
+        int i = ++n;
+        if (i <= 3 || (i % 60) == 0) {
+            fprintf(stderr, "[WpeBackend] onExportShm #%d\n", i); fflush(stderr);
+        }
         static_cast<WpeBackend*>(userData)->onExportShm(buffer);
     }
 
@@ -467,6 +704,7 @@ private:
     std::vector<std::shared_ptr<AbstractView>> views_;
     WpeWebViewImpl*                            primaryView_ = nullptr;  // non-owning; first webview
     std::atomic<uint64_t>                      framesRendered_{0};
+    bool                                       signalsInstalled_ = false;
 };
 
 } // namespace wpe
