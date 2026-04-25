@@ -16,6 +16,7 @@
 #include "../abstract_view.h"
 #include "../backend.h"
 #include "../../shared/asar.h"
+#include "../../shared/callbacks.h"
 #include "../../shared/mime_types.h"
 
 #include "drm_display.h"
@@ -105,9 +106,17 @@ static std::mutex      g_asarReadMutex;
 static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
     const char* uri = webkit_uri_scheme_request_get_uri(request);
     fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
+    // Strip ?query and #fragment from the URL before resolving against
+    // ASAR / disk — a request like `views://main/index.html?t=12345` should
+    // serve `main/index.html`. (The GTK handler in nativeWrapper.cpp has the
+    // same omission; tracked in §17 follow-ups.)
+    std::string pathBuf;
     const char* fullPath = "index.html";
     if (uri && std::strncmp(uri, "views://", 8) == 0) {
-        fullPath = uri + 8;
+        pathBuf = uri + 8;
+        size_t cut = pathBuf.find_first_of("?#");
+        if (cut != std::string::npos) pathBuf.resize(cut);
+        fullPath = pathBuf.c_str();
     }
 
     gchar* cwd = g_get_current_dir();
@@ -251,6 +260,90 @@ public:
     void closeDevTools() override {}
     void toggleDevTools() override {}
 
+    // ---- Navigation callbacks (set by WpeBackend::createWebview) ----
+    //
+    // Mirrors the WebKitGTK members in nativeWrapper.cpp so the same FFI
+    // surface (decide-policy + load-changed + load-failed) reaches Bun.
+    DecideNavigationCallback navigationCallback_ = nullptr;
+    WebviewEventHandler      eventHandler_       = nullptr;
+    bool                     lastNavigationWasBlocked_ = false;
+
+    // ---- Navigation event handlers ----
+    //
+    // Ported verbatim from the WebKitGTK path in nativeWrapper.cpp
+    // (onDecidePolicy / onLoadChanged / onLoadFailed). WPE uses the same
+    // webkit_* C API as GTK, so the bodies are identical except for the
+    // GDK ctrl+click block — the kiosk panel has no keyboard modifiers, so
+    // that whole code path is dropped here. Navigation rules come from the
+    // AbstractView base directly (single-webview target → no g_webviewMap
+    // lookup needed; the GTK map only exists because GTK has many views).
+    gboolean onDecidePolicy(WebKitWebView* /*webview*/,
+                            WebKitPolicyDecision* decision,
+                            WebKitPolicyDecisionType type) {
+        if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
+            WebKitNavigationPolicyDecision* nav_decision = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
+            WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(nav_decision);
+            WebKitURIRequest* request = webkit_navigation_action_get_request(action);
+            const char* uri = webkit_uri_request_get_uri(request);
+
+            std::string url = uri ? uri : "";
+            bool shouldAllow = shouldAllowNavigationToURL(url);
+
+            // Fire will-navigate event with allowed status.
+            if (eventHandler_) {
+                std::string escapedUrl;
+                for (char c : url) {
+                    switch (c) {
+                        case '"':  escapedUrl += "\\\""; break;
+                        case '\\': escapedUrl += "\\\\"; break;
+                        default:   escapedUrl += c;       break;
+                    }
+                }
+                std::string eventData = "{\"url\":\"" + escapedUrl + "\",\"allowed\":" +
+                                        (shouldAllow ? "true" : "false") + "}";
+                eventHandler_(webviewId, strdup("will-navigate"), strdup(eventData.c_str()));
+            }
+
+            if (!shouldAllow) {
+                lastNavigationWasBlocked_ = true;
+                webkit_policy_decision_ignore(decision);
+                return TRUE;
+            }
+            lastNavigationWasBlocked_ = false;
+        }
+        return FALSE;
+    }
+
+    void onLoadChanged(WebKitWebView* webview, WebKitLoadEvent event) {
+        if (!eventHandler_) return;
+        const char* uri = webkit_web_view_get_uri(webview);
+        switch (event) {
+            case WEBKIT_LOAD_STARTED:
+                eventHandler_(webviewId, "load-started", uri);
+                break;
+            case WEBKIT_LOAD_REDIRECTED:
+                eventHandler_(webviewId, "load-redirected", uri);
+                break;
+            case WEBKIT_LOAD_COMMITTED:
+                eventHandler_(webviewId, "load-committed", uri);
+                break;
+            case WEBKIT_LOAD_FINISHED:
+                eventHandler_(webviewId, "load-finished", uri);
+                if (!lastNavigationWasBlocked_) {
+                    eventHandler_(webviewId, "did-navigate", uri);
+                }
+                break;
+        }
+    }
+
+    gboolean onLoadFailed(WebKitWebView* /*webview*/, WebKitLoadEvent /*event*/,
+                          gchar* uri, GError* /*error*/) {
+        if (eventHandler_) {
+            eventHandler_(webviewId, "load-failed", uri);
+        }
+        return FALSE;
+    }
+
 private:
     friend class WpeBackend;
     WpeBackend*                              backend_    = nullptr;
@@ -358,6 +451,11 @@ public:
         // WebKit to load the URL on the main thread (load_uri queues internally
         // and the actual load happens during loop iterations).
         primaryView_->webviewId = spec.webviewId;
+        // Wire navigation + event callbacks. The signal handlers were already
+        // connected in primeWpeView; until these pointers are set, the
+        // handlers see null eventHandler_ and early-return without firing.
+        primaryView_->navigationCallback_ = (DecideNavigationCallback)spec.navigationHandler;
+        primaryView_->eventHandler_       = (WebviewEventHandler)spec.webviewEventHandler;
         if (!spec.url.empty() && !g_getenv("ELECTROBUN_SKIP_USER_URL")) {
             std::string url = spec.url;  // capture by value
             dispatchSyncMain([this, url]() {
@@ -438,6 +536,16 @@ private:
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
 
+        // Wire navigation + load signals before the placeholder load so the
+        // same handlers that serve user-app navigations also see the
+        // placeholder's load events. The thunks early-return while
+        // primaryView_ / eventHandler_ are still nullptr (createWebview
+        // installs eventHandler_ later), so the placeholder fires no
+        // user-visible events.
+        g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeBackend::onDecidePolicyStatic), this);
+        g_signal_connect(webView, "load-changed",  G_CALLBACK(&WpeBackend::onLoadChangedStatic),  this);
+        g_signal_connect(webView, "load-failed",   G_CALLBACK(&WpeBackend::onLoadFailedStatic),   this);
+
         // Load a placeholder HTML so the webview has content before the user's
         // createWebview swaps in their URL. Pre-loop load like wpe_hello.
         if (!g_getenv("ELECTROBUN_NO_PLACEHOLDER")) {
@@ -491,6 +599,35 @@ private:
                 fprintf(stderr, "[WpeBackend] views scheme registered\n"); fflush(stderr);
             }
         });
+    }
+
+    // ---- Navigation signal thunks ----
+    //
+    // Hop from the WpeBackend* user_data we passed to g_signal_connect over
+    // to the (single) WpeWebViewImpl. WpeWebViewImpl doesn't exist yet at
+    // signal-connect time (we make_shared it a few lines later), so we can't
+    // pass it directly — but every signal eventually fires after
+    // primeWpeView returns, by which point primaryView_ is set. The
+    // null-checks cover the "placeholder load fires before createWebview
+    // wires eventHandler_" interleaving.
+    static gboolean onDecidePolicyStatic(WebKitWebView* w,
+                                         WebKitPolicyDecision* d,
+                                         WebKitPolicyDecisionType t,
+                                         gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return FALSE;
+        return self->primaryView_->onDecidePolicy(w, d, t);
+    }
+    static void onLoadChangedStatic(WebKitWebView* w, WebKitLoadEvent e, gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return;
+        self->primaryView_->onLoadChanged(w, e);
+    }
+    static gboolean onLoadFailedStatic(WebKitWebView* w, WebKitLoadEvent e,
+                                       gchar* uri, GError* error, gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return FALSE;
+        return self->primaryView_->onLoadFailed(w, e, uri, error);
     }
 
     // ---- SHM export → DRM blit ----

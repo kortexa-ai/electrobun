@@ -275,7 +275,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             const char* viewsRoot,
                                             bool transparent,
                                             bool sandbox) {
-    (void)autoResize; (void)webviewEventHandler;
+    (void)autoResize;
     (void)electrobunPreloadScript; (void)customPreloadScript;
     (void)viewsRoot; (void)transparent;
     g_nextStartTransparent.store(false);
@@ -290,6 +290,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.sandboxed            = sandbox;
     spec.partition            = partitionIdentifier ? partitionIdentifier : "";
     spec.navigationHandler    = (void*)navigationCallback;
+    spec.webviewEventHandler  = (void*)webviewEventHandler;
     spec.eventBridgeHandler   = (void*)eventBridgeHandler;
     spec.bunBridgeHandler     = (void*)bunBridgeHandler;
     spec.internalBridgeHandler= (void*)internalBridgeHandler;

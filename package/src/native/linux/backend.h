@@ -58,7 +58,8 @@ struct WebviewSpec {
     bool sandboxed = false;
     std::string partition;
     void* navigationHandler = nullptr;
-    void* eventBridgeHandler = nullptr;
+    void* webviewEventHandler = nullptr;   // WebviewEventHandler (3 args): fires for navigation/load events from native code
+    void* eventBridgeHandler = nullptr;    // HandlePostMessage  (2 args): JSON-bridge for events from JS preload scripts
     void* bunBridgeHandler = nullptr;
     void* internalBridgeHandler = nullptr;
 };

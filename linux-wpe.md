@@ -860,3 +860,169 @@ These were useful during the bisect but are NOT the fix; consider for cleanup be
 - The §13 dispatchSyncMain pattern still applies for worker-thread FFI calls (createWindow / createWebview from Bun's worker thread). Was tested live in the final session run: hello-embedded's `BrowserWindow({ url })` from `src/bun/index.ts` flows through the worker → main dispatch → primeWpeView's primed webview → views:// scheme handler → `app.asar` → rendered HTML. All good.
 - `package/build.ts`'s WPE link step at line ~2050 currently uses `-std=c++20`; rebuilding with `-std=c++17 -O2 -g` (matching the standalone tests' Makefile) gave identical behavior so the language standard isn't load-bearing.
 - The Bun version doesn't matter (1.2.5, 1.3.11, 1.3.13 all behave identically once the C++ side is fixed). Stick with the vendored 1.3.11 unless there's a JS-side reason to bump.
+
+## 16. Next session — wire navigation policy + load events for full GTK parity
+
+Goal: bring `linux-embedded`'s navigation event surface up to parity with the GTK backend. Hello-embedded already renders end-to-end (§15); this is the work that turns "kiosk demo" into "every-app-just-works."
+
+The good news: WebKit-WPE uses the **identical** `webkit_*` C API for navigation as WebKit-GTK. Same signal names, same `WebKitNavigationAction` / `WebKitNavigationPolicyDecision` / `WebKitURIRequest` / `WebKitLoadEvent` types. This is a straight port from `nativeWrapper.cpp`, not a re-design.
+
+Estimated effort: ~3 hours focused, mostly mechanical.
+
+### Reference code (read these first)
+
+| Function | File | Lines |
+|---|---|---|
+| `onDecidePolicy` (the meat) | `package/src/native/linux/nativeWrapper.cpp` | ~2700-2820 |
+| `onLoadChanged` | `package/src/native/linux/nativeWrapper.cpp` | 2821-2844 |
+| `onLoadFailed` | `package/src/native/linux/nativeWrapper.cpp` | 2846-2853 |
+| signal-connect site | `package/src/native/linux/nativeWrapper.cpp` | 2299-2304 |
+| `lastNavigationWasBlocked` member | `package/src/native/linux/nativeWrapper.cpp` | 2177 |
+| Callback typedefs | `package/src/native/shared/callbacks.h` | 16-17 |
+| `WebviewSpec.navigationHandler` / `eventBridgeHandler` | `package/src/native/linux/backend.h` | 60-61 |
+| `AbstractView::navigationRules` + `setNavigationRulesFromJSON` + `isNavigationAllowed` (or whatever it's called) | `package/src/native/linux/abstract_view.h` | 55-100 |
+
+The two callback types:
+
+```cpp
+// shared/callbacks.h:16-17
+typedef uint32_t (*DecideNavigationCallback)(uint32_t webviewId, const char* url);
+typedef void     (*WebviewEventHandler)    (uint32_t webviewId, const char* type, const char* url);
+```
+
+`DecideNavigationCallback` returns `1` = allow, `0` = block.
+
+### What to add in `package/src/native/linux/wpe/wpe_backend.cpp`
+
+1. **`WpeWebViewImpl` member additions** (~5 lines around line 183):
+   ```cpp
+   DecideNavigationCallback navigationCallback_ = nullptr;  // copied from spec
+   WebviewEventHandler      eventHandler_       = nullptr;  // copied from spec.eventBridgeHandler
+   bool                     lastNavigationWasBlocked_ = false;
+   ```
+
+2. **Plumb them through `WpeBackend::createWebview`** (line ~352). Currently it does
+   ```cpp
+   primaryView_->webviewId = spec.webviewId;
+   ```
+   Add:
+   ```cpp
+   primaryView_->navigationCallback_ = (DecideNavigationCallback)spec.navigationHandler;
+   primaryView_->eventHandler_       = (WebviewEventHandler)spec.eventBridgeHandler;
+   ```
+
+3. **Signal connections in `primeWpeView`** — right after `webkit_settings_set_enable_write_console_messages_to_stdout`, before the placeholder `load_html`:
+   ```cpp
+   g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeWebViewImpl::onDecidePolicyStatic), nullptr);
+   g_signal_connect(webView, "load-changed",  G_CALLBACK(&WpeWebViewImpl::onLoadChangedStatic),  nullptr);
+   g_signal_connect(webView, "load-failed",   G_CALLBACK(&WpeWebViewImpl::onLoadFailedStatic),   nullptr);
+   ```
+   Pass `nullptr` as user-data because at primeWpeView time we don't have the WpeWebViewImpl yet (we make it three lines later). Inside the static thunks, look up `primaryView_` via `wpeBackendInstance()` — there's only one webview on this target, so this is fine.
+
+4. **The three static thunks + member impls** — port verbatim from `nativeWrapper.cpp`. The `onDecidePolicy` body has one GTK-specific bit to drop: the ctrl+click debounce uses `gtk_get_current_event_state()` to read the modifier keys. WPE doesn't have a modifier-key state on a kiosk panel; just delete that block (or guard it on `#ifdef HAVE_GTK`). Keep:
+   - URL extraction via `webkit_navigation_action_get_request` / `webkit_uri_request_get_uri`
+   - `AbstractView::isNavigationAllowed(url)` (or whatever the exact name is — confirm from `abstract_view.h:90+`)
+   - Setting `lastNavigationWasBlocked_` based on the outcome
+   - Calling `eventHandler_(webviewId, "will-navigate", uri)` with the JSON-encoded "allowed" payload (mirror exactly what GTK does — Bun-side parses `eventData` as JSON)
+   - Returning `TRUE` to cancel, `FALSE` to allow
+
+5. **Free string conventions**: GTK code calls `eventHandler_(impl->webviewId, strdup("did-navigate"), strdup(url))`. The Bun-side JSCallback assumes the strings are owned-and-freed by the callback site. WTF that's not symmetric — copy the GTK semantics exactly so the Bun side's `free()` call lines up.
+
+### Smoke test in `hello-embedded`
+
+Add to `src/main/index.html` (or a new `index.js`):
+```html
+<a href="https://example.com/">link to example</a>
+<button onclick="window.location='views://main/index.html#refresh'">refresh self</button>
+```
+
+In `src/bun/index.ts`, listen for the events:
+```ts
+const win = new BrowserWindow({ url: "views://main/index.html", ... });
+win.webview.on("will-navigate", (e) => console.log("[bun] will-navigate", e.url, "allowed=", e.allowed));
+win.webview.on("did-navigate",  (e) => console.log("[bun] did-navigate",  e.url));
+win.webview.on("load-failed",   (e) => console.log("[bun] load-failed",   e.url));
+```
+
+Build, run via `sudo openvt -s -f -- ./launcher`, touch the link, eyeball the bar for the navigation, and grep the launcher log for `[bun] will-navigate`. If those events fire and the URL changes, navigation parity is done.
+
+### Bonus (only if time allows)
+
+- **`load-failed-with-tls-errors`** signal — GTK has a separate handler for SSL errors that emits `load-failed-tls`. Trivial port (~10 lines).
+- **Permission requests** (`onPermissionRequest` in GTK, lines ~2890+) — GTK pops a GtkDialog for camera/mic permission. On a bare-DRM kiosk there's no dialog system; either auto-allow (kiosk semantics) or auto-deny with a TODO. ~20 lines.
+- Delete the `// Navigation action / script message helpers (legacy — unused on WPE)` block at `nativeWrapper_wpe.cpp:383+` — those were placeholders for this work and are no longer "unused on WPE."
+
+### What NOT to do
+
+- Do NOT touch `wpe_helper.cpp` or `sig_passthrough.cpp` — they're diagnostic-only per §15, kept for future debugging. Navigation work goes only in `wpe_backend.cpp`.
+- Do NOT re-litigate the threading model. `dispatchSyncMain` is the canonical worker→main marshal; the signal handlers fire on the WPE main thread directly so they don't need it. The JSCallback they invoke is `threadsafe: true` on the Bun side, which handles the marshal back to JS.
+- Do NOT add the `static` keyword treatment to other locals in `primeWpeView` "to be safe." The `wpe_view_backend_exportable_fdo_client` was the only one WPE-FDO holds by reference; everything else is fine on the stack.
+- Do NOT skip the smoke test. The whole point of full parity is "Bun apps that work on macOS work here too." A regression test you can re-run is what proves that.
+
+## 17. Session results (2026-04-25, follow-up — §16 navigation parity port)
+
+End state: **navigation events flow C++ → Bun → JS.** hello-embedded's home page round-trips with `views://main/page2.html` and back, plus `views://main/index.html?t=…` self-reload, and every tap surfaces a matching `[bun] will-navigate {"url":…,"allowed":true}` + `[bun] did-navigate <url>` pair in the launcher log. The JSON payload + ownership semantics match GTK's `WebKitWebViewImpl` exactly. Visually confirmed on the bar panel by the user; logs captured by tee'ing the launcher's stdout to `/tmp/hello-embedded-$$.log`.
+
+Sample log from a clean run:
+
+```
+[bun] will-navigate {"url":"about:blank","allowed":true}
+[bun] will-navigate {"url":"views://main/index.html","allowed":true}
+[bun] did-navigate  views://main/index.html
+[bun] will-navigate {"url":"views://main/page2.html","allowed":true}    ← tap "page 2"
+[bun] did-navigate  views://main/page2.html
+[bun] will-navigate {"url":"views://main/index.html","allowed":true}    ← tap "back to home"
+[bun] did-navigate  views://main/index.html
+[bun] will-navigate {"url":"views://main/index.html?t=1777130637210","allowed":true}  ← self-reload
+[bun] did-navigate  views://main/index.html?t=1777130637210
+```
+
+### One brief-was-wrong correction to §16
+
+§16 step 2 said:
+```cpp
+primaryView_->eventHandler_ = (WebviewEventHandler)spec.eventBridgeHandler;
+```
+
+That is incorrect. `WebviewSpec::eventBridgeHandler` is typed `void*` but its semantics are a `HandlePostMessage` (`(uint32_t, const char*) → void`) — it's the JSON-bridge for events emitted from JS preload scripts. Calling it as a `WebviewEventHandler` (`(uint32_t, const char*, const char*) → void`) is UB.
+
+The actual `WebviewEventHandler` slot that GTK uses (`webviewEventHandler` in `nativeWrapper.cpp:6537`) was being **discarded** in the WPE seam — `nativeWrapper_wpe.cpp:278` had `(void)webviewEventHandler;`. So `WebviewSpec` had no field to receive it.
+
+Fix: added a `void* webviewEventHandler = nullptr;` field to `WebviewSpec` (`backend.h`), populated it in `nativeWrapper_wpe.cpp::initWebview`, consumed it in `wpe_backend.cpp::createWebview`. Both `eventBridgeHandler` and `webviewEventHandler` now ride along; semantics distinguish via the inline comments on the WebviewSpec fields.
+
+### Files changed in the working tree
+
+- `package/src/native/linux/backend.h` — added `void* webviewEventHandler` field to `WebviewSpec` between `navigationHandler` and `eventBridgeHandler`.
+- `package/src/native/linux/nativeWrapper_wpe.cpp` — populated `spec.webviewEventHandler`, removed the `(void)webviewEventHandler;` discard.
+- `package/src/native/linux/wpe/wpe_backend.cpp`:
+  - included `../../shared/callbacks.h` for the callback typedefs
+  - added `navigationCallback_` / `eventHandler_` / `lastNavigationWasBlocked_` members + the three handler member fns (`onDecidePolicy` / `onLoadChanged` / `onLoadFailed`) on `WpeWebViewImpl`, ported verbatim from GTK with the GDK-modifier-state ctrl+click block dropped (kiosk panel has no keyboard modifiers)
+  - added the three static thunks (`onDecidePolicyStatic` etc.) on `WpeBackend`, hopping from `WpeBackend* user_data` → `primaryView_` → impl method (cleaner than §16's nullptr+singleton-lookup proposal; same semantics since WpeBackend is a singleton)
+  - wired `g_signal_connect(... decide-policy / load-changed / load-failed ...)` in `primeWpeView`, before the placeholder `load_html` so the thunks see all loads (including placeholder); both thunks early-return while `primaryView_` / `eventHandler_` are still null, so no spurious events fire before `createWebview`
+  - in `createWebview`, copied `spec.navigationHandler` and `spec.webviewEventHandler` onto the impl
+  - **side-fix:** `handleViewsURIScheme` now strips `?query` and `#fragment` from the path before resolving against ASAR/disk, so e.g. `views://main/index.html?t=12345` serves `main/index.html` instead of 404'ing. The GTK handler in `nativeWrapper.cpp:5055` has the same omission and will hit the same bug; tracked as a follow-up below.
+
+### hello-embedded smoke-test wiring (also in the tree)
+
+Test app at `/home/pi/src/hello-embedded` got these adjustments — kept around as the regression test for future sessions:
+
+- `electrobun.config.ts` — added `"src/main/page2.html": "views/main/page2.html"` to `build.copy` (the map is explicit, not glob — new view files won't ship until added here).
+- `src/main/index.html` — orange-on-charcoal gradient (`#cc3300` → `#ff8a00`) so the bar panel's webcam reflection (which reads black-TTY as washed navy) doesn't masquerade as rendered content. Bumped touch-target sizing to `clamp(28px, 5.5vmin, 48px)` font + `0.7em 1.6em` padding (~80-100px tall after padding) for the 7" panel's fat-finger ergonomics. Added two test pills: "tap: page 2" (→ `views://main/page2.html`) and "tap: self-reload" (→ `views://main/index.html?t=Date.now()`).
+- `src/main/page2.html` — second internal page with a "tap: back to home" pill, charcoal-on-orange (inverted from home page) so the visual flip on tap is unambiguous.
+- `src/bun/index.ts` — listens for `will-navigate` and `did-navigate` on the BrowserWindow's webview and console.log's `event.data.detail`. (Note: the event shape is `{data: {detail: string}}`, not `{detail: string}`; first attempt logged `undefined`.)
+
+### Workflow gotchas surfaced this session
+
+- **Don't `timeout sudo openvt -- launcher`**: `sudo` doesn't forward signals to descendants by default, so SIGTERM dies at sudo and the launcher tree (bash + launcher + bun) becomes orphans of init. `bun` keeps DRM master locked → next run hits `drmModeSetCrtc: Permission denied`. Use background `sudo openvt -w` + an explicit `sudo pkill -TERM -f "HelloElectrobun-dev/bin/launcher"` after the sleep window. Pattern is in `~/.claude/projects/.../memory/feedback_pi_launcher_kill.md`.
+- **Don't `rm /tmp/hello-embedded.log` without sudo if a prior `sudo … tee` created it**: the file is root-owned, the `rm` fails with EPERM, and an `&& sudo openvt …` chain short-circuits silently — launcher never starts and you spend several minutes wondering why the log is empty. Use a `$$`-suffixed unique log path or `sudo rm -f` first.
+- **Webcam still lying as predicted**: the example.com link (first version of the smoke test) navigated successfully, the user saw a white page on the panel, and we lost a few minutes wondering whether to chase it. Switched the test to all-internal navigation (`views://main/page2.html` ↔ `views://main/index.html`) so the round-trip is reversible from the panel itself with no internet dependency.
+
+### Open follow-ups (none load-bearing)
+
+- **GTK side has the same query-string bug**. `nativeWrapper.cpp::handleViewsURIScheme` (~line 5055) does `fullPath = uri + 8;` with no `?` / `#` strip, identical to the WPE bug fixed this session. Mirroring the WPE fix is ~5 lines. Out of session scope.
+- **`navigationCallback_` is wired but never called.** GTK's `onDecidePolicy` only consults `AbstractView::shouldAllowNavigationToURL` (the rules-based check) and surfaces the result via the `will-navigate` event. The user-supplied synchronous `DecideNavigationCallback` (the `webviewDecideNavigation` JSCallback on the Bun side) is registered through the FFI but neither GTK nor (now) WPE actually invokes it. Either delete the field on both sides or wire it up — both should land together. Out of scope here.
+- **Permission requests** (`onPermissionRequest` for camera/mic). On bare-DRM there's no dialog system; auto-allow with a TODO is the kiosk-appropriate behavior. ~20 lines if/when needed.
+- **`load-failed-with-tls-errors`**. Trivial port (~10 lines). Punt until something actually loads HTTPS on the kiosk and we have a reproduce case.
+- **Comments in `nativeWrapper_wpe.cpp:383+` mark a "Navigation action / script message helpers (legacy — unused on WPE)" block as legacy.** That comment is now misleading — navigation IS used on WPE. Either delete the legacy block or update the comment. One-line cleanup, deferred.
+- **`webview.on("load-failed", …)` handler in hello-embedded was sketched in §16 but not wired**. The `load-failed` C++ thunk is in place, but Bun's `BrowserView.on()` whitelist (`BrowserView.ts:304-314`) doesn't include `"load-failed"` — adding it requires touching the cross-platform event surface, which is in scope for a different cleanup session (the same one that wires `navigationCallback_`).
+
