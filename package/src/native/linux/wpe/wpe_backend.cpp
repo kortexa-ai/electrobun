@@ -325,6 +325,18 @@ public:
     std::string electrobunPreloadScript_;
     std::string customPreloadScript_;
 
+    // ---- Multi-view pool state ----
+    //
+    // primeWpeView pre-allocates N WpeWebViewImpl instances at startup so the
+    // pre-loop WPE-FDO requirement (§13/§15) is satisfied for every view the
+    // app might ever create. Views start in the free pool with about:blank
+    // loaded; createWebview pops one and binds the user's webviewId/handlers/
+    // preloads; remove() returns it to the pool.
+    bool inFreePool_   = true;   // true until createWebview claims this view
+    bool alwaysTopmost_ = false; // chrome views set this; rendering & input
+                                 // dispatch keep them above app views
+    Rect frame_ = {};            // bounds within the rotated landscape space
+
     // ---- Navigation event handlers ----
     //
     // Ported verbatim from the WebKitGTK path in nativeWrapper.cpp
@@ -422,10 +434,10 @@ public:
     ~WpeBackend() override { teardown(); }
 
     // FFI exports that take only a webviewId (no AbstractView*) reach the
-    // impl through here. Single-view kiosk → just check primaryView_.
+    // impl through here.
     AbstractView* findViewById(uint32_t webviewId) {
-        if (primaryView_ && primaryView_->webviewId == webviewId) {
-            return primaryView_;
+        for (auto* v : activeViews_) {
+            if (v && v->webviewId == webviewId) return v;
         }
         return nullptr;
     }
@@ -459,24 +471,9 @@ public:
         // their URL).
         primeWpeView();
 
-        if (g_getenv("ELECTROBUN_FORCE_WPE_HELLO")) {
-            fprintf(stderr, "[WpeBackend] FORCE: creating second exportable+view\n"); fflush(stderr);
-            wpe_view_backend_exportable_fdo_client client = {};
-            client.export_shm_buffer = &WpeBackend::onExportShmStatic;
-            auto* exportable2 = wpe_view_backend_exportable_fdo_create(&client, this, landscapeW_, landscapeH_);
-            auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable2);
-            WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
-            WebKitWebView* webView = webkit_web_view_new(webviewBackend);
-            WebKitSettings* settings = webkit_web_view_get_settings(webView);
-            webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
-            webkit_web_view_load_html(webView,
-                "<html><body style='background:#1e2a56;color:#ffbe2e;font-size:140px;text-align:center;padding-top:120px;font-family:sans-serif'>FORCE 2nd</body></html>",
-                nullptr);
-            auto view2 = std::make_shared<WpeWebViewImpl>(2, this, webView, exportable2);
-            primaryView_ = view2.get();
-            views_.push_back(view2);
-            fprintf(stderr, "[WpeBackend] FORCE: second view ready, now primary=%p\n", (void*)view2.get()); fflush(stderr);
-        }
+        // ELECTROBUN_FORCE_WPE_HELLO bisect branch removed — was a §13 diag
+        // for cracking the dangling-stack-pointer bug (§15), no longer useful
+        // and would crash now that onExportShm assumes per-view user_data.
 
         if (!mainLoop_) mainLoop_ = g_main_loop_new(nullptr, FALSE);
 
@@ -510,52 +507,62 @@ public:
     std::shared_ptr<AbstractView> createWebview(const WebviewSpec& spec) override {
         fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s'\n",
                 (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str()); fflush(stderr);
-        if (!primaryView_) {
-            fprintf(stderr, "[WpeBackend] createWebview: no primed view (primeWpeView didn't run)\n");
+        if (freePool_.empty()) {
+            fprintf(stderr, "[WpeBackend] createWebview: pool exhausted (max=%d). "
+                            "Set ELECTROBUN_WPE_MAX_VIEWS to bump.\n",
+                    (int)views_.size());
             return nullptr;
         }
-        // Bind the user's webviewId onto the existing primed view, and ask
-        // WebKit to load the URL on the main thread (load_uri queues internally
-        // and the actual load happens during loop iterations).
-        primaryView_->webviewId = spec.webviewId;
-        // Wire navigation + event callbacks. The signal handlers were already
-        // connected in primeWpeView; until these pointers are set, the
-        // handlers see null eventHandler_ and early-return without firing.
-        primaryView_->navigationCallback_ = (DecideNavigationCallback)spec.navigationHandler;
-        primaryView_->eventHandler_       = (WebviewEventHandler)spec.webviewEventHandler;
-        // Webview→Bun message bridges. Mirror of nativeWrapper.cpp's GTK
-        // path. Once these are set, the script-message-received signal
-        // handlers (registered in primeWpeView) will forward postMessage
-        // calls from JS to Bun.
-        primaryView_->bunBridgeHandler_      = (HandlePostMessage)spec.bunBridgeHandler;
-        primaryView_->internalBridgeHandler_ = (HandlePostMessage)spec.internalBridgeHandler;
-        primaryView_->eventBridgeHandler_    = (HandlePostMessage)spec.eventBridgeHandler;
-        // Stash both preload strings on the impl. updateCustomPreloadScript
-        // re-injects from these on swap, so they need to live longer than
-        // the spec.
-        primaryView_->electrobunPreloadScript_ = spec.electrobunPreloadScript;
-        primaryView_->customPreloadScript_     = spec.customPreloadScript;
-        // Inject the Electrobun preload script (sets up window.__electrobun*
-        // globals and the full preload pipeline) followed by the app-supplied
-        // custom preload (BrowserWindow's `preload` option). Both must run at
-        // document-start, so they happen BEFORE loadURL.
+        WpeWebViewImpl* impl = freePool_.front();
+        freePool_.erase(freePool_.begin());
+        impl->inFreePool_ = false;
+
+        impl->webviewId = spec.webviewId;
+        impl->navigationCallback_   = (DecideNavigationCallback)spec.navigationHandler;
+        impl->eventHandler_         = (WebviewEventHandler)spec.webviewEventHandler;
+        impl->bunBridgeHandler_     = (HandlePostMessage)spec.bunBridgeHandler;
+        impl->internalBridgeHandler_= (HandlePostMessage)spec.internalBridgeHandler;
+        impl->eventBridgeHandler_   = (HandlePostMessage)spec.eventBridgeHandler;
+        impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
+        impl->customPreloadScript_     = spec.customPreloadScript;
+        impl->frame_                = spec.frame;
+        if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
+            // Default any unset bounds to fullscreen so the chrome+main split
+            // (commit 5) is the only path that ever cares about partial frames.
+            impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+        }
+        impl->visualBounds = impl->frame_;
         if (!spec.electrobunPreloadScript.empty()) {
-            primaryView_->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
+            impl->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
         }
         if (!spec.customPreloadScript.empty()) {
-            primaryView_->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
+            impl->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
         }
+        // Insertion order: app views go before any alwaysTopmost views;
+        // alwaysTopmost views go at the end (back = topmost). Same z-rule
+        // as nativeWrapper.cpp:7828 — last in list = topmost.
+        if (impl->alwaysTopmost_) {
+            activeViews_.push_back(impl);
+        } else {
+            auto it = activeViews_.begin();
+            while (it != activeViews_.end() && !(*it)->alwaysTopmost_) ++it;
+            activeViews_.insert(it, impl);
+        }
+        // primaryView_ tracks the topmost active view for back-compat with
+        // commit 1's still-single-source rendering (commit 2 replaces this
+        // with a real composite walk over activeViews_).
+        primaryView_ = activeViews_.back();
+
         if (!spec.url.empty() && !g_getenv("ELECTROBUN_SKIP_USER_URL")) {
-            std::string url = spec.url;  // capture by value
-            dispatchSyncMain([this, url]() {
-                fprintf(stderr, "[WpeBackend] createWebview: loadURL %s on main\n", url.c_str()); fflush(stderr);
-                primaryView_->loadURL(url.c_str());
+            std::string url = spec.url;
+            dispatchSyncMain([impl, url]() {
+                fprintf(stderr, "[WpeBackend] createWebview: loadURL %s on main (view %p)\n",
+                        url.c_str(), (void*)impl); fflush(stderr);
+                impl->loadURL(url.c_str());
             });
         }
-        // Find the shared_ptr we own for primaryView_ and return it (FFI keeps
-        // the AbstractView* alive so long as this WpeBackend lives).
         for (auto& v : views_) {
-            if (v.get() == primaryView_) return v;
+            if (v.get() == impl) return v;
         }
         return nullptr;
     }
@@ -606,18 +613,52 @@ private:
             fprintf(stderr, "[WpeBackend] primeWpeView: InputDispatcher SKIPPED\n"); fflush(stderr);
         }
 
-        // The wpe_view_backend_exportable_fdo_client must out-live the
-        // exportable. WPE-FDO holds the pointer (does NOT copy the struct);
-        // if `client` is on primeWpeView's stack frame, after primeWpeView
-        // returns to runEventLoop the stack memory gets reused and WPE-FDO's
-        // callbacks dereference garbage → crash inside g_main_loop_run.
-        // Make the client struct a function-local static so it lives forever.
+        // Pre-allocate N views into the free pool. Each gets its own
+        // exportable_fdo + WebKitWebView + signal-connect setup. The pre-loop
+        // requirement (§15) is satisfied for every view the app might ever
+        // create, so subsequent createWebview calls just claim from the pool
+        // and bind the user's URL/handlers without touching WPE-FDO again.
+        const int N = maxViewsFromEnvOrDefault();
+        for (int i = 0; i < N; i++) {
+            auto* impl = createOnePooledView();
+            if (!impl) {
+                fprintf(stderr, "[WpeBackend] primeWpeView: createOnePooledView #%d failed\n", i);
+                if (i == 0) return;  // Not even one — bail.
+                break;
+            }
+            freePool_.push_back(impl);
+        }
+        // Keep primaryView_ pointing at the first pooled view so legacy
+        // single-view rendering paths (commit 1: still single-source) have
+        // a target until createWebview claims it.
+        if (!freePool_.empty()) primaryView_ = freePool_.front();
+        fprintf(stderr, "[WpeBackend] primeWpeView: pool ready, %zu views\n",
+                freePool_.size()); fflush(stderr);
+    }
+
+    // Build one (exportable_fdo + WebKitWebView + signal connections + pooled
+    // WpeWebViewImpl) tuple. Caller adds the impl to freePool_. All views
+    // share the same wpe_view_backend_exportable_fdo_client instance; per-view
+    // identity is conveyed through the per-exportable user_data (the impl
+    // pointer), so the static SHM thunk can route the buffer to the right
+    // view without a lookup.
+    WpeWebViewImpl* createOnePooledView() {
+        // Static — WPE-FDO holds the pointer, doesn't copy. See §15.
         static wpe_view_backend_exportable_fdo_client client = {};
         client.export_shm_buffer = &WpeBackend::onExportShmStatic;
-        auto* exportable = wpe_view_backend_exportable_fdo_create(&client, this, landscapeW_, landscapeH_);
+
+        auto pendingImpl = std::make_shared<WpeWebViewImpl>(/*webviewId=*/0, this,
+                                                            /*webView=*/nullptr,
+                                                            /*exportable=*/nullptr);
+        // Hand the impl pointer as the per-exportable user_data. onExportShm
+        // re-casts it back. Holds a raw pointer; the shared_ptr lives in views_.
+        WpeWebViewImpl* impl = pendingImpl.get();
+
+        auto* exportable = wpe_view_backend_exportable_fdo_create(
+            &client, /*user_data=*/impl, landscapeW_, landscapeH_);
         if (!exportable) {
-            fprintf(stderr, "[WpeBackend] primeWpeView: exportable_fdo_create failed\n");
-            return;
+            fprintf(stderr, "[WpeBackend] createOnePooledView: exportable_fdo_create failed\n");
+            return nullptr;
         }
         auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable);
         WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
@@ -625,51 +666,38 @@ private:
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
 
-        // Set up the three script-message-handler bridges Electrobun's
-        // preload pipeline expects (window.webkit.messageHandlers.{bunBridge,
-        // internalBridge, eventBridge}.postMessage). We register all three
-        // unconditionally — the per-webview FFI callbacks (set later in
-        // createWebview) decide whether to forward each message to Bun.
-        // Same shape as nativeWrapper.cpp:2275-2297 in the GTK path.
+        // Bridges: per-view user content manager → per-view callbacks. The
+        // signal handlers cast user_data back to WpeWebViewImpl* so multi-
+        // view bridge messages route to the right webviewId.
         WebKitUserContentManager* manager = webkit_web_view_get_user_content_manager(webView);
         g_signal_connect(manager, "script-message-received::bunBridge",
-                         G_CALLBACK(&WpeBackend::onBunBridgeMessageStatic), this);
+                         G_CALLBACK(&WpeBackend::onBunBridgeMessageStatic), impl);
         webkit_user_content_manager_register_script_message_handler(manager, "bunBridge", nullptr);
         g_signal_connect(manager, "script-message-received::internalBridge",
-                         G_CALLBACK(&WpeBackend::onInternalBridgeMessageStatic), this);
+                         G_CALLBACK(&WpeBackend::onInternalBridgeMessageStatic), impl);
         webkit_user_content_manager_register_script_message_handler(manager, "internalBridge", nullptr);
         g_signal_connect(manager, "script-message-received::eventBridge",
-                         G_CALLBACK(&WpeBackend::onEventBridgeMessageStatic), this);
+                         G_CALLBACK(&WpeBackend::onEventBridgeMessageStatic), impl);
         webkit_user_content_manager_register_script_message_handler(manager, "eventBridge", nullptr);
 
-        // Wire navigation + load signals before the placeholder load so the
-        // same handlers that serve user-app navigations also see the
-        // placeholder's load events. The thunks early-return while
-        // primaryView_ / eventHandler_ are still nullptr (createWebview
-        // installs eventHandler_ later), so the placeholder fires no
-        // user-visible events.
-        g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeBackend::onDecidePolicyStatic), this);
-        g_signal_connect(webView, "load-changed",  G_CALLBACK(&WpeBackend::onLoadChangedStatic),  this);
-        g_signal_connect(webView, "load-failed",   G_CALLBACK(&WpeBackend::onLoadFailedStatic),   this);
+        // Navigation + load signals — same per-view binding as bridges.
+        g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeBackend::onDecidePolicyStatic), impl);
+        g_signal_connect(webView, "load-changed",  G_CALLBACK(&WpeBackend::onLoadChangedStatic),  impl);
+        g_signal_connect(webView, "load-failed",   G_CALLBACK(&WpeBackend::onLoadFailedStatic),   impl);
 
-        // Load a placeholder HTML so the webview has content before the user's
-        // createWebview swaps in their URL. Pre-loop load like wpe_hello.
-        if (!g_getenv("ELECTROBUN_NO_PLACEHOLDER")) {
-            webkit_web_view_load_html(webView,
-                "<html><head><style>html,body{margin:0;padding:0;width:100%;height:100%;}"
-                "body{background:linear-gradient(90deg,#1e2a56,#314580);"
-                "color:white;display:flex;align-items:center;justify-content:center;"
-                "font-family:sans-serif;font-weight:800;font-size:80px;letter-spacing:1px}"
-                ".dot{color:#ffbe2e}</style></head>"
-                "<body><span>Electrobun WPE<span class='dot'>.</span></span></body></html>",
-                nullptr);
-        }
+        // Pre-load about:blank so the WebProcess is alive and the view is
+        // ready to render the moment createWebview swaps in the user's URL.
+        // This is also what satisfies WPE-FDO's pre-loop expectation that
+        // each view goes through one full load before the loop iterates.
+        webkit_web_view_load_uri(webView, "about:blank");
 
-        auto view = std::make_shared<WpeWebViewImpl>(/*webviewId=*/1, this, webView, exportable);
-        view->userContentManager_ = manager;  // for addPreloadScriptToWebView in createWebview
-        primaryView_ = view.get();
-        views_.push_back(view);
-        fprintf(stderr, "[WpeBackend] primeWpeView: ready, primary=%p\n", (void*)view.get()); fflush(stderr);
+        impl->webView_ = webView;
+        impl->exportable_ = exportable;
+        impl->userContentManager_ = manager;
+        impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+
+        views_.push_back(pendingImpl);
+        return impl;
     }
 
     int rotationFromEnvOrDefault() {
@@ -710,31 +738,28 @@ private:
 
     // ---- Navigation signal thunks ----
     //
-    // Hop from the WpeBackend* user_data we passed to g_signal_connect over
-    // to the (single) WpeWebViewImpl. WpeWebViewImpl doesn't exist yet at
-    // signal-connect time (we make_shared it a few lines later), so we can't
-    // pass it directly — but every signal eventually fires after
-    // primeWpeView returns, by which point primaryView_ is set. The
-    // null-checks cover the "placeholder load fires before createWebview
-    // wires eventHandler_" interleaving.
+    // user_data is the WpeWebViewImpl* the signal was connected on
+    // (createOnePooledView passes the impl directly). The per-view eventHandler_
+    // is null until createWebview binds the user's callbacks; until then the
+    // thunks see no eventHandler_ and skip user-visible event emission.
     static gboolean onDecidePolicyStatic(WebKitWebView* w,
                                          WebKitPolicyDecision* d,
                                          WebKitPolicyDecisionType t,
                                          gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return FALSE;
-        return self->primaryView_->onDecidePolicy(w, d, t);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return FALSE;
+        return impl->onDecidePolicy(w, d, t);
     }
     static void onLoadChangedStatic(WebKitWebView* w, WebKitLoadEvent e, gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return;
-        self->primaryView_->onLoadChanged(w, e);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return;
+        impl->onLoadChanged(w, e);
     }
     static gboolean onLoadFailedStatic(WebKitWebView* w, WebKitLoadEvent e,
                                        gchar* uri, GError* error, gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return FALSE;
-        return self->primaryView_->onLoadFailed(w, e, uri, error);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return FALSE;
+        return impl->onLoadFailed(w, e, uri, error);
     }
 
     // ---- Webview→Bun message bridge thunks ----
@@ -770,49 +795,51 @@ private:
     static void onBunBridgeMessageStatic(WebKitUserContentManager*,
                                          JSCValue* value,
                                          gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return;
-        forwardBridgeMessage(self->primaryView_->bunBridgeHandler_,
-                             self->primaryView_->webviewId, value);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return;
+        forwardBridgeMessage(impl->bunBridgeHandler_, impl->webviewId, value);
     }
     static void onInternalBridgeMessageStatic(WebKitUserContentManager*,
                                               JSCValue* value,
                                               gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return;
-        forwardBridgeMessage(self->primaryView_->internalBridgeHandler_,
-                             self->primaryView_->webviewId, value);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return;
+        forwardBridgeMessage(impl->internalBridgeHandler_, impl->webviewId, value);
     }
     static void onEventBridgeMessageStatic(WebKitUserContentManager*,
                                            JSCValue* value,
                                            gpointer user_data) {
-        auto* self = static_cast<WpeBackend*>(user_data);
-        if (!self || !self->primaryView_) return;
-        forwardBridgeMessage(self->primaryView_->eventBridgeHandler_,
-                             self->primaryView_->webviewId, value);
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl) return;
+        forwardBridgeMessage(impl->eventBridgeHandler_, impl->webviewId, value);
     }
 
     // ---- SHM export → DRM blit ----
 
     static void onExportShmStatic(void* userData, struct wpe_fdo_shm_exported_buffer* buffer) {
+        auto* impl = static_cast<WpeWebViewImpl*>(userData);
         static std::atomic<int> n{0};
         int i = ++n;
         if (i <= 3 || (i % 60) == 0) {
-            fprintf(stderr, "[WpeBackend] onExportShm #%d\n", i); fflush(stderr);
+            fprintf(stderr, "[WpeBackend] onExportShm #%d (view %p, webviewId=%u)\n",
+                    i, (void*)impl, impl ? impl->webviewId : 0u); fflush(stderr);
         }
-        static_cast<WpeBackend*>(userData)->onExportShm(buffer);
+        if (!impl || !impl->backend_) return;
+        impl->backend_->onViewExportedShm(impl, buffer);
     }
 
-    void onExportShm(struct wpe_fdo_shm_exported_buffer* buffer) {
-        if (!primaryView_ || !display_) {
-            // Can't blit without a target. Release and ask for the next frame
-            // so WPE doesn't stall.
-            if (primaryView_ && primaryView_->exportable()) {
-                wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-                    primaryView_->exportable(), buffer);
-                wpe_view_backend_exportable_fdo_dispatch_frame_complete(
-                    primaryView_->exportable());
-            }
+    // Per-view SHM frame arrival. In commit 1 we still render single-source:
+    // only the primaryView_'s buffer hits the DRM blit. Non-primary views
+    // (about:blank in pool, or non-topmost active) get their buffers released
+    // immediately so WPE-FDO keeps producing frames without backpressure.
+    // Commit 2 (composite) replaces this branch with a coalesced compose pass.
+    void onViewExportedShm(WpeWebViewImpl* view,
+                           struct wpe_fdo_shm_exported_buffer* buffer) {
+        if (!view || !view->exportable()) return;
+        if (view != primaryView_ || !display_) {
+            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+                view->exportable(), buffer);
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
             return;
         }
 
@@ -834,9 +861,8 @@ private:
         }
 
         wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-            primaryView_->exportable(), buffer);
-        wpe_view_backend_exportable_fdo_dispatch_frame_complete(
-            primaryView_->exportable());
+            view->exportable(), buffer);
+        wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
     }
 
     // rotationQuarters_ of 0 = no rotation (straight copy), respect pitches.
@@ -984,6 +1010,8 @@ private:
     }
 
     void teardown() {
+        activeViews_.clear();
+        freePool_.clear();
         views_.clear();
         primaryView_ = nullptr;
         if (input_) { input_->stop(); input_.reset(); }
@@ -1000,10 +1028,24 @@ private:
     uint32_t                          landscapeH_ = 0;
     int                               rotationQuarters_ = 0;
 
-    std::vector<std::shared_ptr<AbstractView>> views_;
-    WpeWebViewImpl*                            primaryView_ = nullptr;  // non-owning; first webview
+    std::vector<std::shared_ptr<AbstractView>> views_;        // owns all N pre-allocated views
+    std::vector<WpeWebViewImpl*>               freePool_;     // available for createWebview
+    std::vector<WpeWebViewImpl*>               activeViews_;  // in z-order; back = topmost
+    WpeWebViewImpl*                            primaryView_ = nullptr;  // topmost active view
     std::atomic<uint64_t>                      framesRendered_{0};
     bool                                       signalsInstalled_ = false;
+
+    // Default 5 (chrome bar + ~4 app views). Override with ELECTROBUN_WPE_MAX_VIEWS.
+    // Each pre-allocated view spawns its own WebProcess at primeWpeView time
+    // (~50-100MB resident on Pi), so don't crank this without reason.
+    static int maxViewsFromEnvOrDefault() {
+        const char* s = g_getenv("ELECTROBUN_WPE_MAX_VIEWS");
+        if (!s || !*s) return 5;
+        int n = atoi(s);
+        if (n < 1)  return 1;
+        if (n > 32) return 32;
+        return n;
+    }
 };
 
 } // namespace wpe
