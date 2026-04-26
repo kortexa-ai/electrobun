@@ -1006,36 +1006,58 @@ private:
     // ---- Input translation ----
     //
     // InputDispatcher gives us normalized (0..1) coords in the DRM-native
-    // coordinate system (screenWidth × screenHeight). We map back to pixel,
-    // then apply the inverse of the blit rotation to get WPE-landscape pixel
-    // coords, then dispatch a WPE pointer event so the page handles the
-    // touch as a mouse click (which the HTML `click` listener expects).
+    // coordinate system. We map back to pixel, then apply the inverse blit
+    // rotation to get landscape (composite-space) pixel coords, then hit-test
+    // against active views in reverse-z order (topmost first) to pick the
+    // target. The final pointer event uses view-local coords so the page's
+    // event.clientX/Y come out right.
+    //
+    // Touch slot bookkeeping lives on the backend (touchSlots_): a TouchDown
+    // captures the target view + view-local coords; subsequent Motion/Up
+    // events route to the same view even if the finger drifts outside its
+    // bounds, matching standard "implicit pointer capture" behavior.
     void onInputEvent(const InputEvent& ev) {
-        if (!primaryView_ || !display_) return;
-        auto* vb = primaryView_->viewBackend();
-        if (!vb) return;
+        if (!display_ || activeViews_.empty()) return;
 
         const uint32_t screenW = display_->logicalWidth();
         const uint32_t screenH = display_->logicalHeight();
         const int32_t drmX = (int32_t)(ev.x * (double)screenW);
         const int32_t drmY = (int32_t)(ev.y * (double)screenH);
 
-        int32_t wpeX = 0, wpeY = 0;
-        // Inverse of blitWithRotation's mapping.
+        int32_t landX = 0, landY = 0;
         switch (rotationQuarters_) {
-            case 1:  wpeX = drmY;                         wpeY = (int32_t)landscapeH_ - 1 - drmX; break;
-            case 2:  wpeX = (int32_t)landscapeW_ - 1 - drmX; wpeY = (int32_t)landscapeH_ - 1 - drmY; break;
-            case 3:  wpeX = (int32_t)landscapeW_ - 1 - drmY; wpeY = drmX;                           break;
-            default: wpeX = drmX;                         wpeY = drmY;                              break;
+            case 1:  landX = drmY;                            landY = (int32_t)landscapeH_ - 1 - drmX; break;
+            case 2:  landX = (int32_t)landscapeW_ - 1 - drmX; landY = (int32_t)landscapeH_ - 1 - drmY; break;
+            case 3:  landX = (int32_t)landscapeW_ - 1 - drmY; landY = drmX;                            break;
+            default: landX = drmX;                            landY = drmY;                            break;
         }
 
-        auto dispatchPointer = [&](enum wpe_input_pointer_event_type t,
-                                   uint32_t button, uint32_t state) {
+        // Hit-test in reverse-z order: topmost view containing (landX,landY).
+        // Matches nativeWrapper.cpp:7828 (rbegin/rend, first match wins).
+        auto hitTest = [&](int32_t lx, int32_t ly) -> WpeWebViewImpl* {
+            for (auto it = activeViews_.rbegin(); it != activeViews_.rend(); ++it) {
+                WpeWebViewImpl* v = *it;
+                if (!v) continue;
+                const Rect& f = v->frame_;
+                if (lx >= f.x && lx < f.x + f.width &&
+                    ly >= f.y && ly < f.y + f.height) {
+                    return v;
+                }
+            }
+            return nullptr;
+        };
+
+        auto dispatchPointerTo = [&](WpeWebViewImpl* v, int32_t viewX, int32_t viewY,
+                                     enum wpe_input_pointer_event_type t,
+                                     uint32_t button, uint32_t state) {
+            if (!v) return;
+            auto* vb = v->viewBackend();
+            if (!vb) return;
             struct wpe_input_pointer_event pe = {};
             pe.type   = t;
             pe.time   = ev.timeMs;
-            pe.x      = wpeX;
-            pe.y      = wpeY;
+            pe.x      = viewX;
+            pe.y      = viewY;
             pe.button = button;
             pe.state  = state;
             wpe_view_backend_dispatch_pointer_event(vb, &pe);
@@ -1044,30 +1066,39 @@ private:
         switch (ev.type) {
             case InputEventType::TouchDown: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
-                primaryView_->lastTouchX_[s] = wpeX;
-                primaryView_->lastTouchY_[s] = wpeY;
-                dispatchPointer(wpe_input_pointer_event_type_motion, 0, 0);
-                dispatchPointer(wpe_input_pointer_event_type_button, 1, 1);
+                WpeWebViewImpl* target = hitTest(landX, landY);
+                if (!target) target = activeViews_.back();  // fallback: topmost
+                const int32_t viewX = landX - target->frame_.x;
+                const int32_t viewY = landY - target->frame_.y;
+                touchSlots_[s].view = target;
+                touchSlots_[s].x    = viewX;
+                touchSlots_[s].y    = viewY;
+                target->lastTouchX_[s] = viewX;
+                target->lastTouchY_[s] = viewY;
+                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_motion, 0, 0);
+                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_button, 1, 1);
                 break;
             }
             case InputEventType::TouchMotion: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
-                primaryView_->lastTouchX_[s] = wpeX;
-                primaryView_->lastTouchY_[s] = wpeY;
-                dispatchPointer(wpe_input_pointer_event_type_motion, 0, 0);
+                WpeWebViewImpl* target = touchSlots_[s].view;
+                if (!target) break;  // motion without prior down — drop
+                const int32_t viewX = landX - target->frame_.x;
+                const int32_t viewY = landY - target->frame_.y;
+                touchSlots_[s].x = viewX;
+                touchSlots_[s].y = viewY;
+                target->lastTouchX_[s] = viewX;
+                target->lastTouchY_[s] = viewY;
+                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_motion, 0, 0);
                 break;
             }
             case InputEventType::TouchUp: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
-                // Dispatch release at the last known slot coords.
-                struct wpe_input_pointer_event pe = {};
-                pe.type   = wpe_input_pointer_event_type_button;
-                pe.time   = ev.timeMs;
-                pe.x      = primaryView_->lastTouchX_[s];
-                pe.y      = primaryView_->lastTouchY_[s];
-                pe.button = 1;
-                pe.state  = 0;
-                wpe_view_backend_dispatch_pointer_event(vb, &pe);
+                WpeWebViewImpl* target = touchSlots_[s].view;
+                if (!target) break;
+                dispatchPointerTo(target, touchSlots_[s].x, touchSlots_[s].y,
+                                  wpe_input_pointer_event_type_button, 1, 0);
+                touchSlots_[s].view = nullptr;
                 break;
             }
             case InputEventType::PointerMotion:
@@ -1116,6 +1147,16 @@ private:
     // blitWithRotation pushes the result to DRM. ~3.7MB at 1920x480.
     std::vector<uint8_t>                       compositeBuffer_;
     bool                                       composeScheduled_ = false;
+
+    // Per-touch-slot capture state. TouchDown picks a target view; subsequent
+    // Motion/Up on the same slot stick with that view (implicit pointer
+    // capture). Cleared on Up.
+    struct TouchSlotState {
+        WpeWebViewImpl* view = nullptr;
+        int32_t         x    = 0;
+        int32_t         y    = 0;
+    };
+    TouchSlotState                             touchSlots_[16] = {};
 
     // Default 5 (chrome bar + ~4 app views). Override with ELECTROBUN_WPE_MAX_VIEWS.
     // Each pre-allocated view spawns its own WebProcess at primeWpeView time
