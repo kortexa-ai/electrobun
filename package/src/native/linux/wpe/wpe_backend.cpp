@@ -234,8 +234,15 @@ public:
                                                 nullptr, nullptr, nullptr);
         }
     }
-    void callAsyncJavascript(const char*, const char*, uint32_t, uint32_t, void*) override {
-        // TODO(phase2.next): mirror WebKitGTK callAsyncJavaScript pattern.
+    void callAsyncJavascript(const char*, const char* jsString,
+                             uint32_t, uint32_t, void*) override {
+        // Mainline Electrobun does not bind callAsyncJavaScript on the Bun
+        // side (see package/src/bun/proc/native.ts:268 — "Users can use RPC
+        // for JavaScript execution"). The macOS impl is fully written but
+        // unreachable; GTK/CEF/Win are stubs. We match GTK: fire-and-forget
+        // the JS so the symbol does the lexically-closest thing if anyone
+        // ever wires the Bun binding back up.
+        evaluateJavaScriptWithNoCompletion(jsString);
     }
     void addPreloadScriptToWebView(const char* jsString) override {
         // Inject at DOCUMENT_START on every navigation. Used to set up the
@@ -252,7 +259,21 @@ public:
         webkit_user_content_manager_add_script(userContentManager_, script);
         webkit_user_script_unref(script);
     }
-    void updateCustomPreloadScript(const char*) override { /* TODO(phase2.next) */ }
+    void updateCustomPreloadScript(const char* jsString) override {
+        // Mirrors nativeWrapper.cpp:2473 (GTK path). Wipe all user scripts,
+        // re-inject electrobun preload (load-bearing for window.__electrobun*
+        // globals) followed by the new custom preload. Script-message
+        // handlers are separate registrations and survive remove_all_scripts.
+        customPreloadScript_ = jsString ? jsString : "";
+        if (!userContentManager_) return;
+        webkit_user_content_manager_remove_all_scripts(userContentManager_);
+        if (!electrobunPreloadScript_.empty()) {
+            addPreloadScriptToWebView(electrobunPreloadScript_.c_str());
+        }
+        if (!customPreloadScript_.empty()) {
+            addPreloadScriptToWebView(customPreloadScript_.c_str());
+        }
+    }
 
     void resize(const Rect& frame, const char* masksJson) override {
         visualBounds = frame;
@@ -298,6 +319,11 @@ public:
     HandlePostMessage internalBridgeHandler_ = nullptr;
     HandlePostMessage eventBridgeHandler_    = nullptr;
     WebKitUserContentManager* userContentManager_ = nullptr;  // not owned
+
+    // Latest preload scripts for this view. updateCustomPreloadScript wipes
+    // and re-injects both, so we need to remember the electrobun one.
+    std::string electrobunPreloadScript_;
+    std::string customPreloadScript_;
 
     // ---- Navigation event handlers ----
     //
@@ -383,6 +409,7 @@ private:
     // Per-slot last touch position so TouchUp (no coords) can dispatch at the right spot.
     int32_t                                  lastTouchX_[16] = {0};
     int32_t                                  lastTouchY_[16] = {0};
+
 };
 
 // ---------------------------------------------------------------------------
@@ -393,6 +420,15 @@ class WpeBackend : public IDisplayBackend, public IWebviewBackend {
 public:
     WpeBackend() = default;
     ~WpeBackend() override { teardown(); }
+
+    // FFI exports that take only a webviewId (no AbstractView*) reach the
+    // impl through here. Single-view kiosk → just check primaryView_.
+    AbstractView* findViewById(uint32_t webviewId) {
+        if (primaryView_ && primaryView_->webviewId == webviewId) {
+            return primaryView_;
+        }
+        return nullptr;
+    }
 
     // IDisplayBackend
 
@@ -494,11 +530,20 @@ public:
         primaryView_->bunBridgeHandler_      = (HandlePostMessage)spec.bunBridgeHandler;
         primaryView_->internalBridgeHandler_ = (HandlePostMessage)spec.internalBridgeHandler;
         primaryView_->eventBridgeHandler_    = (HandlePostMessage)spec.eventBridgeHandler;
+        // Stash both preload strings on the impl. updateCustomPreloadScript
+        // re-injects from these on swap, so they need to live longer than
+        // the spec.
+        primaryView_->electrobunPreloadScript_ = spec.electrobunPreloadScript;
+        primaryView_->customPreloadScript_     = spec.customPreloadScript;
         // Inject the Electrobun preload script (sets up window.__electrobun*
-        // globals and the full preload pipeline). Must happen BEFORE loadURL
-        // so it runs at document-start of the user's URL load.
+        // globals and the full preload pipeline) followed by the app-supplied
+        // custom preload (BrowserWindow's `preload` option). Both must run at
+        // document-start, so they happen BEFORE loadURL.
         if (!spec.electrobunPreloadScript.empty()) {
             primaryView_->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
+        }
+        if (!spec.customPreloadScript.empty()) {
+            primaryView_->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
         }
         if (!spec.url.empty() && !g_getenv("ELECTROBUN_SKIP_USER_URL")) {
             std::string url = spec.url;  // capture by value
@@ -973,5 +1018,9 @@ wpe::WpeBackend& wpeBackendInstance() {
 
 IDisplayBackend& currentDisplayBackend() { return wpeBackendInstance(); }
 IWebviewBackend& currentWebviewBackend() { return wpeBackendInstance(); }
+
+AbstractView* wpeFindViewById(uint32_t webviewId) {
+    return wpeBackendInstance().findViewById(webviewId);
+}
 
 } // namespace electrobun

@@ -68,6 +68,12 @@ static void warnOnce(const char* name) {
 static std::atomic<QuitRequestedHandler> g_quitRequestedHandler{nullptr};
 QuitRequestedHandler wpeGetQuitRequestedHandler() { return g_quitRequestedHandler.load(); }
 
+// Defined in wpe/wpe_backend.cpp. Returns the (single) AbstractView matching
+// the given webviewId, or nullptr if it hasn't been created yet. Used by the
+// FFI exports below that take only a webviewId (no AbstractView*) to dispatch
+// to the impl.
+namespace electrobun { AbstractView* wpeFindViewById(uint32_t webviewId); }
+
 // ---------------------------------------------------------------------------
 // extern "C" — exported FFI surface
 // ---------------------------------------------------------------------------
@@ -276,7 +282,6 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             bool transparent,
                                             bool sandbox) {
     (void)autoResize;
-    (void)customPreloadScript;
     (void)viewsRoot; (void)transparent;
     g_nextStartTransparent.store(false);
     g_nextStartPassthrough.store(false);
@@ -295,6 +300,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.bunBridgeHandler     = (void*)bunBridgeHandler;
     spec.internalBridgeHandler= (void*)internalBridgeHandler;
     spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
+    spec.customPreloadScript     = customPreloadScript     ? customPreloadScript     : "";
 
     auto view = currentWebviewBackend().createWebview(spec);
     return view ? view.get() : nullptr;
@@ -362,8 +368,10 @@ ELECTROBUN_EXPORT void addPreloadScriptToWebView(AbstractView* v, const char* sc
 }
 
 ELECTROBUN_EXPORT void callAsyncJavaScript(const char* messageId, const char* jsString, uint32_t webviewId, uint32_t hostWebviewId, void* completionHandler) {
-    (void)messageId; (void)jsString; (void)webviewId; (void)hostWebviewId; (void)completionHandler;
-    warnOnce("callAsyncJavaScript");
+    AbstractView* v = wpeFindViewById(webviewId);
+    if (!v || !jsString || !completionHandler) return;
+    v->callAsyncJavascript(messageId ? messageId : "", jsString,
+                           webviewId, hostWebviewId, completionHandler);
 }
 
 // ===========================================================================

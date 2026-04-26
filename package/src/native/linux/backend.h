@@ -67,6 +67,10 @@ struct WebviewSpec {
     // and runs Electrobun's full preload pipeline (RPC, drag regions, webview
     // tag support, lifecycle events). Empty string = no injection.
     std::string electrobunPreloadScript;
+    // App-supplied preload script (BrowserWindow/BrowserView `preload` option).
+    // Injected at document-start alongside electrobunPreloadScript and
+    // re-applied by updateCustomPreloadScript. Empty string = no injection.
+    std::string customPreloadScript;
 };
 
 // Display backend: owns the platform window, the output surface, and the
