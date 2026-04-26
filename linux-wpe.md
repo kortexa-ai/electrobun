@@ -1026,3 +1026,71 @@ Test app at `/home/pi/src/hello-embedded` got these adjustments — kept around 
 - **Comments in `nativeWrapper_wpe.cpp:383+` mark a "Navigation action / script message helpers (legacy — unused on WPE)" block as legacy.** That comment is now misleading — navigation IS used on WPE. Either delete the legacy block or update the comment. One-line cleanup, deferred.
 - **`webview.on("load-failed", …)` handler in hello-embedded was sketched in §16 but not wired**. The `load-failed` C++ thunk is in place, but Bun's `BrowserView.on()` whitelist (`BrowserView.ts:304-314`) doesn't include `"load-failed"` — adding it requires touching the cross-platform event surface, which is in scope for a different cleanup session (the same one that wires `navigationCallback_`).
 
+
+## 18. Session results (2026-04-25, follow-up — kiosk chrome bar prototype)
+
+**Goal:** give the bare-DRM kiosk a way to exit back to TTY without `pkill`. On macOS/GTK the OS provides a titlebar with a close button; on bare-DRM there's no compositor, no titlebar, no [X]. So today the only way out is killing the process from another terminal.
+
+**Decision:** _no new Electrobun abstraction._ Instead, mirror what macOS already exposes:
+- Set `titleBarStyle: "hidden"` on the BrowserWindow → on macOS/GTK this removes native chrome (so the in-page chrome isn't doubled up); on WPE-on-DRM this is a no-op since there's no native chrome anyway.
+- The app draws its own chrome bar in HTML/CSS (a `<header>` pinned to the top, app body fills the rest).
+- The chrome's [X] button calls a Bun-side RPC that invokes `Utils.quit()` to drive the existing shutdown path.
+
+**Why not a separate chrome webview?** WpeBackend is single-view by design — DRM has one scanout plane, the SHM exporter wires one WebKitWebView to one fullscreen frame. Compositing N webviews into one scanout would require extending `onExportShm` to merge buffers, which is real work for a feature that doesn't need it on macOS/GTK either.
+
+**Why `Utils.quit()` not `BrowserWindow.close()`?** On WPE the window-close callback is not wired (kiosk has a degenerate single-fullscreen-window lifecycle, see `nativeWrapper_wpe.cpp:171`). Calling `close()` would call `stopEventLoop()` → `g_main_loop_quit()`, but Bun never observes the close event, so it stays running and the process hangs. `Utils.quit()` calls `stopEventLoop` + `forceExit(0)` which causes the process to terminate, which runs `~WpeBackend()` → `teardown()` → `display_.reset()` (DRM master drop). Verified in `package/src/bun/core/Utils.ts:122-146`. The WPE seam already exposes `waitForShutdownComplete` and `forceExit` (lines 106-113 of `nativeWrapper_wpe.cpp`), so Bun's `quit()` works end-to-end.
+
+### What shipped (after two ratchets)
+
+**First attempt:** wired `[✕]` via the standard Electrobun RPC (`Electroview.defineRPC` + `BrowserView.defineRPC`). **Silently broke both buttons.** Root cause: `Electroview.init()` does `window.__electrobun!.receiveMessageFromBun = …` (`browser/index.ts:36`), throws TypeError because `window.__electrobun` is never set on WPE — the WPE seam discarded `electrobunPreloadScript` (`nativeWrapper_wpe.cpp:279` had `(void)electrobunPreloadScript;`). The throw killed the rest of the view's `index.ts`, including the pure-CSS `[⛶]` toggle.
+
+**Stopgap:** chrome `[✕]` does `window.location.href = "electrobun://quit"`, fires `decide-policy` → `will-navigate` → Bun's listener pattern-matches the URL and calls `Utils.quit()`. Worked, but page2 had no chrome (manually duplicated as a workaround that doesn't generalize past two pages).
+
+**Final state:** ported the WPE preload + script-message-handler bridge, then added auto-chrome injection to the preload pipeline. No app-side chrome HTML or wiring needed — `titleBarStyle: "hidden"` is the entire opt-in.
+
+### Files touched
+
+**electrobun package (the bridge port + auto-chrome):**
+- `package/src/native/linux/backend.h` — added `std::string electrobunPreloadScript;` to `WebviewSpec`.
+- `package/src/native/linux/nativeWrapper_wpe.cpp::initWebview` — populated `spec.electrobunPreloadScript` instead of discarding it.
+- `package/src/native/linux/wpe/wpe_backend.cpp`:
+  - Added `#include <chrono>` + `<thread>` (for the GTK-pattern deferred-free).
+  - `WpeWebViewImpl`: added `bunBridgeHandler_` / `internalBridgeHandler_` / `eventBridgeHandler_` (typed `HandlePostMessage`) + non-owning `WebKitUserContentManager* userContentManager_`. Implemented `addPreloadScriptToWebView` (was a TODO stub) using `webkit_user_script_new` + `webkit_user_content_manager_add_script` with `WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START`.
+  - `WpeBackend::primeWpeView`: pulled the user content manager via `webkit_web_view_get_user_content_manager(webView)`, registered three `script-message-received::{bunBridge,internalBridge,eventBridge}` signal handlers + `webkit_user_content_manager_register_script_message_handler(manager, "...", nullptr)` (WPE's 3-arg form, the doc example showing 2-arg is stale). Stored the manager on the impl so `addPreloadScriptToWebView` can reach it.
+  - `WpeBackend::createWebview`: copies `spec.bunBridgeHandler` / `internalBridgeHandler` / `eventBridgeHandler` onto the impl and calls `primaryView_->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str())` BEFORE the deferred `loadURL` so it injects at document-start of the user URL.
+  - Added `forwardBridgeMessage` helper + 3 static thunks (`onBunBridgeMessageStatic` etc.). **WPE-WebKit 2.0 API drift:** the signal callback receives `JSCValue*` directly (not `WebKitJavascriptResult*` like older GTK). Skip `webkit_javascript_result_get_js_value` — the GTK code in `nativeWrapper.cpp:2630-2715` was the wrong template for this part. Lifetime: same "leak then free 1s later in detached thread" pattern GTK uses, because the Bun JSCallback may still be using the string async.
+- `package/src/bun/preload/chrome.ts` — **new file.** Auto-injected chrome `<header>` with `[⛶]` + `[✕]`. Idempotent (skips if already present). Reads `window.__electrobunTitleBarStyle === "hidden"` to decide whether to inject. Title pulled from `document.title` and updated via `MutationObserver` so single-page apps get correct titles. `[✕]` calls `send("electrobunChromeQuit", {})` (internal RPC). `[⛶]` sets `data-hidden` on the header + a `data-electrobun-chrome-hidden` flag on `<body>` (which the injected `<style>` reads to remove `padding-top`). Hidden state persisted via `sessionStorage` (`__electrobun_chrome_hidden`) so navigating between pages preserves the user's choice.
+- `package/src/bun/preload/index.ts` — call `initChrome()` after the other inits.
+- `package/src/bun/preload/globals.d.ts` — added optional `__electrobunTitleBarStyle` global.
+- `package/src/bun/proc/native.ts` — read `parentWindow?.titleBarStyle ?? "default"` and emit `window.__electrobunTitleBarStyle = ${JSON.stringify(...)};` into the dynamic preload prefix. Added `internalRpcHandlers.message.electrobunChromeQuit` handler that inline-requires `Utils.quit`.
+- `package/src/bun/core/BrowserWindow.ts` — store `titleBarStyle` as a member field so the FFI side can read it.
+
+**hello-embedded (reverted to clean — no chrome HTML):**
+- `src/bun/index.ts` — just `titleBarStyle: "hidden"` on the BrowserWindow + the will-navigate logging.
+- `src/main/index.html` — original orange-on-charcoal app body, no `<header>`. Generic `button {}` scoped to `.card button` so the home page's "Press me" doesn't bleed into nav-test. nav-test uses two `<button>` elements (not `<a>`+`<button>`) for baseline alignment.
+- `src/main/index.ts` — original frame counter + click counter. No chrome wiring at all.
+- `src/main/page2.html` — back to the original minimal page (no chrome HTML).
+
+### Verified end-to-end on the bar panel (2026-04-25)
+
+- ✅ Chrome auto-injects on home page (no app code touched).
+- ✅ Chrome auto-injects on page2 too (cross-page proof).
+- ✅ `[✕]` quits cleanly via real RPC; DRM master released; relaunch succeeds.
+- ✅ `[⛶]` hides chrome; tap body to bring it back. Persists via sessionStorage across navigation.
+- ✅ Bridge port works — `Electroview.defineRPC` would now succeed (verified by the chrome's `send("electrobunChromeQuit", ...)` reaching the Bun-side handler).
+
+### Gotchas surfaced this session
+
+- **WPE-WebKit 2.0 deprecated `WebKitJavascriptResult`.** The `script-message-received` signal callback now receives `JSCValue*` directly. The old GTK code with `webkit_javascript_result_get_js_value(js_result)` doesn't compile — the function isn't declared anywhere reachable from `wpe/webkit.h`. Skipped that step, used `JSCValue*` as the param type.
+- **`webkit_user_content_manager_register_script_message_handler` is 3-arg in WPE.** Doc-comment example shows 2-arg `(manager, "name")` but actual signature is `(manager, name, world_name)`. Pass `nullptr` for default world. Compiler error pointed straight at the line.
+- **Inline `style="display: flex"` on the chrome `<header>` outranks external CSS without `!important`.** First version of `[⛶]` toggle changed the body padding (with `!important`) but the bar stayed visible. Adding `!important` to `[data-electrobun-chrome="true"][data-hidden] { display: none !important; }` fixed it.
+- **`[✕]` is a tap-target hazard right next to `[⛶]`.** User accidentally tapped close instead of fullscreen multiple times. Future polish: separate them, or make `[✕]` require confirmation, or move `[✕]` to a different corner. Deferred.
+
+### Open follow-ups
+
+- **`[⛶]` and `[✕]` are too close on a touchscreen.** Visual or spatial separation needed.
+- **Chrome bar height/padding on the 1920×480 panel.** Currently 44px fixed. Buttons sometimes overflow at narrow widths. Tune `font-size` or use viewport-relative units that scale to actual height. Not blocking.
+- **macOS traffic lights with `titleBarStyle: "hidden"`?** `"hidden"` removes them entirely. If you want traffic lights on macOS while having in-page chrome, switch macOS to `"hiddenInset"` and offset the chrome's leading padding to clear them.
+- **`closeWindow` callback not wired on WPE.** If a future session adds programmatic window close (`BrowserWindow.close()` instead of `Utils.quit()`), wire the close callback so Bun's `BrowserWindowMap` cleanup runs and `exitOnLastWindowClosed` triggers `Utils.quit()`. Today the only programmatic exit is `Utils.quit()` directly.
+- **`callAsyncJavascript` and `updateCustomPreloadScript` on WpeWebViewImpl** are still TODO stubs — not exercised by the chrome flow but the next webview-tag or context-menu work will hit them.
+- **Chrome theming** is hard-coded charcoal/orange in `chrome.ts`. Apps will eventually want to override colors / hide buttons / customize. Probably opt-in via window options (`chrome: { background, accent, buttons: [...] }`) once a second use case emerges.

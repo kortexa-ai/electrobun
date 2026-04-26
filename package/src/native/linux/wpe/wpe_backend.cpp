@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -45,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace electrobun {
@@ -235,7 +237,21 @@ public:
     void callAsyncJavascript(const char*, const char*, uint32_t, uint32_t, void*) override {
         // TODO(phase2.next): mirror WebKitGTK callAsyncJavaScript pattern.
     }
-    void addPreloadScriptToWebView(const char*) override { /* TODO(phase2.next): user content manager */ }
+    void addPreloadScriptToWebView(const char* jsString) override {
+        // Inject at DOCUMENT_START on every navigation. Used to set up the
+        // window.__electrobun* globals + the Electrobun preload pipeline so
+        // the standard RPC / drag-regions / webview-tag features work on
+        // WPE the same way they do on macOS/GTK. WpeBackend::primeWpeView
+        // assigns userContentManager_ before this is callable; createWebview
+        // is the first user of it.
+        if (!userContentManager_ || !jsString || !*jsString) return;
+        WebKitUserScript* script = webkit_user_script_new(jsString,
+            WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            nullptr, nullptr);
+        webkit_user_content_manager_add_script(userContentManager_, script);
+        webkit_user_script_unref(script);
+    }
     void updateCustomPreloadScript(const char*) override { /* TODO(phase2.next) */ }
 
     void resize(const Rect& frame, const char* masksJson) override {
@@ -267,6 +283,21 @@ public:
     DecideNavigationCallback navigationCallback_ = nullptr;
     WebviewEventHandler      eventHandler_       = nullptr;
     bool                     lastNavigationWasBlocked_ = false;
+
+    // ---- Webview→Bun message bridges (set by WpeBackend::createWebview) ----
+    //
+    // The three script-message-handler channels Electrobun expects on every
+    // webview. JS-side gets window.webkit.messageHandlers.{bunBridge,
+    // internalBridge, eventBridge}.postMessage(json); the registered
+    // signal handlers in WpeBackend forward the payload to these JSCallbacks
+    // which marshal back to Bun. WPE primeWpeView creates the
+    // userContentManager_ and registers the handlers so even before
+    // createWebview runs, the JS bridges exist (they just route to a null
+    // callback that early-returns).
+    HandlePostMessage bunBridgeHandler_      = nullptr;
+    HandlePostMessage internalBridgeHandler_ = nullptr;
+    HandlePostMessage eventBridgeHandler_    = nullptr;
+    WebKitUserContentManager* userContentManager_ = nullptr;  // not owned
 
     // ---- Navigation event handlers ----
     //
@@ -456,6 +487,19 @@ public:
         // handlers see null eventHandler_ and early-return without firing.
         primaryView_->navigationCallback_ = (DecideNavigationCallback)spec.navigationHandler;
         primaryView_->eventHandler_       = (WebviewEventHandler)spec.webviewEventHandler;
+        // Webview→Bun message bridges. Mirror of nativeWrapper.cpp's GTK
+        // path. Once these are set, the script-message-received signal
+        // handlers (registered in primeWpeView) will forward postMessage
+        // calls from JS to Bun.
+        primaryView_->bunBridgeHandler_      = (HandlePostMessage)spec.bunBridgeHandler;
+        primaryView_->internalBridgeHandler_ = (HandlePostMessage)spec.internalBridgeHandler;
+        primaryView_->eventBridgeHandler_    = (HandlePostMessage)spec.eventBridgeHandler;
+        // Inject the Electrobun preload script (sets up window.__electrobun*
+        // globals and the full preload pipeline). Must happen BEFORE loadURL
+        // so it runs at document-start of the user's URL load.
+        if (!spec.electrobunPreloadScript.empty()) {
+            primaryView_->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
+        }
         if (!spec.url.empty() && !g_getenv("ELECTROBUN_SKIP_USER_URL")) {
             std::string url = spec.url;  // capture by value
             dispatchSyncMain([this, url]() {
@@ -536,6 +580,23 @@ private:
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
 
+        // Set up the three script-message-handler bridges Electrobun's
+        // preload pipeline expects (window.webkit.messageHandlers.{bunBridge,
+        // internalBridge, eventBridge}.postMessage). We register all three
+        // unconditionally — the per-webview FFI callbacks (set later in
+        // createWebview) decide whether to forward each message to Bun.
+        // Same shape as nativeWrapper.cpp:2275-2297 in the GTK path.
+        WebKitUserContentManager* manager = webkit_web_view_get_user_content_manager(webView);
+        g_signal_connect(manager, "script-message-received::bunBridge",
+                         G_CALLBACK(&WpeBackend::onBunBridgeMessageStatic), this);
+        webkit_user_content_manager_register_script_message_handler(manager, "bunBridge", nullptr);
+        g_signal_connect(manager, "script-message-received::internalBridge",
+                         G_CALLBACK(&WpeBackend::onInternalBridgeMessageStatic), this);
+        webkit_user_content_manager_register_script_message_handler(manager, "internalBridge", nullptr);
+        g_signal_connect(manager, "script-message-received::eventBridge",
+                         G_CALLBACK(&WpeBackend::onEventBridgeMessageStatic), this);
+        webkit_user_content_manager_register_script_message_handler(manager, "eventBridge", nullptr);
+
         // Wire navigation + load signals before the placeholder load so the
         // same handlers that serve user-app navigations also see the
         // placeholder's load events. The thunks early-return while
@@ -560,6 +621,7 @@ private:
         }
 
         auto view = std::make_shared<WpeWebViewImpl>(/*webviewId=*/1, this, webView, exportable);
+        view->userContentManager_ = manager;  // for addPreloadScriptToWebView in createWebview
         primaryView_ = view.get();
         views_.push_back(view);
         fprintf(stderr, "[WpeBackend] primeWpeView: ready, primary=%p\n", (void*)view.get()); fflush(stderr);
@@ -628,6 +690,61 @@ private:
         auto* self = static_cast<WpeBackend*>(user_data);
         if (!self || !self->primaryView_) return FALSE;
         return self->primaryView_->onLoadFailed(w, e, uri, error);
+    }
+
+    // ---- Webview→Bun message bridge thunks ----
+    //
+    // Forward postMessage payloads from JS (via the user-content-manager's
+    // script-message-received signal) to the per-webview FFI callback set
+    // by createWebview. WPE-WebKit 2.0 deprecated WebKitJavascriptResult —
+    // the signal now passes JSCValue* directly, so the GTK code in
+    // nativeWrapper.cpp:2630-2715 has an extra `_get_js_value` step that
+    // we skip here.
+    //
+    // Lifetime: GTK uses a "leak then free 1s later in a detached thread"
+    // pattern because the Bun JSCallback may still be using the string
+    // asynchronously when the signal handler returns. We copy the same
+    // semantics to keep behavior identical across targets.
+    static void forwardBridgeMessage(HandlePostMessage handler,
+                                     uint32_t webviewId,
+                                     JSCValue* value) {
+        if (!handler || !value) return;
+        if (!JSC_IS_VALUE(value) || !jsc_value_is_string(value)) return;
+        gchar* str_value = jsc_value_to_string(value);
+        if (!str_value) return;
+        size_t len = strlen(str_value);
+        char* message_copy = new char[len + 1];
+        std::memcpy(message_copy, str_value, len + 1);
+        handler(webviewId, message_copy);
+        std::thread([message_copy, str_value]() {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            delete[] message_copy;
+            g_free(str_value);
+        }).detach();
+    }
+    static void onBunBridgeMessageStatic(WebKitUserContentManager*,
+                                         JSCValue* value,
+                                         gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return;
+        forwardBridgeMessage(self->primaryView_->bunBridgeHandler_,
+                             self->primaryView_->webviewId, value);
+    }
+    static void onInternalBridgeMessageStatic(WebKitUserContentManager*,
+                                              JSCValue* value,
+                                              gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return;
+        forwardBridgeMessage(self->primaryView_->internalBridgeHandler_,
+                             self->primaryView_->webviewId, value);
+    }
+    static void onEventBridgeMessageStatic(WebKitUserContentManager*,
+                                           JSCValue* value,
+                                           gpointer user_data) {
+        auto* self = static_cast<WpeBackend*>(user_data);
+        if (!self || !self->primaryView_) return;
+        forwardBridgeMessage(self->primaryView_->eventBridgeHandler_,
+                             self->primaryView_->webviewId, value);
     }
 
     // ---- SHM export → DRM blit ----

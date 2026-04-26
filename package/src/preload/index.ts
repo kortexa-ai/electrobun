@@ -22,6 +22,7 @@ import { initExternalDropFocusRestoration } from "./externalDropFocus";
 import { initWebviewTag } from "./webviewTag";
 import { initWgpuTag } from "./wgpuTag";
 import { initUiTag } from "./uiTag";
+import { initChrome } from "./chrome";
 import {
 	initHostMessageBridge,
 	initLifecycleEvents,
@@ -75,3 +76,4 @@ initExternalDropFocusRestoration();
 initWebviewTag();
 initWgpuTag();
 initUiTag();
+initChrome();

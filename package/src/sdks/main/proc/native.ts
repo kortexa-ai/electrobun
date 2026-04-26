@@ -3458,6 +3458,15 @@ export const internalRpcHandlers = {
 		},
 	},
 	message: {
+		// Auto-chrome bar's [✕] button (§18 in linux-wpe.md) routes here so
+		// apps that opt into titleBarStyle: "hidden" get a working close
+		// button without any per-app wiring.
+		electrobunChromeQuit: () => {
+			// Inline require to avoid pulling Utils into the module-init cycle
+			// (BrowserWindow → events → Utils path is already touchy).
+			const { quit } = require("../core/Utils");
+			quit();
+		},
 		webviewTagResize: (params: {
 			id: number;
 			frame: { x: number; y: number; width: number; height: number };

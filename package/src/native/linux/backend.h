@@ -62,6 +62,11 @@ struct WebviewSpec {
     void* eventBridgeHandler = nullptr;    // HandlePostMessage  (2 args): JSON-bridge for events from JS preload scripts
     void* bunBridgeHandler = nullptr;
     void* internalBridgeHandler = nullptr;
+    // Compiled JS injected at document-start of every navigation. Sets up
+    // window.__electrobun{WebviewId,WindowId,RpcSocketPort,SecretKeyBytes,*Bridge}
+    // and runs Electrobun's full preload pipeline (RPC, drag regions, webview
+    // tag support, lifecycle events). Empty string = no injection.
+    std::string electrobunPreloadScript;
 };
 
 // Display backend: owns the platform window, the output surface, and the

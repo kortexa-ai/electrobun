@@ -276,7 +276,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             bool transparent,
                                             bool sandbox) {
     (void)autoResize;
-    (void)electrobunPreloadScript; (void)customPreloadScript;
+    (void)customPreloadScript;
     (void)viewsRoot; (void)transparent;
     g_nextStartTransparent.store(false);
     g_nextStartPassthrough.store(false);
@@ -294,6 +294,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.eventBridgeHandler   = (void*)eventBridgeHandler;
     spec.bunBridgeHandler     = (void*)bunBridgeHandler;
     spec.internalBridgeHandler= (void*)internalBridgeHandler;
+    spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
 
     auto view = currentWebviewBackend().createWebview(spec);
     return view ? view.get() : nullptr;

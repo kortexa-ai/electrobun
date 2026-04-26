@@ -35,6 +35,10 @@ declare global {
 		) => Promise<string>;
 		__electrobunSendToHost: (message: unknown) => void;
 		__electrobunPendingHostMessages?: unknown[];
+		// titleBarStyle from BrowserWindow options. When "hidden" the preload
+		// pipeline auto-injects a chrome bar (§18). "default"/"hiddenInset"
+		// suppress injection (the OS or app provides chrome).
+		__electrobunTitleBarStyle?: "default" | "hidden" | "hiddenInset";
 		__electrobun: {
 			receiveMessageFromHost: (msg: unknown) => void;
 			receiveInternalMessageFromHost: (msg: unknown) => void;

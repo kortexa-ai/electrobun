@@ -101,6 +101,7 @@ const TrayState = struct {
 const WindowState = struct {
     ptr: WindowPtr,
     transparent: bool,
+    title_bar_style: TitleBarStyle,
     close_handler: ?WindowCloseHandler,
     should_close_handler: ?WindowShouldCloseHandler,
     move_handler: ?WindowMoveHandler,
@@ -109,6 +110,31 @@ const WindowState = struct {
     blur_handler: ?WindowBlurHandler,
     key_handler: ?WindowKeyHandler,
 };
+
+const TitleBarStyle = enum {
+    default,
+    hidden,
+    hidden_inset,
+};
+
+fn parseTitleBarStyle(value: [*:0]const u8) TitleBarStyle {
+    const style = std.mem.span(value);
+    if (std.mem.eql(u8, style, "hidden")) {
+        return .hidden;
+    }
+    if (std.mem.eql(u8, style, "hiddenInset")) {
+        return .hidden_inset;
+    }
+    return .default;
+}
+
+fn titleBarStyleName(style: TitleBarStyle) []const u8 {
+    return switch (style) {
+        .default => "default",
+        .hidden => "hidden",
+        .hidden_inset => "hiddenInset",
+    };
+}
 
 const WebviewRendererKind = enum {
     native,
@@ -1285,6 +1311,7 @@ fn buildElectrobunPreload(
     window_id: u32,
     secret_key: [*:0]const u8,
     sandbox: bool,
+    title_bar_style: TitleBarStyle,
 ) ?[:0]u8 {
     if (!ensureWebviewRuntimeConfigured()) {
         return null;
@@ -1321,6 +1348,7 @@ fn buildElectrobunPreload(
         \\window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
         \\window.__electrobunHostBridge = window.__electrobunHostBridge || window.__electrobunBunBridge || window.webkit?.messageHandlers?.hostBridge || window.webkit?.messageHandlers?.bunBridge || window.hostBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.hostBridge || window.chrome?.webview?.hostObjects?.bunBridge;
         \\window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
+        \\window.__electrobunTitleBarStyle = "{s}";
         \\{s}
     ,
         .{
@@ -1330,6 +1358,7 @@ fn buildElectrobunPreload(
             webview_runtime_state.rpc_port,
             webview_runtime_state.rpc_port,
             std.mem.span(secret_key),
+            titleBarStyleName(title_bar_style),
             preload_script,
         },
     ) catch |err| {
@@ -2467,6 +2496,7 @@ export fn createWindow(
     window_registry.put(window_id, .{
         .ptr = null,
         .transparent = transparent,
+        .title_bar_style = parseTitleBarStyle(title_bar_style),
         .close_handler = close_handler,
         .should_close_handler = should_close_handler,
         .move_handler = move_handler,
@@ -2867,6 +2897,7 @@ export fn createWebview(
         window_id,
         secret_key,
         sandbox,
+        window_state.title_bar_style,
     ) orelse {
         webview_registry_mutex.lockUncancelable(coreIo());
         _ = webview_registry.remove(webview_id);

@@ -115,6 +115,10 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	navigationRules: string | null = null;
 	// Sandbox mode disables RPC and only allows event emission (for untrusted content)
 	sandbox: boolean = false;
+	// Stored so the webview's preload pipeline can decide whether to inject
+	// the auto-chrome bar (§18 in linux-wpe.md). Read by proc/native.ts when
+	// building the dynamic preload prefix per webview.
+	titleBarStyle: "default" | "hidden" | "hiddenInset" = "default";
 	frame: {
 		x: number;
 		y: number;
@@ -159,6 +163,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		};
 		this.navigationRules = options.navigationRules || null;
 		this.sandbox = options.sandbox ?? false;
+		this.titleBarStyle = options.titleBarStyle ?? "default";
 
 		this.init(options, centered);
 	}
