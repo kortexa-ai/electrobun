@@ -202,6 +202,12 @@ public:
           exportable_(exportable) {}
 
     ~WpeWebViewImpl() override {
+        if (pendingShm_ && exportable_) {
+            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+                exportable_, pendingShm_);
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(exportable_);
+            pendingShm_ = nullptr;
+        }
         if (webView_)    g_object_unref(webView_);
         if (exportable_) wpe_view_backend_exportable_fdo_destroy(exportable_);
     }
@@ -336,6 +342,13 @@ public:
     bool alwaysTopmost_ = false; // chrome views set this; rendering & input
                                  // dispatch keep them above app views
     Rect frame_ = {};            // bounds within the rotated landscape space
+
+    // Most-recent SHM buffer this view exported. Held (not released) across
+    // composites so static views (chrome) keep contributing pixels even when
+    // they're not producing new frames. onViewExportedShm releases the old
+    // one and stores the new; composeAndPresent reads it; teardown releases
+    // whatever's left. nullptr until the view's first paint.
+    struct wpe_fdo_shm_exported_buffer* pendingShm_ = nullptr;
 
     // ---- Navigation event handlers ----
     //
@@ -828,41 +841,104 @@ private:
         impl->backend_->onViewExportedShm(impl, buffer);
     }
 
-    // Per-view SHM frame arrival. In commit 1 we still render single-source:
-    // only the primaryView_'s buffer hits the DRM blit. Non-primary views
-    // (about:blank in pool, or non-topmost active) get their buffers released
-    // immediately so WPE-FDO keeps producing frames without backpressure.
-    // Commit 2 (composite) replaces this branch with a coalesced compose pass.
+    // Per-view SHM frame arrival. The buffer is held on the view (replacing
+    // any previous one — old frames are dropped when a newer one arrives
+    // before composite). composeAndPresent walks all active views and blits
+    // each pendingShm_ into compositeBuffer_ at view.frame_, then a single
+    // rotate-blit pushes the composite to DRM.
+    //
+    // Static views (e.g. chrome that paints once) keep their pendingShm_
+    // across composites; an animating view replaces its pendingShm_ on every
+    // frame and the previous one is released-and-frame-completed at swap.
     void onViewExportedShm(WpeWebViewImpl* view,
                            struct wpe_fdo_shm_exported_buffer* buffer) {
         if (!view || !view->exportable()) return;
-        if (view != primaryView_ || !display_) {
-            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-                view->exportable(), buffer);
-            wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
-            return;
-        }
 
-        struct wl_shm_buffer* shm = wpe_fdo_shm_exported_buffer_get_shm_buffer(buffer);
-        if (shm) {
+        // Replace the held buffer. Releasing the old one (and signaling
+        // frame_complete) tells WPE-FDO it can produce the next frame.
+        if (view->pendingShm_) {
+            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+                view->exportable(), view->pendingShm_);
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
+        }
+        view->pendingShm_ = buffer;
+        scheduleCompose();
+    }
+
+    // Coalesce composite scheduling. If a frame is already pending we don't
+    // schedule another — the next compose pass will pick up whatever each
+    // view's pendingShm_ is at fire time.
+    void scheduleCompose() {
+        if (composeScheduled_) return;
+        composeScheduled_ = true;
+        g_idle_add_full(G_PRIORITY_DEFAULT, +[](gpointer ud) -> gboolean {
+            auto* self = static_cast<WpeBackend*>(ud);
+            self->composeScheduled_ = false;
+            self->composeAndPresent();
+            return G_SOURCE_REMOVE;
+        }, this, nullptr);
+    }
+
+    // Walk activeViews_ in insertion order (back = topmost; later overlays
+    // earlier). Each view's pendingShm_ is copied into compositeBuffer_ at
+    // view.frame_; then a single rotate-blit pushes the composite to DRM.
+    // Held buffers stay held — see onViewExportedShm.
+    void composeAndPresent() {
+        if (!display_) return;
+
+        const size_t neededBytes = (size_t)landscapeW_ * landscapeH_ * 4;
+        if (compositeBuffer_.size() != neededBytes) {
+            compositeBuffer_.assign(neededBytes, 0);
+        } else {
+            // Clear to opaque black. Each view's blit overwrites only its
+            // bounds; uncovered regions stay black.
+            std::memset(compositeBuffer_.data(), 0, neededBytes);
+        }
+        const uint32_t compStride = landscapeW_ * 4;
+
+        for (auto* view : activeViews_) {
+            if (!view || !view->pendingShm_) continue;
+            struct wl_shm_buffer* shm =
+                wpe_fdo_shm_exported_buffer_get_shm_buffer(view->pendingShm_);
+            if (!shm) continue;
+
             wl_shm_buffer_begin_access(shm);
-            const uint8_t* src       = static_cast<const uint8_t*>(wl_shm_buffer_get_data(shm));
+            const uint8_t* src       = (const uint8_t*)wl_shm_buffer_get_data(shm);
             int32_t        srcStride = wl_shm_buffer_get_stride(shm);
             int32_t        srcW      = wl_shm_buffer_get_width(shm);
             int32_t        srcH      = wl_shm_buffer_get_height(shm);
 
-            DrmFrame dst = display_->acquire();
-            blitWithRotation(src, srcStride, (uint32_t)srcW, (uint32_t)srcH,
-                             dst.pixels, dst.pitch, dst.width, dst.height);
+            // Blit src → compositeBuffer_ at (view.frame_.x, view.frame_.y),
+            // sized to min(srcW, frame.w) × min(srcH, frame.h). Negative
+            // origins clipped to 0; out-of-bounds src/dst clipped to the
+            // composite's dims. Plain BGRA copy — alpha math defers to the
+            // next iteration if any view ever needs translucency.
+            const int dstX0 = std::max(0, view->frame_.x);
+            const int dstY0 = std::max(0, view->frame_.y);
+            const int srcX0 = dstX0 - view->frame_.x;
+            const int srcY0 = dstY0 - view->frame_.y;
+            const int blitW = std::min({(int)srcW - srcX0,
+                                        view->frame_.width  - (dstX0 - view->frame_.x),
+                                        (int)landscapeW_   - dstX0});
+            const int blitH = std::min({(int)srcH - srcY0,
+                                        view->frame_.height - (dstY0 - view->frame_.y),
+                                        (int)landscapeH_   - dstY0});
+            if (blitW > 0 && blitH > 0) {
+                for (int r = 0; r < blitH; r++) {
+                    std::memcpy(
+                        compositeBuffer_.data() + (size_t)(dstY0 + r) * compStride + (size_t)dstX0 * 4,
+                        src + (size_t)(srcY0 + r) * srcStride + (size_t)srcX0 * 4,
+                        (size_t)blitW * 4);
+                }
+            }
             wl_shm_buffer_end_access(shm);
-
-            display_->present();
-            framesRendered_++;
         }
 
-        wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-            view->exportable(), buffer);
-        wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
+        DrmFrame dst = display_->acquire();
+        blitWithRotation(compositeBuffer_.data(), compStride, landscapeW_, landscapeH_,
+                         dst.pixels, dst.pitch, dst.width, dst.height);
+        display_->present();
+        framesRendered_++;
     }
 
     // rotationQuarters_ of 0 = no rotation (straight copy), respect pitches.
@@ -1034,6 +1110,12 @@ private:
     WpeWebViewImpl*                            primaryView_ = nullptr;  // topmost active view
     std::atomic<uint64_t>                      framesRendered_{0};
     bool                                       signalsInstalled_ = false;
+
+    // Composite-pass scratch buffer in landscape (pre-rotation) space. Each
+    // composeAndPresent walk copies all active views into here, then a single
+    // blitWithRotation pushes the result to DRM. ~3.7MB at 1920x480.
+    std::vector<uint8_t>                       compositeBuffer_;
+    bool                                       composeScheduled_ = false;
 
     // Default 5 (chrome bar + ~4 app views). Override with ELECTROBUN_WPE_MAX_VIEWS.
     // Each pre-allocated view spawns its own WebProcess at primeWpeView time
