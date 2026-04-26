@@ -283,10 +283,11 @@ public:
 
     void resize(const Rect& frame, const char* masksJson) override {
         visualBounds = frame;
+        frame_ = frame;
         maskJSON = masksJson ? masksJson : "";
-        // On a kiosk with first-window-wins, logical size == full display.
-        // We still forward size so the web engine reflows correctly if JS
-        // queries window inner dims.
+        // Forward size so the web engine reflows + the SHM buffer matches
+        // the view's bounds; the composite blit reads SHM dimensions and
+        // honors them.
         if (exportable_) {
             auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable_);
             if (vb) wpe_view_backend_dispatch_set_size(vb, frame.width, frame.height);
@@ -583,11 +584,26 @@ public:
         impl->customPreloadScript_     = spec.customPreloadScript;
         impl->frame_                = spec.frame;
         if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
-            // Default any unset bounds to fullscreen so the chrome+main split
-            // (commit 5) is the only path that ever cares about partial frames.
+            // Default any unset bounds to fullscreen.
             impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
         }
         impl->visualBounds = impl->frame_;
+        // Partition convention for chrome views: the magic string flags this
+        // view as alwaysTopmost so it stays above app views regardless of
+        // creation order. Other backends (macOS/GTK/CEF/Win) ignore the
+        // partition value or treat it as a normal cookie partition; on WPE
+        // bare-DRM the multi-view compositor needs an explicit topmost hint
+        // because there's no native window-system z-order.
+        impl->alwaysTopmost_ = (spec.partition == "__electrobun_chrome__");
+
+        // Tell WPE to render at the view's bounds size — the SHM buffer it
+        // exports will match this exactly, which the composite blit copies
+        // into compositeBuffer_ at (frame.x, frame.y).
+        if (auto* vb = impl->viewBackend()) {
+            wpe_view_backend_dispatch_set_size(vb,
+                (uint32_t)impl->frame_.width,
+                (uint32_t)impl->frame_.height);
+        }
         if (!spec.electrobunPreloadScript.empty()) {
             impl->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
         }
