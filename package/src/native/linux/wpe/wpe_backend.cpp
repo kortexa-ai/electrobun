@@ -230,7 +230,7 @@ public:
     void goBack()     override { if (webView_) webkit_web_view_go_back(webView_); }
     void goForward()  override { if (webView_) webkit_web_view_go_forward(webView_); }
     void reload()     override { if (webView_) webkit_web_view_reload(webView_); }
-    void remove()     override { isRemoved = true; /* WpeBackend cleans up on destruction */ }
+    void remove() override;  // body below the WpeBackend definition
     bool canGoBack()    override { return webView_ && webkit_web_view_can_go_back(webView_); }
     bool canGoForward() override { return webView_ && webkit_web_view_can_go_forward(webView_); }
 
@@ -453,6 +453,49 @@ public:
             if (v && v->webviewId == webviewId) return v;
         }
         return nullptr;
+    }
+
+    // Called from WpeWebViewImpl::remove(). Removes from activeViews_,
+    // resets bound state (so JS bridges/handlers don't fire on reused view),
+    // navigates to about:blank, clears the user-content scripts, releases
+    // any held SHM, and returns the impl to the free pool. The
+    // shared_ptr in views_ keeps the impl alive; the WebKitWebView and
+    // exportable_fdo are kept hot so the next createWebview is cheap.
+    void recyclePooledView(WpeWebViewImpl* impl) {
+        if (!impl || impl->inFreePool_) return;
+        activeViews_.erase(
+            std::remove(activeViews_.begin(), activeViews_.end(), impl),
+            activeViews_.end());
+        primaryView_ = activeViews_.empty() ? nullptr : activeViews_.back();
+
+        // Tear down user state.
+        impl->navigationCallback_   = nullptr;
+        impl->eventHandler_         = nullptr;
+        impl->bunBridgeHandler_     = nullptr;
+        impl->internalBridgeHandler_= nullptr;
+        impl->eventBridgeHandler_   = nullptr;
+        impl->electrobunPreloadScript_.clear();
+        impl->customPreloadScript_.clear();
+        impl->isRemoved      = false;
+        impl->alwaysTopmost_ = false;
+        impl->webviewId      = 0;
+        impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+        impl->visualBounds = impl->frame_;
+
+        if (impl->userContentManager_) {
+            webkit_user_content_manager_remove_all_scripts(impl->userContentManager_);
+        }
+        if (impl->pendingShm_ && impl->exportable()) {
+            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+                impl->exportable(), impl->pendingShm_);
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(impl->exportable());
+            impl->pendingShm_ = nullptr;
+        }
+        if (impl->webView_) webkit_web_view_load_uri(impl->webView_, "about:blank");
+
+        impl->inFreePool_ = true;
+        freePool_.push_back(impl);
+        scheduleCompose();  // re-render without the removed view
     }
 
     // IDisplayBackend
@@ -1170,6 +1213,13 @@ private:
         return n;
     }
 };
+
+// Defined out-of-line so backend_->recyclePooledView is callable (the class
+// body would otherwise see only a forward declaration of WpeBackend).
+inline void WpeWebViewImpl::remove() {
+    isRemoved = true;
+    if (backend_) backend_->recyclePooledView(this);
+}
 
 } // namespace wpe
 
