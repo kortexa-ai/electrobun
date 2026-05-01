@@ -1783,6 +1783,9 @@ async function createLinuxInstallerArchive(
 			name: config.app.name,
 			channel: buildEnvironment,
 			hash: hash,
+			// Routes the extractor down the linux-wpe install path
+			// (versioned dir + current symlink + systemd user unit).
+			...(config.build?.linux?.embedded ? { linuxTarget: "embedded" } : {}),
 		};
 		const metadataJson = JSON.stringify(metadata);
 		const metadataBuffer = Buffer.from(metadataJson, "utf8");
@@ -3873,6 +3876,11 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 			baseUrl: config.release.baseUrl,
 			name: appFileName,
 			identifier: config.app.identifier,
+			// linux-wpe (bare-DRM kiosk) builds get a different OTA path:
+			// versioned dirs + symlink swap + systemd-managed restart + rollback.
+			...(targetOS === "linux" && config.build.linux?.embedded
+				? { linuxTarget: "embedded" }
+				: {}),
 		});
 
 		await Bun.write(

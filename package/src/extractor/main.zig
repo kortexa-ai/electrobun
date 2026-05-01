@@ -25,6 +25,8 @@ const AppMetadata = struct {
     name: []const u8,
     channel: []const u8,
     hash: ?[]const u8 = null,
+    // Linux-only; "embedded" selects the WPE/DRM kiosk install path.
+    linuxTarget: ?[]const u8 = null,
 };
 
 // Progress indicator for extraction
@@ -184,7 +186,9 @@ fn extractAdjacentArchive(
     defer allocator.free(app_base_dir);
     const self_extraction_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "self-extraction" });
     defer allocator.free(self_extraction_dir);
-    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "app" });
+    const app_dir_name = try appInstallDirectoryName(allocator, metadata);
+    defer allocator.free(app_dir_name);
+    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, app_dir_name });
     defer allocator.free(app_dir);
 
     std.debug.print("Extracting to: {s}\n", .{self_extraction_dir});
@@ -284,6 +288,7 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
         .name = metadata.name,
         .channel = metadata.channel,
         .hash = backup_hash,
+        .linuxTarget = metadata.linuxTarget,
     };
 
     // Defer cleanup until after extractAndInstall is done
@@ -293,6 +298,9 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
         allocator.free(metadata.channel);
         if (metadata.hash) |hash| {
             allocator.free(hash);
+        }
+        if (metadata.linuxTarget) |target| {
+            allocator.free(target);
         }
     }
 
@@ -308,8 +316,9 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
     const self_extraction_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "self-extraction" });
     defer allocator.free(self_extraction_dir);
 
-    // Always use "app" folder instead of hash-based versioning
-    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "app" });
+    const app_dir_name = try appInstallDirectoryName(allocator, safe_metadata);
+    defer allocator.free(app_dir_name);
+    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, app_dir_name });
     defer allocator.free(app_dir);
 
     std.debug.print("Self-extracting archive found at offset {d}\n", .{archive_offset});
@@ -467,7 +476,13 @@ fn extractAndInstall(allocator: std.mem.Allocator, compressed_data: []const u8, 
 
     // Create desktop shortcuts on Linux and Windows
     if (builtin.os.tag == .linux) {
-        try createDesktopShortcut(allocator, app_dir);
+        if (isWpeEmbedded(metadata)) {
+            // Bare-DRM kiosk installs run under a systemd user service instead
+            // of creating a desktop-environment launcher.
+            try installEmbeddedKiosk(allocator, app_dir, metadata);
+        } else {
+            try createDesktopShortcut(allocator, app_dir);
+        }
     }
 
     if (builtin.os.tag == .windows) {
@@ -746,7 +761,8 @@ fn readEmbeddedMetadata(allocator: std.mem.Allocator, metadata_bytes: []const u8
         name: []const u8,
         channel: []const u8,
         hash: ?[]const u8 = null,
-    }, allocator, metadata_bytes, .{});
+        linuxTarget: ?[]const u8 = null,
+    }, allocator, metadata_bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     return AppMetadata{
@@ -754,6 +770,7 @@ fn readEmbeddedMetadata(allocator: std.mem.Allocator, metadata_bytes: []const u8
         .name = try allocator.dupe(u8, parsed.value.name),
         .channel = try allocator.dupe(u8, parsed.value.channel),
         .hash = if (parsed.value.hash) |h| try allocator.dupe(u8, h) else null,
+        .linuxTarget = if (parsed.value.linuxTarget) |target| try allocator.dupe(u8, target) else null,
     };
 }
 
@@ -849,6 +866,115 @@ fn escapeDesktopString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
     }
 
     return escaped;
+}
+
+
+fn isWpeEmbedded(metadata: AppMetadata) bool {
+    if (builtin.os.tag != .linux) return false;
+    const target = metadata.linuxTarget orelse return false;
+    return std.mem.eql(u8, target, "embedded");
+}
+
+fn appInstallDirectoryName(allocator: std.mem.Allocator, metadata: AppMetadata) ![]u8 {
+    if (isWpeEmbedded(metadata)) {
+        if (metadata.hash) |hash| {
+            return std.fmt.allocPrint(allocator, "app.{s}", .{hash});
+        }
+    }
+    return allocator.dupe(u8, "app");
+}
+
+// Best-effort external command runner. Installation remains usable when the
+// host has no user-systemd session or does not permit lingering.
+fn runBestEffort(allocator: std.mem.Allocator, argv: []const []const u8, label: []const u8) void {
+    _ = allocator;
+    var child = std.process.spawn(g_io, .{
+        .argv = argv,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print("Warning: failed to run {s}: {}\n", .{ label, err });
+        return;
+    };
+    const term = child.wait(g_io) catch |err| {
+        std.debug.print("Warning: failed to wait for {s}: {}\n", .{ label, err });
+        return;
+    };
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("Warning: {s} exited with code {d}\n", .{ label, code });
+            }
+        },
+        else => std.debug.print("Warning: {s} terminated abnormally\n", .{label}),
+    }
+}
+
+fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
+    const app_base_dir = std.fs.path.dirname(app_dir) orelse {
+        std.debug.print("Warning: could not derive app base directory from {s}\n", .{app_dir});
+        return;
+    };
+    const app_dir_name = std.fs.path.basename(app_dir);
+
+    // Atomically selected version. The unit always launches through this
+    // stable path so a later OTA only needs to replace the symlink.
+    const current_link = try std.fs.path.join(allocator, &.{ app_base_dir, "current" });
+    defer allocator.free(current_link);
+    std.Io.Dir.cwd().deleteFile(g_io, current_link) catch {};
+    std.Io.Dir.cwd().symLink(g_io, app_dir_name, current_link, .{}) catch |err| {
+        std.debug.print("Warning: could not create current symlink at {s}: {}\n", .{ current_link, err });
+        return;
+    };
+
+    const home = getEnvOwned(allocator, "HOME") catch {
+        std.debug.print("Warning: HOME not set; skipping systemd unit install\n", .{});
+        return;
+    };
+    defer allocator.free(home);
+
+    const unit_dir = try std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user" });
+    defer allocator.free(unit_dir);
+    try std.Io.Dir.cwd().createDirPath(g_io, unit_dir);
+
+    const unit_filename = try std.fmt.allocPrint(allocator, "{s}.service", .{metadata.identifier});
+    defer allocator.free(unit_filename);
+    const unit_path = try std.fs.path.join(allocator, &.{ unit_dir, unit_filename });
+    defer allocator.free(unit_path);
+    const launcher_path = try std.fs.path.join(allocator, &.{ app_base_dir, "current", "bin", "launcher" });
+    defer allocator.free(launcher_path);
+
+    const unit_text = try std.fmt.allocPrint(allocator,
+        \\[Unit]
+        \\Description={s} (Electrobun kiosk)
+        \\After=graphical-session.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\ExecStart={s}
+        \\Restart=on-failure
+        \\RestartSec=2
+        \\StartLimitIntervalSec=30
+        \\StartLimitBurst=3
+        \\TimeoutStopSec=5
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+        \\
+    , .{ metadata.name, launcher_path });
+    defer allocator.free(unit_text);
+
+    const unit_file = try std.Io.Dir.cwd().createFile(g_io, unit_path, .{ .truncate = true });
+    defer unit_file.close(g_io);
+    try unit_file.writeStreamingAll(g_io, unit_text);
+
+    const user = getEnvOwned(allocator, "USER") catch null;
+    defer if (user) |value| allocator.free(value);
+    if (user) |value| {
+        runBestEffort(allocator, &.{ "loginctl", "enable-linger", value }, "loginctl enable-linger");
+    }
+    runBestEffort(allocator, &.{ "systemctl", "--user", "daemon-reload" }, "systemctl --user daemon-reload");
+    runBestEffort(allocator, &.{ "systemctl", "--user", "enable", "--now", unit_filename }, "systemctl --user enable --now");
 }
 
 fn desktopEntryInstallName(source_name: []const u8) ?[]const u8 {
