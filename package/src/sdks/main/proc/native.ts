@@ -1,5 +1,5 @@
 import { dirname, join } from "path";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import electrobunEventEmitter from "../events/eventEmitter";
 import ElectrobunEvent from "../events/event";
 import {
@@ -11,6 +11,25 @@ import {
 	preloadScript,
 	preloadScriptSandboxed,
 } from "../../../preload/.generated/compiled";
+import { OS } from "../../../shared/platform";
+
+// True only when this is a linux-embedded (bare-DRM kiosk) build. Read from
+// version.json's `linuxTarget` field (set by `electrobun build` when
+// build.linux.embedded === true). The launcher's cwd at app start is
+// .../app.{hash}/bin, so version.json lives at ../Resources/version.json.
+//
+// Used to decide whether to auto-inject the framework's chrome bar — it
+// only fires on linux-embedded with titleBarStyle "default" because every
+// other target gets OS chrome.
+const IS_LINUX_EMBEDDED: boolean = (() => {
+	if (OS !== "linux") return false;
+	try {
+		const raw = readFileSync(join("..", "Resources", "version.json"), "utf-8");
+		return JSON.parse(raw).linuxTarget === "embedded";
+	} catch {
+		return false;
+	}
+})();
 
 // Menu data reference system to avoid serialization overhead
 const menuDataRegistry = new Map<string, any>();
@@ -123,6 +142,7 @@ function ensureWebviewRuntimeConfigured() {
 		0,
 		toCString(preloadScript),
 		toCString(preloadScriptSandboxed),
+		IS_LINUX_EMBEDDED,
 	);
 
 	if (!configured) {
@@ -299,6 +319,7 @@ const core = (() => {
 					FFIType.u32,
 					FFIType.cstring,
 					FFIType.cstring,
+					FFIType.bool,
 				],
 				returns: FFIType.bool,
 			},

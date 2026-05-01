@@ -1,13 +1,16 @@
 // Auto-injected chrome bar (§18 in linux-wpe.md).
 //
-// When BrowserWindow is created with titleBarStyle: "hidden", Electrobun
-// injects a top chrome bar into every page the webview navigates to. The
-// alternative — apps drawing their own chrome — meant page-2 had no exit
-// once you navigated away from the home page on bare-DRM kiosk targets.
+// Electrobun injects a top chrome bar (title + close + fullscreen) into every
+// page the webview navigates to, *but only* when there is no OS-provided
+// chrome to fall back on. Today that means: linux-embedded (bare-DRM, no
+// compositor) with titleBarStyle "default". On every other surface — macOS /
+// Windows / Linux-desktop with any style, or linux-embedded with
+// "hidden"/"hiddenInset" — the boolean is false and this module is a no-op.
 //
+// The decision is computed bun-side (in proc/native.ts) and exposed as
+// `window.__electrobunAutoInjectChrome`; this module stays platform-agnostic.
 // The injection runs at DOMContentLoaded so it works across SPA navigations
-// AND multi-page apps. It's a no-op on titleBarStyle "default"/"hiddenInset"
-// because those targets get OS chrome (or inset traffic lights on macOS).
+// AND multi-page apps.
 
 import "./globals.d.ts";
 import { send } from "./internalRpc";
@@ -152,7 +155,7 @@ function injectChrome() {
 }
 
 export function initChrome() {
-  if (window.__electrobunTitleBarStyle !== "hidden") return;
+  if (!window.__electrobunAutoInjectChrome) return;
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", injectChrome);

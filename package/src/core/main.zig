@@ -176,6 +176,7 @@ const WebviewRuntimeState = struct {
     rpc_port: u32 = 0,
     preload_script: ?[:0]u8 = null,
     preload_script_sandboxed: ?[:0]u8 = null,
+    is_linux_embedded: bool = false,
     configured: bool = false,
 };
 
@@ -1349,6 +1350,7 @@ fn buildElectrobunPreload(
         \\window.__electrobunHostBridge = window.__electrobunHostBridge || window.__electrobunBunBridge || window.webkit?.messageHandlers?.hostBridge || window.webkit?.messageHandlers?.bunBridge || window.hostBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.hostBridge || window.chrome?.webview?.hostObjects?.bunBridge;
         \\window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
         \\window.__electrobunTitleBarStyle = "{s}";
+        \\window.__electrobunAutoInjectChrome = {};
         \\{s}
     ,
         .{
@@ -1359,6 +1361,7 @@ fn buildElectrobunPreload(
             webview_runtime_state.rpc_port,
             std.mem.span(secret_key),
             titleBarStyleName(title_bar_style),
+            webview_runtime_state.is_linux_embedded and title_bar_style == .default,
             preload_script,
         },
     ) catch |err| {
@@ -1371,10 +1374,12 @@ export fn configureWebviewRuntime(
     rpc_port: u32,
     preload_script: [*:0]const u8,
     preload_script_sandboxed: [*:0]const u8,
+    is_linux_embedded: bool,
 ) bool {
     clearLastError();
 
     webview_runtime_state.rpc_port = rpc_port;
+    webview_runtime_state.is_linux_embedded = is_linux_embedded;
 
     if (!replaceOptionalOwnedZ(&webview_runtime_state.preload_script, preload_script)) {
         return false;

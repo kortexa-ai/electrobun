@@ -35,10 +35,17 @@ declare global {
 		) => Promise<string>;
 		__electrobunSendToHost: (message: unknown) => void;
 		__electrobunPendingHostMessages?: unknown[];
-		// titleBarStyle from BrowserWindow options. When "hidden" the preload
-		// pipeline auto-injects a chrome bar (§18). "default"/"hiddenInset"
-		// suppress injection (the OS or app provides chrome).
+		// titleBarStyle from BrowserWindow options. The page reads it only for
+		// informational purposes (e.g. an app's own custom chrome could behave
+		// differently in inset mode) — the auto-inject decision is made in
+		// __electrobunAutoInjectChrome below.
 		__electrobunTitleBarStyle?: "default" | "hidden" | "hiddenInset";
+		// Computed from (platform, build target, titleBarStyle). True
+		// only when the framework should inject its own chrome bar — i.e. on
+		// linux-embedded with titleBarStyle "default", where there is no OS
+		// chrome to fall back on. chrome.ts reads only this boolean and stays
+		// platform-agnostic itself.
+		__electrobunAutoInjectChrome?: boolean;
 		__electrobun: {
 			receiveMessageFromHost: (msg: unknown) => void;
 			receiveInternalMessageFromHost: (msg: unknown) => void;
