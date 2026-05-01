@@ -335,11 +335,13 @@ public:
 
     // ---- Multi-view pool state ----
     //
-    // primeWpeView pre-allocates N WpeWebViewImpl instances at startup so the
-    // pre-loop WPE-FDO requirement (§13/§15) is satisfied for every view the
-    // app might ever create. Views start in the free pool with about:blank
-    // loaded; createWebview pops one and binds the user's webviewId/handlers/
-    // preloads; remove() returns it to the pool.
+    // primeWpeView seeds the pool with one WpeWebViewImpl (satisfies the
+    // pre-loop WPE-FDO requirement, §13/§15). createWebview lazily grows
+    // the pool by one when claiming would empty it, capped by
+    // ELECTROBUN_WPE_MAX_VIEWS as a runaway-leak safety net. Views start in
+    // the free pool with about:blank loaded; createWebview pops one and
+    // binds the user's webviewId/handlers/preloads; remove() returns it
+    // to the pool.
     bool inFreePool_   = true;   // true until createWebview claims this view
     bool alwaysTopmost_ = false; // chrome views set this; rendering & input
                                  // dispatch keep them above app views
@@ -566,10 +568,28 @@ public:
         fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s'\n",
                 (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str()); fflush(stderr);
         if (freePool_.empty()) {
-            fprintf(stderr, "[WpeBackend] createWebview: pool exhausted (max=%d). "
-                            "Set ELECTROBUN_WPE_MAX_VIEWS to bump.\n",
-                    (int)views_.size());
-            return nullptr;
+            // Stage 1: lazy pool growth. Seed view is already in use; allocate
+            // another. webkit_* APIs in createOnePooledView require the main
+            // thread, so dispatchSyncMain it. ELECTROBUN_WPE_MAX_VIEWS still
+            // caps total view count as a runaway-leak safety net (retired in
+            // Stage 4 once related-view sharing makes new views cheap).
+            const int cap = maxViewsFromEnvOrDefault();
+            if ((int)views_.size() >= cap) {
+                fprintf(stderr, "[WpeBackend] createWebview: pool at cap (%d). "
+                                "Set ELECTROBUN_WPE_MAX_VIEWS to bump.\n", cap);
+                return nullptr;
+            }
+            WpeWebViewImpl* grown = nullptr;
+            dispatchSyncMain([this, &grown]() {
+                grown = createOnePooledView();
+            });
+            if (!grown) {
+                fprintf(stderr, "[WpeBackend] createWebview: lazy createOnePooledView failed\n");
+                return nullptr;
+            }
+            freePool_.push_back(grown);
+            fprintf(stderr, "[WpeBackend] createWebview: lazy-grew pool to %zu views\n",
+                    views_.size()); fflush(stderr);
         }
         WpeWebViewImpl* impl = freePool_.front();
         freePool_.erase(freePool_.begin());
@@ -709,27 +729,24 @@ private:
             fprintf(stderr, "[WpeBackend] primeWpeView: InputDispatcher SKIPPED\n"); fflush(stderr);
         }
 
-        // Pre-allocate N views into the free pool. Each gets its own
-        // exportable_fdo + WebKitWebView + signal-connect setup. The pre-loop
-        // requirement (§15) is satisfied for every view the app might ever
-        // create, so subsequent createWebview calls just claim from the pool
-        // and bind the user's URL/handlers without touching WPE-FDO again.
-        const int N = maxViewsFromEnvOrDefault();
-        for (int i = 0; i < N; i++) {
-            auto* impl = createOnePooledView();
-            if (!impl) {
-                fprintf(stderr, "[WpeBackend] primeWpeView: createOnePooledView #%d failed\n", i);
-                if (i == 0) return;  // Not even one — bail.
-                break;
-            }
-            freePool_.push_back(impl);
+        // §15 pre-loop requirement: at least one wpe_view_backend_exportable_fdo
+        // must exist with a WebKitWebView wired to it before g_main_loop_run
+        // starts iterating, otherwise the WebProcess never produces frame
+        // exports. Seed the pool with exactly one view — createWebview grows
+        // it lazily on demand. Stage 1 of the WebProcess pool optimization
+        // (see electrobun-session.md): pays for one WebProcess at startup
+        // instead of N, saves ~800 MB when the app uses fewer views than the
+        // cap (the common case).
+        auto* seedImpl = createOnePooledView();
+        if (!seedImpl) {
+            fprintf(stderr, "[WpeBackend] primeWpeView: createOnePooledView (seed) failed\n");
+            return;
         }
-        // Keep primaryView_ pointing at the first pooled view so legacy
-        // single-view rendering paths (commit 1: still single-source) have
-        // a target until createWebview claims it.
-        if (!freePool_.empty()) primaryView_ = freePool_.front();
-        fprintf(stderr, "[WpeBackend] primeWpeView: pool ready, %zu views\n",
-                freePool_.size()); fflush(stderr);
+        freePool_.push_back(seedImpl);
+        // Keep primaryView_ pointing at the seed view so legacy single-view
+        // rendering paths have a target until createWebview claims it.
+        primaryView_ = seedImpl;
+        fprintf(stderr, "[WpeBackend] primeWpeView: pool seeded with 1 view\n"); fflush(stderr);
     }
 
     // Build one (exportable_fdo + WebKitWebView + signal connections + pooled
@@ -1303,9 +1320,11 @@ private:
     };
     TouchSlotState                             touchSlots_[16] = {};
 
-    // Default 5 (chrome bar + ~4 app views). Override with ELECTROBUN_WPE_MAX_VIEWS.
-    // Each pre-allocated view spawns its own WebProcess at primeWpeView time
-    // (~50-100MB resident on Pi), so don't crank this without reason.
+    // Cap on lazy pool growth. Default 5 (chrome bar + ~4 app views). Override
+    // with ELECTROBUN_WPE_MAX_VIEWS. Each WPE WebView slot spawns its own
+    // WPEWebProcess (~200MB resident on Pi) — the cap is a runaway-leak safety
+    // net, not a steady-state allocation. Retired in Stage 4 once related-view
+    // sharing collapses trusted views onto a single shared WebProcess.
     static int maxViewsFromEnvOrDefault() {
         const char* s = g_getenv("ELECTROBUN_WPE_MAX_VIEWS");
         if (!s || !*s) return 5;
