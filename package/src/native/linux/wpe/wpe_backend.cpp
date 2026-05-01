@@ -1162,6 +1162,46 @@ private:
             wpe_view_backend_dispatch_pointer_event(vb, &pe);
         };
 
+        // Build a wpe_input_touch_event from the current touchSlots_ targeted
+        // at `v` and dispatch it to that view's backend. The touchpoints array
+        // contains every active slot bound to v; the slot that triggered this
+        // dispatch (`triggerSlot`) carries `triggerType` (down/motion/up), all
+        // other still-down slots are reported as motion. WebKit's touch-to-
+        // click path applies its own slop tolerance, so fat-finger drift no
+        // longer kills click synthesis (the wpe_input_pointer_event path
+        // required exact mousedown→mouseup alignment, which fingers never
+        // give you on a capacitive panel) and TouchEvent dispatch enables
+        // overflow:scroll touch-scrolling natively in the page.
+        auto dispatchTouchTo = [&](WpeWebViewImpl* v,
+                                   enum wpe_input_touch_event_type triggerType,
+                                   int triggerSlot) {
+            if (!v) return;
+            auto* vb = v->viewBackend();
+            if (!vb) return;
+            std::vector<struct wpe_input_touch_event_raw> points;
+            points.reserve(16);
+            for (int s = 0; s < 16; ++s) {
+                if (touchSlots_[s].view != v) continue;
+                struct wpe_input_touch_event_raw r = {};
+                r.type = (s == triggerSlot)
+                             ? triggerType
+                             : wpe_input_touch_event_type_motion;
+                r.time = ev.timeMs;
+                r.id   = s;
+                r.x    = touchSlots_[s].x;
+                r.y    = touchSlots_[s].y;
+                points.push_back(r);
+            }
+            struct wpe_input_touch_event te = {};
+            te.touchpoints        = points.empty() ? nullptr : points.data();
+            te.touchpoints_length = points.size();
+            te.type               = triggerType;
+            te.id                 = triggerSlot;
+            te.time               = ev.timeMs;
+            te.modifiers          = 0;
+            wpe_view_backend_dispatch_touch_event(vb, &te);
+        };
+
         switch (ev.type) {
             case InputEventType::TouchDown: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
@@ -1174,8 +1214,7 @@ private:
                 touchSlots_[s].y    = viewY;
                 target->lastTouchX_[s] = viewX;
                 target->lastTouchY_[s] = viewY;
-                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_motion, 0, 0);
-                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_button, 1, 1);
+                dispatchTouchTo(target, wpe_input_touch_event_type_down, s);
                 break;
             }
             case InputEventType::TouchMotion: {
@@ -1188,15 +1227,16 @@ private:
                 touchSlots_[s].y = viewY;
                 target->lastTouchX_[s] = viewX;
                 target->lastTouchY_[s] = viewY;
-                dispatchPointerTo(target, viewX, viewY, wpe_input_pointer_event_type_motion, 0, 0);
+                dispatchTouchTo(target, wpe_input_touch_event_type_motion, s);
                 break;
             }
             case InputEventType::TouchUp: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
                 WpeWebViewImpl* target = touchSlots_[s].view;
                 if (!target) break;
-                dispatchPointerTo(target, touchSlots_[s].x, touchSlots_[s].y,
-                                  wpe_input_pointer_event_type_button, 1, 0);
+                // Dispatch BEFORE clearing the slot so the up-touchpoint is
+                // present in the touchpoints array with its final coordinates.
+                dispatchTouchTo(target, wpe_input_touch_event_type_up, s);
                 touchSlots_[s].view = nullptr;
                 break;
             }
