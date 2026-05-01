@@ -47,6 +47,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace electrobun {
@@ -583,7 +584,20 @@ public:
         impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
         impl->customPreloadScript_     = spec.customPreloadScript;
         impl->frame_                = spec.frame;
-        if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
+        // Bare-DRM has no window manager: a BrowserWindow.frame is just a
+        // desktop-only initial-placement hint. The first webview bound to a
+        // host window is the BrowserWindow's implicit primary view; force it
+        // to fill the panel so apps written for cross-target portability
+        // (where the same source must run on macOS/Windows/Linux-desktop and
+        // bare-DRM) don't have to special-case the kiosk dimensions.
+        // Explicit BrowserViews (chrome bars, overlays) attach to the same
+        // host window with their own frames — those are honored as-is.
+        const bool isPrimaryView =
+            spec.hostWindow != nullptr &&
+            primaryBoundFor_.insert(spec.hostWindow).second;
+        if (isPrimaryView) {
+            impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+        } else if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
             // Default any unset bounds to fullscreen.
             impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
         }
@@ -595,6 +609,16 @@ public:
         // bare-DRM the multi-view compositor needs an explicit topmost hint
         // because there's no native window-system z-order.
         impl->alwaysTopmost_ = (spec.partition == "__electrobun_chrome__");
+        // Same portability rule as for the BrowserWindow primary view: the
+        // app's hardcoded chrome width is a desktop-only hint. On bare-DRM
+        // an alwaysTopmost chrome bar should span the panel — keep the app's
+        // requested y/height (so it can sit at the top, bottom, or any band),
+        // but pin x=0 and width=panelW.
+        if (impl->alwaysTopmost_) {
+            impl->frame_.x     = 0;
+            impl->frame_.width = (int)landscapeW_;
+            impl->visualBounds = impl->frame_;
+        }
 
         // Tell WPE to render at the view's bounds size — the SHM buffer it
         // exports will match this exactly, which the composite blit copies
@@ -803,6 +827,19 @@ private:
                 fprintf(stderr, "[WpeBackend] webkit_web_context_register_uri_scheme\n"); fflush(stderr);
                 webkit_web_context_register_uri_scheme(
                     ctx, "views", handleViewsURIScheme, nullptr, nullptr);
+                // Mark views:// as a secure origin so DOM Storage
+                // (localStorage / sessionStorage), IndexedDB, Service
+                // Workers, etc. work on app-bundled pages. Without this,
+                // WebKit treats custom schemes as non-standard origins and
+                // silently no-ops storage APIs — which broke the auto-inject
+                // chrome bar's "remember hidden state across navigation".
+                // CORS-enabled too, so fetch() across views://<host> URLs
+                // works the way apps expect on http(s).
+                if (auto* sm = webkit_web_context_get_security_manager(ctx)) {
+                    webkit_security_manager_register_uri_scheme_as_secure(sm, "views");
+                    webkit_security_manager_register_uri_scheme_as_cors_enabled(sm, "views");
+                    fprintf(stderr, "[WpeBackend] views scheme marked secure + cors-enabled\n"); fflush(stderr);
+                }
                 fprintf(stderr, "[WpeBackend] views scheme registered\n"); fflush(stderr);
             }
         });
@@ -913,14 +950,17 @@ private:
                            struct wpe_fdo_shm_exported_buffer* buffer) {
         if (!view || !view->exportable()) return;
 
-        // Replace the held buffer. Releasing the old one (and signaling
-        // frame_complete) tells WPE-FDO it can produce the next frame.
+        // Release the previous held buffer (if any) back to WPE for reuse.
         if (view->pendingShm_) {
             wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
                 view->exportable(), view->pendingShm_);
-            wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
         }
         view->pendingShm_ = buffer;
+        // Always ack: tells WPE-FDO it can produce the next frame. Must fire
+        // even on the very first frame (when there was no prior buffer to
+        // release) — otherwise WPE waits forever for the ack and the
+        // renderer stalls after a single onExportShm callback per view.
+        wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
         scheduleCompose();
     }
 
@@ -1198,6 +1238,12 @@ private:
     std::vector<WpeWebViewImpl*>               freePool_;     // available for createWebview
     std::vector<WpeWebViewImpl*>               activeViews_;  // in z-order; back = topmost
     WpeWebViewImpl*                            primaryView_ = nullptr;  // topmost active view
+    // Tracks which hostWindows have already had their primary (BrowserWindow's
+    // implicit) view bound. The first createWebview for a given hostWindow is
+    // forced to full-panel — on bare-DRM the BrowserWindow.frame is fictional
+    // (no compositor, single window = the panel). Explicit BrowserViews keep
+    // their requested frames so chrome bars / overlays still position freely.
+    std::unordered_set<void*>                  primaryBoundFor_;
     std::atomic<uint64_t>                      framesRendered_{0};
     bool                                       signalsInstalled_ = false;
 
