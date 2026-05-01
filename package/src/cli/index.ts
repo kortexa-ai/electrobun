@@ -630,6 +630,15 @@ async function buildOdinMainExecutable(options: {
 async function ensureCoreDependencies(
 	targetOS?: "macos" | "win" | "linux",
 	targetArch?: "arm64" | "x64",
+	// Which Linux native wrapper this build will actually link against. The
+	// three are mutually exclusive (cli/index.ts ~2747 picks one based on
+	// config.build.linux.{embedded,bundleCEF}); requiring the wrong one
+	// makes ensureCoreDependencies trigger a fallback download of the
+	// published core tarball, which then *overwrites* every other binary
+	// in dist-{os}-{arch}/ — including locally-built ones — with the older
+	// published versions. That bit linux-embedded builds where the wpe
+	// wrapper is locally built but the GTK wrapper isn't.
+	linuxWrapper: "default" | "cef" | "wpe" = "default",
 ) {
 	// Use provided target platform or default to host platform
 	const platformOS = targetOS || OS;
@@ -652,7 +661,21 @@ async function ensureCoreDependencies(
 	} else if (platformOS === "win") {
 		requiredBinaries.push(platformPaths.NATIVE_WRAPPER_WIN);
 	} else {
-		requiredBinaries.push(platformPaths.NATIVE_WRAPPER_LINUX);
+		// Pick the wrapper the build actually needs. For linux-embedded the
+		// wpe wrapper is built locally and the published core tarball does
+		// not ship it, so falling back to a download here is both wrong
+		// (would clobber the wpe wrapper) and useless (download wouldn't
+		// contain it). Same shape for the CEF variant.
+		switch (linuxWrapper) {
+			case "wpe":
+				requiredBinaries.push(platformPaths.NATIVE_WRAPPER_LINUX_WPE);
+				break;
+			case "cef":
+				requiredBinaries.push(platformPaths.NATIVE_WRAPPER_LINUX_CEF);
+				break;
+			default:
+				requiredBinaries.push(platformPaths.NATIVE_WRAPPER_LINUX);
+		}
 	}
 
 	// Check shared files (main.js should be in shared dist/)
@@ -2272,8 +2295,19 @@ ${utiDecls}
 		);
 		const artifactFolder = join(projectRoot, config.build.artifactFolder);
 
-		// Ensure core binaries are available for the target platform before starting build
-		await ensureCoreDependencies(currentTarget.os, currentTarget.arch);
+		// Ensure core binaries are available for the target platform before starting build.
+		// On Linux there are three mutually-exclusive native wrappers; pass the one
+		// matching this build's config so ensureCoreDependencies doesn't require (and
+		// trigger a clobbering download for) a wrapper the build never uses.
+		const linuxWrapper: "default" | "cef" | "wpe" =
+			targetOS === "linux"
+				? config.build.linux?.embedded
+					? "wpe"
+					: config.build.linux?.bundleCEF
+						? "cef"
+						: "default"
+				: "default";
+		await ensureCoreDependencies(currentTarget.os, currentTarget.arch, linuxWrapper);
 
 		// Get platform-specific paths for the current target
 		const targetPaths = getPlatformPaths(currentTarget.os, currentTarget.arch);

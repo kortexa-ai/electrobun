@@ -2,6 +2,11 @@
 **/target
 **/zig-cache
 **/zig-out
+# Zig build-exe leaves an intermediate .o next to the source. The fallback
+# path in package/build.ts uses build-exe (Zig 0.13 aarch64 build-runner
+# panic workaround), so this file appears next to extractor/main.zig and
+# launcher/main.zig on every Pi build.
+**/*.o
 node_modules
 build
 /package/vendors
