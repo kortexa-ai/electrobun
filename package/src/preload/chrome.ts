@@ -108,12 +108,17 @@ function injectChrome() {
   // Fullscreen state persists across navigations via sessionStorage so
   // the user doesn't have to re-tap [⛶] every time they change pages.
   // Same origin (e.g. views://main) → shared storage automatically.
+  // Note: this requires the views:// scheme to be registered as secure
+  // in the native backend (see WpeBackend::primeWpeView for WPE) — without
+  // that, WebKit silently no-ops DOM storage on custom schemes.
   const HIDE_KEY = "__electrobun_chrome_hidden";
+  let lastHideAt = 0;
   const setHidden = (hidden: boolean) => {
     if (hidden) {
       header.setAttribute("data-hidden", "");
       document.body.setAttribute("data-electrobun-chrome-hidden", "");
       try { sessionStorage.setItem(HIDE_KEY, "1"); } catch {}
+      lastHideAt = Date.now();
     } else {
       header.removeAttribute("data-hidden");
       document.body.removeAttribute("data-electrobun-chrome-hidden");
@@ -129,8 +134,20 @@ function injectChrome() {
     e.stopPropagation();
     setHidden(true);
   });
-  document.body.addEventListener("click", () => {
-    if (header.hasAttribute("data-hidden")) setHidden(false);
+  // Restore chrome only on a deliberate top-edge tap (within the strip of
+  // pixels the chrome bar normally occupies). The original "tap anywhere"
+  // gesture is hostile to touch UX — every interactive element on the page
+  // (including app navigation buttons) would restore chrome before the
+  // app's own onclick fired, which also defeats sessionStorage persistence
+  // because the navigating tap clears the hide flag pre-navigation.
+  // Top-edge restore is discoverable (chrome was visible there) and
+  // disjoint from normal interactions further down the page.
+  const RESTORE_ZONE_PX = 44; // matches CHROME_HTML's header height
+  document.addEventListener("click", (e) => {
+    if (!header.hasAttribute("data-hidden")) return;
+    if (Date.now() - lastHideAt < 250) return;
+    if (typeof e.clientY === "number" && e.clientY > RESTORE_ZONE_PX) return;
+    setHidden(false);
   });
 }
 
