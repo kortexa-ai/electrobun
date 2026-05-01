@@ -17,6 +17,7 @@ import {
 	type UpdateStatusDetails,
 } from "./core/Updater";
 import * as Utils from "./core/Utils";
+import * as Kiosk from "./core/Kiosk";
 import type {
 	MessageBoxOptions,
 	MessageBoxResponse,
@@ -258,6 +259,7 @@ export {
 	Tray,
 	Updater,
 	Utils,
+	Kiosk,
 	ApplicationMenu,
 	ContextMenu,
 	PATHS,
@@ -284,6 +286,7 @@ const Electrobun = {
 	Tray,
 	Updater,
 	Utils,
+	Kiosk,
 	ApplicationMenu,
 	ContextMenu,
 	GlobalShortcut,
