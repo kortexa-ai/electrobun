@@ -27,7 +27,9 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <memory>
 #include <mutex>
 
 using namespace electrobun;
@@ -73,6 +75,26 @@ QuitRequestedHandler wpeGetQuitRequestedHandler() { return g_quitRequestedHandle
 // FFI exports below that take only a webviewId (no AbstractView*) to dispatch
 // to the impl.
 namespace electrobun { AbstractView* wpeFindViewById(uint32_t webviewId); }
+
+// ---------------------------------------------------------------------------
+// Multi-window emulation on bare-DRM. The kiosk has exactly one DRM scanout,
+// so the WpeBackend itself only ever has one "display." But the JS layer
+// expects multiple BrowserWindows (About dialog, OAuth popup, etc.) to be
+// independently closable. We bridge that by allocating a per-call
+// WpeWindowEntry on createGTKWindow — its address is the unique "window
+// handle" returned to JS, and closeWindow looks the entry up to fire the
+// per-window close callback. The bun side's existing close-event chain
+// (BrowserWindow.ts: delete from BrowserWindowMap, remove views,
+// exitOnLastWindowClosed) then runs as it would on macOS/GTK.
+// ---------------------------------------------------------------------------
+
+struct WpeWindowEntry {
+    uint32_t            windowId;
+    WindowCloseCallback closeCallback;
+};
+
+static std::mutex                                              g_windowsMutex;
+static std::unordered_map<void*, std::unique_ptr<WpeWindowEntry>> g_windows;
 
 // ---------------------------------------------------------------------------
 // extern "C" — exported FFI surface
@@ -137,10 +159,14 @@ ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, d
                                        WindowCloseCallback closeCallback, WindowMoveCallback moveCallback, WindowResizeCallback resizeCallback,
                                        WindowFocusCallback focusCallback, WindowBlurCallback blurCallback, WindowKeyHandler keyCallback,
                                        const char* titleBarStyle, bool transparent) {
-    (void)windowId; (void)x; (void)y;
-    (void)closeCallback; (void)moveCallback; (void)resizeCallback;
+    (void)x; (void)y;
+    (void)moveCallback; (void)resizeCallback;
     (void)focusCallback; (void)blurCallback; (void)keyCallback;
     (void)titleBarStyle; (void)transparent;
+    // Initialize the DRM scanout on the first call. WpeBackend::createWindow
+    // is idempotent — subsequent calls return the same DrmDisplay pointer —
+    // so it's safe to invoke per BrowserWindow even though there's only one
+    // physical display.
     WindowSpec spec{};
     spec.frame       = Rect{0, 0, (int)width, (int)height};
     spec.title       = title ? title : "";
@@ -148,7 +174,19 @@ ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, d
     spec.transparent = false;
     spec.resizable   = false;
     spec.fullscreenable = true;
-    return currentDisplayBackend().createWindow(spec);
+    (void)currentDisplayBackend().createWindow(spec);
+    // Allocate a unique per-window handle. The pointer's identity is what
+    // distinguishes this BrowserWindow from any other in subsequent FFI
+    // calls (createWebview's hostWindow, closeWindow, etc.).
+    auto entry = std::make_unique<WpeWindowEntry>();
+    entry->windowId      = windowId;
+    entry->closeCallback = closeCallback;
+    void* handle = entry.get();
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        g_windows.emplace(handle, std::move(entry));
+    }
+    return handle;
 }
 
 ELECTROBUN_EXPORT void* createWindowWithFrameAndStyleFromWorker(uint32_t windowId, double x, double y, double width, double height,
@@ -175,9 +213,22 @@ ELECTROBUN_EXPORT void showWindow(void* window, bool activate)         { (void)w
 ELECTROBUN_EXPORT void activateWindow(void* window)                    { (void)window; }
 ELECTROBUN_EXPORT void hideWindow(void* window)                        { (void)window; }
 ELECTROBUN_EXPORT void closeWindow(void* window) {
-    (void)window;
-    // On a bare-DRM kiosk, closing the only window ends the app.
-    currentDisplayBackend().stopEventLoop();
+    // Look up the per-window entry by handle. Fire its close callback so the
+    // bun side runs its BrowserWindowMap-cleanup + view-removal +
+    // exitOnLastWindowClosed logic (BrowserWindow.ts:77 and ::close listener).
+    // Don't stopEventLoop here — bun's quit() handler reaches us via a
+    // separate FFI symbol when it decides to actually exit.
+    std::unique_ptr<WpeWindowEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_windows.find(window);
+        if (it == g_windows.end()) return;  // already closed or unknown handle
+        entry = std::move(it->second);
+        g_windows.erase(it);
+    }
+    if (entry && entry->closeCallback) {
+        entry->closeCallback(entry->windowId);
+    }
 }
 
 ELECTROBUN_EXPORT void minimizeWindow(void* window)                  { (void)window; }
@@ -263,6 +314,16 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextStartPassthrough.store(startPassthrough);
 }
 
+// Trust class for the next initWebview call. 0 = trusted (default — view
+// shares the WPEWebProcess of the seed via related-view), 1 = untrusted
+// (view gets its own WPEWebProcess). Mirrors the setNextWebviewFlags
+// pattern to avoid bloating initWebview's already-long FFI signature.
+static std::atomic<int> g_nextTrust{0};
+
+ELECTROBUN_EXPORT void setNextWebviewTrust(const char* trust) {
+    g_nextTrust.store((trust && std::strcmp(trust, "untrusted") == 0) ? 1 : 0);
+}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             void* window,
                                             const char* renderer,
@@ -301,6 +362,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.internalBridgeHandler= (void*)internalBridgeHandler;
     spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
     spec.customPreloadScript     = customPreloadScript     ? customPreloadScript     : "";
+    spec.trust                   = (g_nextTrust.exchange(0) == 1) ? "untrusted" : "trusted";
 
     auto view = currentWebviewBackend().createWebview(spec);
     return view ? view.get() : nullptr;

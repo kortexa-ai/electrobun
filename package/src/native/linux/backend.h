@@ -71,6 +71,13 @@ struct WebviewSpec {
     // Injected at document-start alongside electrobunPreloadScript and
     // re-applied by updateCustomPreloadScript. Empty string = no injection.
     std::string customPreloadScript;
+    // Trust class for process isolation. "" or "trusted" (default) → the view
+    // shares a WebProcess with other trusted views (related-view link).
+    // "untrusted" → the view gets its own WPEWebProcess so a compromised
+    // origin can't read trusted-view memory. Currently honored only by the
+    // WPE backend; ignored on macOS/GTK/CEF/Win where the per-view default
+    // already gives every view its own process.
+    std::string trust;
 };
 
 // Display backend: owns the platform window, the output surface, and the

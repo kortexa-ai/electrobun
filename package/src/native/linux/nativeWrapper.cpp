@@ -7651,6 +7651,10 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
+// Stub for FFI symbol parity with the WPE backend. WebKitGTK already gives
+// every WebKitWebView its own WebProcess, so trust class is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          void* window,
                          const char* renderer,

@@ -8525,6 +8525,10 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
+// Stub for FFI symbol parity with the WPE backend. WebView2 manages its own
+// process model, so trust class is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
+
 // Clean, elegant initWebview function - Windows version matching Mac pattern
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          NSWindow *window,  // Actually HWND on Windows

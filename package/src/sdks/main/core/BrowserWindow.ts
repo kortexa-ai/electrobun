@@ -48,6 +48,9 @@ export type WindowOptionsType<T = undefined> = {
 	// Use for untrusted content (remote URLs) to prevent malicious sites from
 	// accessing internal APIs, creating OOPIFs, or communicating with Bun
 	sandbox: boolean;
+	// Trust class for the window's primary BrowserView. See
+	// BrowserViewOptions.trust. Default "trusted".
+	trust: "trusted" | "untrusted";
 };
 
 const defaultOptions: WindowOptionsType = {
@@ -68,6 +71,7 @@ const defaultOptions: WindowOptionsType = {
 	hidden: false,
 	navigationRules: null,
 	sandbox: false,
+	trust: "trusted",
 };
 
 export const BrowserWindowMap: {
@@ -115,6 +119,8 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	navigationRules: string | null = null;
 	// Sandbox mode disables RPC and only allows event emission (for untrusted content)
 	sandbox: boolean = false;
+	// See WindowOptionsType.trust. Forwarded to the window's primary BrowserView.
+	trust: "trusted" | "untrusted" = "trusted";
 	// Stored so the webview's preload pipeline can decide whether to inject
 	// the auto-chrome bar (§18 in linux-wpe.md). Read by proc/native.ts when
 	// building the dynamic preload prefix per webview.
@@ -163,6 +169,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		};
 		this.navigationRules = options.navigationRules || null;
 		this.sandbox = options.sandbox ?? false;
+		this.trust = options.trust ?? "trusted";
 		this.titleBarStyle = options.titleBarStyle ?? "default";
 
 		this.init(options, centered);
@@ -262,6 +269,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			windowId: this.id,
 			navigationRules: this.navigationRules,
 			sandbox: this.sandbox,
+			trust: this.trust,
 			startPassthrough: this.passthrough,
 			spellCheck: this.spellCheck,
 		});

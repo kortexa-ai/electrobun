@@ -7293,6 +7293,10 @@ extern "C" void setNextWebviewFlags(bool startTransparent, bool startPassthrough
     g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
+// Stub for FFI symbol parity with the WPE backend. WKWebView already gives
+// every view its own Web Content process, so trust class is a no-op here.
+extern "C" void setNextWebviewTrust(const char* /*trust*/) {}
+
 extern "C" AbstractView* initWebview(uint32_t webviewId,
                         NSWindow *window,
                         const char *renderer,

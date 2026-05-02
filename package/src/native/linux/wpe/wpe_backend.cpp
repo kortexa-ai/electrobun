@@ -345,6 +345,15 @@ public:
     bool inFreePool_   = true;   // true until createWebview claims this view
     bool alwaysTopmost_ = false; // chrome views set this; rendering & input
                                  // dispatch keep them above app views
+    // Trust class of this slot. Set at WebKitWebView creation time and
+    // permanent for the WebKitWebView's lifetime — recycle never crosses
+    // the boundary because the WebProcess identity is fixed:
+    //   trusted   → constructed with the related-view link to the shared
+    //               trusted source view, so all trusted views share one
+    //               WPEWebProcess.
+    //   untrusted → constructed without related-view, so WPE spawns a
+    //               fresh WPEWebProcess for this view.
+    bool trusted_     = true;
     Rect frame_ = {};            // bounds within the rotated landscape space
 
     // Most-recent SHM buffer this view exported. Held (not released) across
@@ -565,34 +574,54 @@ public:
     // IWebviewBackend
 
     std::shared_ptr<AbstractView> createWebview(const WebviewSpec& spec) override {
-        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s'\n",
-                (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str()); fflush(stderr);
-        if (freePool_.empty()) {
-            // Stage 1: lazy pool growth. Seed view is already in use; allocate
-            // another. webkit_* APIs in createOnePooledView require the main
-            // thread, so dispatchSyncMain it. ELECTROBUN_WPE_MAX_VIEWS still
-            // caps total view count as a runaway-leak safety net (retired in
-            // Stage 4 once related-view sharing makes new views cheap).
+        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
+                (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str(),
+                spec.trust.c_str()); fflush(stderr);
+
+        // Trust class drives WebProcess sharing (Stage 2). "" defaults to
+        // "trusted" — same-origin app + chrome views share one WebProcess via
+        // the related-view link captured on the seed view. "untrusted" gets a
+        // fresh WebProcess for the OAuth-popup / external-content case.
+        const bool wantTrusted = (spec.trust != "untrusted");
+
+        // Find a recyclable view in the free pool that matches the requested
+        // trust class. The pool is small (seed + lazy-grown views), so a
+        // linear walk is cheap.
+        WpeWebViewImpl* impl = nullptr;
+        for (auto it = freePool_.begin(); it != freePool_.end(); ++it) {
+            if ((*it)->trusted_ == wantTrusted) {
+                impl = *it;
+                freePool_.erase(it);
+                break;
+            }
+        }
+        if (!impl) {
+            // No matching free view — lazy-grow. webkit_* APIs in
+            // createOnePooledView require the main thread, so dispatchSyncMain
+            // it. ELECTROBUN_WPE_MAX_VIEWS still caps total view count as a
+            // runaway-leak safety net (retired in Stage 4).
             const int cap = maxViewsFromEnvOrDefault();
             if ((int)views_.size() >= cap) {
                 fprintf(stderr, "[WpeBackend] createWebview: pool at cap (%d). "
                                 "Set ELECTROBUN_WPE_MAX_VIEWS to bump.\n", cap);
                 return nullptr;
             }
-            WpeWebViewImpl* grown = nullptr;
-            dispatchSyncMain([this, &grown]() {
-                grown = createOnePooledView();
+            // Trusted views attach to the shared trusted process via
+            // related-view. Untrusted views pass relatedView=nullptr to get
+            // their own WebProcess. trustedSourceView_ is set on the seed
+            // view in primeWpeView, so it's always non-null for trusted
+            // requests by the time createWebview runs.
+            WebKitWebView* relatedView = wantTrusted ? trustedSourceView_ : nullptr;
+            dispatchSyncMain([this, wantTrusted, relatedView, &impl]() {
+                impl = createOnePooledView(wantTrusted, relatedView);
             });
-            if (!grown) {
+            if (!impl) {
                 fprintf(stderr, "[WpeBackend] createWebview: lazy createOnePooledView failed\n");
                 return nullptr;
             }
-            freePool_.push_back(grown);
-            fprintf(stderr, "[WpeBackend] createWebview: lazy-grew pool to %zu views\n",
-                    views_.size()); fflush(stderr);
+            fprintf(stderr, "[WpeBackend] createWebview: lazy-grew pool to %zu views (%s)\n",
+                    views_.size(), wantTrusted ? "trusted/shared" : "untrusted/own-process"); fflush(stderr);
         }
-        WpeWebViewImpl* impl = freePool_.front();
-        freePool_.erase(freePool_.begin());
         impl->inFreePool_ = false;
 
         impl->webviewId = spec.webviewId;
@@ -737,7 +766,10 @@ private:
         // (see electrobun-session.md): pays for one WebProcess at startup
         // instead of N, saves ~800 MB when the app uses fewer views than the
         // cap (the common case).
-        auto* seedImpl = createOnePooledView();
+        // Seed view is trusted with no related-view link — it becomes the
+        // shared trusted source for all subsequent trusted views (set inside
+        // createOnePooledView).
+        auto* seedImpl = createOnePooledView(/*trusted=*/true, /*relatedView=*/nullptr);
         if (!seedImpl) {
             fprintf(stderr, "[WpeBackend] primeWpeView: createOnePooledView (seed) failed\n");
             return;
@@ -755,7 +787,14 @@ private:
     // identity is conveyed through the per-exportable user_data (the impl
     // pointer), so the static SHM thunk can route the buffer to the right
     // view without a lookup.
-    WpeWebViewImpl* createOnePooledView() {
+    //
+    // `trusted` tags the slot for trust-aware pool recycling. `relatedView`
+    // (when non-null) is wired through the WebKitWebView's "related-view"
+    // construct property, telling WPE WebKit to reuse the related view's
+    // WPEWebProcess instead of spawning a new one. Trusted views pass the
+    // shared trustedSourceView_ here; untrusted views pass nullptr to force
+    // a fresh WebProcess.
+    WpeWebViewImpl* createOnePooledView(bool trusted, WebKitWebView* relatedView) {
         // Static — WPE-FDO holds the pointer, doesn't copy. See §15.
         static wpe_view_backend_exportable_fdo_client client = {};
         client.export_shm_buffer = &WpeBackend::onExportShmStatic;
@@ -766,6 +805,7 @@ private:
         // Hand the impl pointer as the per-exportable user_data. onExportShm
         // re-casts it back. Holds a raw pointer; the shared_ptr lives in views_.
         WpeWebViewImpl* impl = pendingImpl.get();
+        impl->trusted_ = trusted;
 
         auto* exportable = wpe_view_backend_exportable_fdo_create(
             &client, /*user_data=*/impl, landscapeW_, landscapeH_);
@@ -775,7 +815,18 @@ private:
         }
         auto* vb = wpe_view_backend_exportable_fdo_get_view_backend(exportable);
         WebKitWebViewBackend* webviewBackend = webkit_web_view_backend_new(vb, nullptr, nullptr);
-        WebKitWebView* webView = webkit_web_view_new(webviewBackend);
+        // related-view is a WebKit construct property (no public C wrapper in
+        // the WPE port — see g_object_class_find_property probe). Setting it
+        // makes the new WebKitWebView reuse the related view's WPEWebProcess.
+        WebKitWebView* webView = nullptr;
+        if (relatedView) {
+            webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                "backend", webviewBackend,
+                "related-view", relatedView,
+                nullptr));
+        } else {
+            webView = webkit_web_view_new(webviewBackend);
+        }
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
 
@@ -808,6 +859,14 @@ private:
         impl->exportable_ = exportable;
         impl->userContentManager_ = manager;
         impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+
+        // Capture the first trusted view's WebKitWebView as the related-view
+        // source for all subsequent trusted views — this is what makes them
+        // share a WebProcess. The seed view in primeWpeView is created with
+        // relatedView=nullptr, so it always sets this pointer first.
+        if (trusted && !trustedSourceView_) {
+            trustedSourceView_ = webView;
+        }
 
         views_.push_back(pendingImpl);
         return impl;
@@ -1291,10 +1350,16 @@ private:
     uint32_t                          landscapeH_ = 0;
     int                               rotationQuarters_ = 0;
 
-    std::vector<std::shared_ptr<AbstractView>> views_;        // owns all N pre-allocated views
-    std::vector<WpeWebViewImpl*>               freePool_;     // available for createWebview
+    std::vector<std::shared_ptr<AbstractView>> views_;        // owns all pooled views
+    std::vector<WpeWebViewImpl*>               freePool_;     // available for createWebview (mixed trust)
     std::vector<WpeWebViewImpl*>               activeViews_;  // in z-order; back = topmost
     WpeWebViewImpl*                            primaryView_ = nullptr;  // topmost active view
+    // First trusted WebKitWebView created. All subsequent trusted views are
+    // constructed with the "related-view" GObject property pointing at this
+    // one, which makes WPE WebKit reuse its WPEWebProcess. Set once on the
+    // seed view in primeWpeView; never reset (recycle keeps the WebKitWebView
+    // alive, so the pointer stays valid for the process lifetime).
+    WebKitWebView*                             trustedSourceView_ = nullptr;
     // Tracks which hostWindows have already had their primary (BrowserWindow's
     // implicit) view bound. The first createWebview for a given hostWindow is
     // forced to full-panel — on bare-DRM the BrowserWindow.frame is fictional

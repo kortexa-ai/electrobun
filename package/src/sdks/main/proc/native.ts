@@ -6,6 +6,7 @@ import {
 	BrowserView,
 	emitWebviewTagBrowserViewCreated,
 } from "../core/BrowserView";
+import { BrowserWindow, BrowserWindowMap } from "../core/BrowserWindow";
 import { WGPUView } from "../core/WGPUView";
 import {
 	preloadScript,
@@ -346,6 +347,8 @@ const core = (() => {
 					FFIType.bool,
 					FFIType.bool,
 					FFIType.bool,
+					FFIType.bool,
+					FFIType.cstring,
 				],
 				returns: FFIType.u32,
 			},
@@ -750,6 +753,17 @@ export const native = (() => {
 				args: [
 					FFIType.bool, // startTransparent
 					FFIType.bool, // startPassthrough
+				],
+				returns: FFIType.void,
+			},
+			// Pre-set trust class for the next initWebview call. "trusted" (default
+			// or empty) → on WPE, view shares the trusted WebProcess via related-view.
+			// "untrusted" → on WPE, view gets its own WebProcess for OAuth-style
+			// isolation. No-op on macOS/GTK/CEF/Win where each view already has its
+			// own process.
+			setNextWebviewTrust: {
+				args: [
+					FFIType.cstring, // trust
 				],
 				returns: FFIType.void,
 			},
@@ -1768,6 +1782,7 @@ const _ffiImpl = {
 			startTransparent: boolean;
 			startPassthrough: boolean;
 			spellCheck: boolean;
+			trust: "trusted" | "untrusted";
 		}): number => {
 			const {
 				windowId,
@@ -1784,6 +1799,7 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				trust,
 			} = params;
 			ensureWebviewRuntimeConfigured();
 
@@ -1810,6 +1826,7 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				toCString(trust),
 			);
 
 			if (!webviewId) {
@@ -3481,11 +3498,23 @@ export const internalRpcHandlers = {
 	message: {
 		// Auto-chrome bar's [✕] button (§18 in linux-wpe.md) routes here so
 		// apps that opt into titleBarStyle: "hidden" get a working close
-		// button without any per-app wiring.
-		electrobunChromeQuit: () => {
+		// button without any per-app wiring. Context-aware: closes the
+		// originating window if there are others still open, quits the app
+		// if it's the last one. Without windowId in the payload (older
+		// chrome.ts builds) we always quit, matching the original behavior.
+		electrobunChromeQuit: (params?: { windowId?: number }) => {
 			// Inline require to avoid pulling Utils into the module-init cycle
 			// (BrowserWindow → events → Utils path is already touchy).
 			const { quit } = require("../core/Utils");
+			const windowId = params?.windowId;
+			const remainingWindows = Object.keys(BrowserWindowMap).length;
+			if (windowId != null && remainingWindows > 1) {
+				const win = BrowserWindow.getById(windowId);
+				if (win) {
+					win.close();
+					return;
+				}
+			}
 			quit();
 		},
 		webviewTagResize: (params: {

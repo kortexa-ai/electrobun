@@ -104,8 +104,13 @@ function injectChrome() {
   closeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     // Routes through the internal RPC bridge to a built-in handler that
-    // calls Utils.quit() Bun-side. No app-level wiring needed.
-    send("electrobunChromeQuit", {});
+    // closes this window if it isn't the last one, otherwise quits the app.
+    // Pass our windowId so the handler can pick the right BrowserWindow —
+    // without it, the handler can't tell whether to close-vs-quit when the
+    // app has multiple windows (About dialogs, OAuth popups, etc.).
+    const windowId = (window as unknown as { __electrobunWindowId?: number })
+      .__electrobunWindowId;
+    send("electrobunChromeQuit", windowId != null ? { windowId } : {});
   });
 
   // Fullscreen state persists across navigations via sessionStorage so

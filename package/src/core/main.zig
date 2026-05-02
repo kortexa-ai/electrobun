@@ -1877,6 +1877,7 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         transparent,
         passthrough,
         spell_check,
+        "trusted",
     );
 
     if (webview_id == 0) {
@@ -2812,6 +2813,7 @@ export fn createWebview(
     start_transparent: bool,
     start_passthrough: bool,
     spell_check: bool,
+    trust: [*:0]const u8,
 ) u32 {
     clearLastError();
     _ = _host_bridge_handler;
@@ -2822,6 +2824,7 @@ export fn createWebview(
     );
 
     const SetNextWebviewFlagsFn = *const fn (bool, bool) callconv(.c) void;
+    const SetNextWebviewTrustFn = *const fn ([*:0]const u8) callconv(.c) void;
     const InitWebviewFn = *const fn (
         u32,
         WindowPtr,
@@ -2854,6 +2857,7 @@ export fn createWebview(
         return 0;
     };
     const set_next_webview_flags = lookupNativeSymbol(SetNextWebviewFlagsFn, "setNextWebviewFlags") orelse return 0;
+    const set_next_webview_trust = lookupNativeSymbol(SetNextWebviewTrustFn, "setNextWebviewTrust") orelse return 0;
     const init_webview = lookupNativeSymbol(InitWebviewFn, "initWebview") orelse return 0;
     const parsed_secret_key = parseWebviewSecretKey(secret_key) orelse return 0;
 
@@ -2912,6 +2916,7 @@ export fn createWebview(
     defer allocator.free(electrobun_preload_script);
 
     set_next_webview_flags(start_transparent, start_passthrough);
+    set_next_webview_trust(trust);
 
     const webview_ptr = init_webview(
         webview_id,
