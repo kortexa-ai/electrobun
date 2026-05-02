@@ -633,18 +633,24 @@ public:
         impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
         impl->customPreloadScript_     = spec.customPreloadScript;
         impl->frame_                = spec.frame;
-        // Bare-DRM has no window manager: a BrowserWindow.frame is just a
-        // desktop-only initial-placement hint. The first webview bound to a
-        // host window is the BrowserWindow's implicit primary view; force it
-        // to fill the panel so apps written for cross-target portability
-        // (where the same source must run on macOS/Windows/Linux-desktop and
-        // bare-DRM) don't have to special-case the kiosk dimensions.
-        // Explicit BrowserViews (chrome bars, overlays) attach to the same
-        // host window with their own frames — those are honored as-is.
+        // Bare-DRM has no window manager. The *first* BrowserWindow's primary
+        // view (the chrome bar + app on a kiosk) is force-fitted to fill the
+        // panel so apps written for cross-target portability don't have to
+        // special-case the kiosk dimensions. Subsequent BrowserWindows (About
+        // dialogs, OAuth popups, etc.) honor their requested frame so visual
+        // dialogs work — without this multi-window apps would overlay every
+        // window fullscreen on top of each other. Explicit BrowserViews
+        // (chrome bars, overlays) attach to a host window with their own
+        // frames — those are honored as-is regardless of host window.
         const bool isPrimaryView =
             spec.hostWindow != nullptr &&
             primaryBoundFor_.insert(spec.hostWindow).second;
-        if (isPrimaryView) {
+        if (isPrimaryView && !firstHostWindow_) {
+            firstHostWindow_ = spec.hostWindow;
+        }
+        const bool isMainPrimary =
+            isPrimaryView && spec.hostWindow == firstHostWindow_;
+        if (isMainPrimary) {
             impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
         } else if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
             // Default any unset bounds to fullscreen.
@@ -1360,6 +1366,12 @@ private:
     // seed view in primeWpeView; never reset (recycle keeps the WebKitWebView
     // alive, so the pointer stays valid for the process lifetime).
     WebKitWebView*                             trustedSourceView_ = nullptr;
+    // First BrowserWindow's host handle. Used in createWebview to decide
+    // whether to fullscreen-promote a primary view: only the main window's
+    // primary view fills the whole panel; secondary BrowserWindows (About,
+    // OAuth popups, etc.) honor their requested frame. Set on the first
+    // primary-view bind; never reset.
+    void*                                      firstHostWindow_   = nullptr;
     // Tracks which hostWindows have already had their primary (BrowserWindow's
     // implicit) view bound. The first createWebview for a given hostWindow is
     // forced to full-panel — on bare-DRM the BrowserWindow.frame is fictional
