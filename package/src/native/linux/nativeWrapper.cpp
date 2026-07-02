@@ -402,7 +402,9 @@ bool isPointInMask(double x, double y, const std::vector<MaskRect>& masks) {
 // Note: X11 window extraction removed - WebKit now uses GTK-native input shape masking
 
 // Forward declarations
-class AbstractView;
+// (AbstractView comes from abstract_view.h via `using namespace electrobun`;
+// re-forward-declaring it in the global namespace makes every unqualified
+// use ambiguous once the GTK wrapper actually compiles.)
 
 // Helper function to check navigation rules - defined after AbstractView class
 bool checkNavigationRules(std::shared_ptr<AbstractView> view, const std::string& url);
