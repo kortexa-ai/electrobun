@@ -6,6 +6,9 @@ const c = @cImport({
     @cInclude("signal.h");
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
+    if (builtin.os.tag == .linux) {
+        @cInclude("dlfcn.h");
+    }
 });
 
 // Initialized at the top of main().
@@ -135,26 +138,34 @@ fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8) void
         defer allocator.free(path);
         fadviseWillneed(path);
     }
+}
 
-    const system_directories = [_][]const u8{
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-    };
-    for (system_directories) |directory_path| {
-        var directory = std.Io.Dir.openDirAbsolute(g_io, directory_path, .{ .iterate = true }) catch continue;
-        defer directory.close(g_io);
-        var iterator = directory.iterate();
-        while (iterator.next(g_io) catch null) |entry| {
-            if (std.mem.startsWith(u8, entry.name, "libWPEWebKit-") or
-                std.mem.startsWith(u8, entry.name, "libwebkit2gtk-") or
-                std.mem.startsWith(u8, entry.name, "libjavascriptcoregtk-"))
-            {
-                const path = std.fs.path.join(allocator, &.{ directory_path, entry.name }) catch continue;
-                defer allocator.free(path);
-                fadviseWillneed(path);
-            }
+// Preheat the web engine by dlopen'ing the native wrapper in a throwaway
+// grandchild. This warms the wrapper's shared-library dependency pages in
+// parallel with the app runtime's cold start.
+fn preheatNativeWrapper(allocator: std.mem.Allocator, exe_dir: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+
+    const wrapper_path = std.fs.path.joinZ(allocator, &.{ exe_dir, "libNativeWrapper.so" }) catch return;
+    defer allocator.free(wrapper_path);
+    std.Io.Dir.accessAbsolute(g_io, wrapper_path, .{}) catch return;
+
+    const pid = std.posix.fork() catch return;
+    if (pid == 0) {
+        const grandchild = std.posix.fork() catch std.posix.exit(0);
+        if (grandchild == 0) {
+            _ = c.dlopen(wrapper_path.ptr, c.RTLD_NOW | c.RTLD_GLOBAL);
+            std.posix.exit(0);
         }
+        std.posix.exit(0);
     }
+    _ = std.posix.waitpid(pid, 0);
+}
+        }
+        std.posix.exit(0);
+    }
+    // Reap the short-lived first child; the grandchild belongs to init now.
+    _ = std.posix.waitpid(pid, 0);
 }
 
 const MainProcess = enum {
@@ -283,6 +294,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk args_list.items;
     };
 
+    preheatNativeWrapper(arena_alloc, exe_dir);
     readaheadStartupFiles(arena_alloc, exe_dir);
     const main_process = detectMainProcess(arena_alloc, exe_dir);
 
