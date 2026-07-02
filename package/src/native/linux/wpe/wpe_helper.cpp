@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     const char* url = argv[1];
-    const char* identifier = (argc > 2) ? argv[2] : "sh.kortexa.hello-embedded";
+    const char* identifier = (argc > 2) ? argv[2] : "ai.kortexa.hello-embedded";
     const char* name = (argc > 3) ? argv[3] : "HelloElectrobun";
     const char* channel = (argc > 4) ? argv[4] : "dev";
 
