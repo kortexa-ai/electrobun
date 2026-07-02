@@ -363,6 +363,12 @@ public:
     // whatever's left. nullptr until the view's first paint.
     struct wpe_fdo_shm_exported_buffer* pendingShm_ = nullptr;
 
+    // True while this view has produced a frame whose frame_complete ack is
+    // deferred until the composite that includes it is presented. Ties the
+    // WebProcess's frame production to the panel's refresh rate instead of
+    // free-running raster (see onViewExportedShm / composeAndPresent).
+    bool awaitingFrameComplete_ = false;
+
     // ---- Navigation event handlers ----
     //
     // Ported verbatim from the WebKitGTK path in nativeWrapper.cpp
@@ -503,7 +509,12 @@ public:
                 impl->exportable(), impl->pendingShm_);
             wpe_view_backend_exportable_fdo_dispatch_frame_complete(impl->exportable());
             impl->pendingShm_ = nullptr;
+        } else if (impl->awaitingFrameComplete_ && impl->exportable()) {
+            // Deferred ack never fired (recycled between export and compose)
+            // — release the WebProcess so the pooled view keeps rendering.
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(impl->exportable());
         }
+        impl->awaitingFrameComplete_ = false;
         if (impl->webView_) webkit_web_view_load_uri(impl->webView_, "about:blank");
 
         impl->inFreePool_ = true;
@@ -750,6 +761,21 @@ private:
                 landscapeW_, landscapeH_, display_->logicalWidth(), display_->logicalHeight(),
                 rotationQuarters_); fflush(stderr);
 
+        // Page-flip completions arrive on the DRM fd. Watching it from the
+        // main loop lets composeAndPresent defer instead of blocking in
+        // acquire() until vblank (which would stall input + bridge traffic).
+        drmFdWatchId_ = g_unix_fd_add(display_->fd(), G_IO_IN,
+            +[](gint, GIOCondition, gpointer ud) -> gboolean {
+                auto* self = static_cast<WpeBackend*>(ud);
+                if (!self->display_) return G_SOURCE_REMOVE;
+                self->display_->handleEvents();
+                if (self->composeDeferredForFlip_) {
+                    self->composeDeferredForFlip_ = false;
+                    self->composeAndPresent();
+                }
+                return G_SOURCE_CONTINUE;
+            }, this);
+
         if (!g_getenv("ELECTROBUN_NO_INPUT")) {
             InputDispatcherConfig icfg{};
             icfg.screenWidth          = display_->logicalWidth();
@@ -962,10 +988,11 @@ private:
     // nativeWrapper.cpp:2630-2715 has an extra `_get_js_value` step that
     // we skip here.
     //
-    // Lifetime: GTK uses a "leak then free 1s later in a detached thread"
-    // pattern because the Bun JSCallback may still be using the string
-    // asynchronously when the signal handler returns. We copy the same
-    // semantics to keep behavior identical across targets.
+    // Lifetime: same deferred-free contract as GTK (the Bun JSCallback may
+    // still be using the string asynchronously when the signal handler
+    // returns), but WITHOUT the thread-per-message + 1s sleep GTK uses —
+    // that's a thread spawn per RPC message. A low-priority GLib timeout on
+    // the already-running main loop frees the buffers instead.
     static void forwardBridgeMessage(HandlePostMessage handler,
                                      uint32_t webviewId,
                                      JSCValue* value) {
@@ -977,11 +1004,18 @@ private:
         char* message_copy = new char[len + 1];
         std::memcpy(message_copy, str_value, len + 1);
         handler(webviewId, message_copy);
-        std::thread([message_copy, str_value]() {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            delete[] message_copy;
-            g_free(str_value);
-        }).detach();
+
+        struct DeferredFree { char* copy; gchar* str; };
+        auto* deferred = new DeferredFree{message_copy, str_value};
+        g_timeout_add_seconds_full(G_PRIORITY_LOW, 1,
+            +[](gpointer) -> gboolean { return G_SOURCE_REMOVE; },
+            deferred,
+            +[](gpointer ud) {
+                auto* d = static_cast<DeferredFree*>(ud);
+                delete[] d->copy;
+                g_free(d->str);
+                delete d;
+            });
     }
     static void onBunBridgeMessageStatic(WebKitUserContentManager*,
                                          JSCValue* value,
@@ -1038,12 +1072,21 @@ private:
                 view->exportable(), view->pendingShm_);
         }
         view->pendingShm_ = buffer;
-        // Always ack: tells WPE-FDO it can produce the next frame. Must fire
-        // even on the very first frame (when there was no prior buffer to
-        // release) — otherwise WPE waits forever for the ack and the
-        // renderer stalls after a single onExportShm callback per view.
-        wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
-        scheduleCompose();
+        // frame_complete tells WPE-FDO it can produce the next frame; every
+        // exported frame must eventually get one or the renderer stalls.
+        //
+        // Pool-parked views (about:blank warmers) and no-display fallback:
+        // never composited, so ack immediately to keep their render loop
+        // alive. Active views: defer the ack until composeAndPresent has
+        // queued the flip that includes this frame — that throttles the
+        // WebProcess to the panel's refresh rate instead of free-running
+        // raster (pure CPU savings on animated content, steadier pacing).
+        if (view->inFreePool_ || !display_) {
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
+        } else {
+            view->awaitingFrameComplete_ = true;
+            scheduleCompose();
+        }
     }
 
     // Coalesce composite scheduling. If a frame is already pending we don't
@@ -1060,66 +1103,125 @@ private:
         }, this, nullptr);
     }
 
+    // True when `v` (with its current SHM buffer) would overwrite every pixel
+    // of the composite space — the common kiosk case of one force-fitted
+    // fullscreen view. Lets composeAndPresent skip the full-frame clear and
+    // take the direct-blit fast path. wl_shm_buffer_get_width/height do not
+    // require begin_access.
+    bool viewCoversComposite(WpeWebViewImpl* v) const {
+        if (!v || !v->pendingShm_) return false;
+        if (v->frame_.x != 0 || v->frame_.y != 0 ||
+            v->frame_.width  < (int)landscapeW_ ||
+            v->frame_.height < (int)landscapeH_) return false;
+        struct wl_shm_buffer* shm =
+            wpe_fdo_shm_exported_buffer_get_shm_buffer(v->pendingShm_);
+        return shm &&
+               wl_shm_buffer_get_width(shm)  >= (int)landscapeW_ &&
+               wl_shm_buffer_get_height(shm) >= (int)landscapeH_;
+    }
+
     // Walk activeViews_ in insertion order (back = topmost; later overlays
     // earlier). Each view's pendingShm_ is copied into compositeBuffer_ at
     // view.frame_; then a single rotate-blit pushes the composite to DRM.
     // Held buffers stay held — see onViewExportedShm.
+    //
+    // Single fullscreen view takes a fast path: rotate-blit its SHM straight
+    // into the DRM back buffer, skipping the intermediate composite copy AND
+    // the full-frame clear (one memory pass instead of three).
     void composeAndPresent() {
         if (!display_) return;
 
-        const size_t neededBytes = (size_t)landscapeW_ * landscapeH_ * 4;
-        if (compositeBuffer_.size() != neededBytes) {
-            compositeBuffer_.assign(neededBytes, 0);
-        } else {
-            // Clear to opaque black. Each view's blit overwrites only its
-            // bounds; uncovered regions stay black.
-            std::memset(compositeBuffer_.data(), 0, neededBytes);
+        // A flip is still in flight — acquire() would block the GLib main
+        // loop until vblank, stalling input dispatch and bridge messages.
+        // Defer: the DRM-fd watch re-runs us when the flip completes.
+        if (display_->flipPending()) {
+            composeDeferredForFlip_ = true;
+            return;
         }
-        const uint32_t compStride = landscapeW_ * 4;
 
-        for (auto* view : activeViews_) {
-            if (!view || !view->pendingShm_) continue;
+        DrmFrame dst = display_->acquire();  // non-blocking (no flip pending)
+
+        const bool singleFullscreen =
+            activeViews_.size() == 1 && viewCoversComposite(activeViews_[0]);
+
+        if (singleFullscreen) {
+            WpeWebViewImpl* view = activeViews_[0];
             struct wl_shm_buffer* shm =
                 wpe_fdo_shm_exported_buffer_get_shm_buffer(view->pendingShm_);
-            if (!shm) continue;
-
             wl_shm_buffer_begin_access(shm);
-            const uint8_t* src       = (const uint8_t*)wl_shm_buffer_get_data(shm);
-            int32_t        srcStride = wl_shm_buffer_get_stride(shm);
-            int32_t        srcW      = wl_shm_buffer_get_width(shm);
-            int32_t        srcH      = wl_shm_buffer_get_height(shm);
-
-            // Blit src → compositeBuffer_ at (view.frame_.x, view.frame_.y),
-            // sized to min(srcW, frame.w) × min(srcH, frame.h). Negative
-            // origins clipped to 0; out-of-bounds src/dst clipped to the
-            // composite's dims. Plain BGRA copy — alpha math defers to the
-            // next iteration if any view ever needs translucency.
-            const int dstX0 = std::max(0, view->frame_.x);
-            const int dstY0 = std::max(0, view->frame_.y);
-            const int srcX0 = dstX0 - view->frame_.x;
-            const int srcY0 = dstY0 - view->frame_.y;
-            const int blitW = std::min({(int)srcW - srcX0,
-                                        view->frame_.width  - (dstX0 - view->frame_.x),
-                                        (int)landscapeW_   - dstX0});
-            const int blitH = std::min({(int)srcH - srcY0,
-                                        view->frame_.height - (dstY0 - view->frame_.y),
-                                        (int)landscapeH_   - dstY0});
-            if (blitW > 0 && blitH > 0) {
-                for (int r = 0; r < blitH; r++) {
-                    std::memcpy(
-                        compositeBuffer_.data() + (size_t)(dstY0 + r) * compStride + (size_t)dstX0 * 4,
-                        src + (size_t)(srcY0 + r) * srcStride + (size_t)srcX0 * 4,
-                        (size_t)blitW * 4);
-                }
-            }
+            blitWithRotation((const uint8_t*)wl_shm_buffer_get_data(shm),
+                             wl_shm_buffer_get_stride(shm),
+                             landscapeW_, landscapeH_,
+                             dst.pixels, dst.pitch, dst.width, dst.height);
             wl_shm_buffer_end_access(shm);
+        } else {
+            const size_t neededBytes = (size_t)landscapeW_ * landscapeH_ * 4;
+            // Clear to opaque black so uncovered regions don't show stale
+            // pixels — skippable when some view overwrites every pixel.
+            bool fullyCovered = false;
+            for (auto* view : activeViews_) {
+                if (viewCoversComposite(view)) { fullyCovered = true; break; }
+            }
+            if (compositeBuffer_.size() != neededBytes) {
+                compositeBuffer_.assign(neededBytes, 0);
+            } else if (!fullyCovered) {
+                std::memset(compositeBuffer_.data(), 0, neededBytes);
+            }
+            const uint32_t compStride = landscapeW_ * 4;
+
+            for (auto* view : activeViews_) {
+                if (!view || !view->pendingShm_) continue;
+                struct wl_shm_buffer* shm =
+                    wpe_fdo_shm_exported_buffer_get_shm_buffer(view->pendingShm_);
+                if (!shm) continue;
+
+                wl_shm_buffer_begin_access(shm);
+                const uint8_t* src       = (const uint8_t*)wl_shm_buffer_get_data(shm);
+                int32_t        srcStride = wl_shm_buffer_get_stride(shm);
+                int32_t        srcW      = wl_shm_buffer_get_width(shm);
+                int32_t        srcH      = wl_shm_buffer_get_height(shm);
+
+                // Blit src → compositeBuffer_ at (view.frame_.x, view.frame_.y),
+                // sized to min(srcW, frame.w) × min(srcH, frame.h). Negative
+                // origins clipped to 0; out-of-bounds src/dst clipped to the
+                // composite's dims. Plain BGRA copy — alpha math defers to the
+                // next iteration if any view ever needs translucency.
+                const int dstX0 = std::max(0, view->frame_.x);
+                const int dstY0 = std::max(0, view->frame_.y);
+                const int srcX0 = dstX0 - view->frame_.x;
+                const int srcY0 = dstY0 - view->frame_.y;
+                const int blitW = std::min({(int)srcW - srcX0,
+                                            view->frame_.width  - (dstX0 - view->frame_.x),
+                                            (int)landscapeW_   - dstX0});
+                const int blitH = std::min({(int)srcH - srcY0,
+                                            view->frame_.height - (dstY0 - view->frame_.y),
+                                            (int)landscapeH_   - dstY0});
+                if (blitW > 0 && blitH > 0) {
+                    for (int r = 0; r < blitH; r++) {
+                        std::memcpy(
+                            compositeBuffer_.data() + (size_t)(dstY0 + r) * compStride + (size_t)dstX0 * 4,
+                            src + (size_t)(srcY0 + r) * srcStride + (size_t)srcX0 * 4,
+                            (size_t)blitW * 4);
+                    }
+                }
+                wl_shm_buffer_end_access(shm);
+            }
+
+            blitWithRotation(compositeBuffer_.data(), compStride, landscapeW_, landscapeH_,
+                             dst.pixels, dst.pitch, dst.width, dst.height);
         }
 
-        DrmFrame dst = display_->acquire();
-        blitWithRotation(compositeBuffer_.data(), compStride, landscapeW_, landscapeH_,
-                         dst.pixels, dst.pitch, dst.width, dst.height);
         display_->present();
         framesRendered_++;
+
+        // The flip that includes every held frame is queued — release the
+        // WebProcesses to produce their next frames (see onViewExportedShm).
+        for (auto* view : activeViews_) {
+            if (view && view->awaitingFrameComplete_ && view->exportable()) {
+                view->awaitingFrameComplete_ = false;
+                wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
+            }
+        }
     }
 
     // rotationQuarters_ of 0 = no rotation (straight copy), respect pitches.
@@ -1343,6 +1445,7 @@ private:
         views_.clear();
         primaryView_ = nullptr;
         if (input_) { input_->stop(); input_.reset(); }
+        if (drmFdWatchId_) { g_source_remove(drmFdWatchId_); drmFdWatchId_ = 0; }
         display_.reset();
         if (mainLoop_) { g_main_loop_unref(mainLoop_); mainLoop_ = nullptr; }
     }
@@ -1386,6 +1489,10 @@ private:
     // blitWithRotation pushes the result to DRM. ~3.7MB at 1920x480.
     std::vector<uint8_t>                       compositeBuffer_;
     bool                                       composeScheduled_ = false;
+    // Set when composeAndPresent found a flip still in flight; the DRM-fd
+    // watch (drmFdWatchId_) re-runs the compose when the flip completes.
+    bool                                       composeDeferredForFlip_ = false;
+    guint                                      drmFdWatchId_ = 0;
 
     // Per-touch-slot capture state. TouchDown picks a target view; subsequent
     // Motion/Up on the same slot stick with that view (implicit pointer

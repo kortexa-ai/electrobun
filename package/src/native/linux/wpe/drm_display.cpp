@@ -241,6 +241,17 @@ void pageFlipHandler(int /*fd*/, unsigned /*frame*/, unsigned /*sec*/,
 }
 } // anon
 
+int DrmDisplay::fd() const { return impl_->fd; }
+
+bool DrmDisplay::flipPending() const { return impl_->pageFlipPending; }
+
+void DrmDisplay::handleEvents() {
+    drmEventContext evctx = {};
+    evctx.version = DRM_EVENT_CONTEXT_VERSION;
+    evctx.page_flip_handler = pageFlipHandler;
+    drmHandleEvent(impl_->fd, &evctx);
+}
+
 DrmFrame DrmDisplay::acquire() {
     // Block until the previous page flip (if any) has completed; otherwise
     // the kernel will refuse a new flip with EBUSY.

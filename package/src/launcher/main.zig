@@ -105,6 +105,58 @@ fn isDevBuild(allocator: std.mem.Allocator, exe_dir: []const u8) bool {
     return false;
 }
 
+// Linux cold-start: the launcher is the first process in the chain, and
+// everything after it is I/O-bound — bun (~100MB) pages in on exec, then the
+// app's dlopen pages in libWPEWebKit/libwebkit2gtk (~116MB) from the system
+// dir. posix_fadvise(WILLNEED) is asynchronous kernel readahead: one cheap
+// syscall per file here lets those reads run in parallel with bun's own boot
+// instead of serializing behind it. No-op when files are already page-cached
+// (warm restarts) or on other platforms.
+fn fadviseWillneed(path: []const u8) void {
+    const file = std.Io.Dir.cwd().openFile(g_io, path, .{}) catch return;
+    defer file.close(g_io);
+    // A length of zero asks Linux to advise from offset zero to EOF.
+    _ = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.WILLNEED);
+}
+
+fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+
+    const relative_candidates = [_][]const u8{
+        "bun",
+        "libNativeWrapper.so",
+        "libNativeWrapper_wpe.so",
+        "libElectrobunCore.so",
+        "../Resources/main.js",
+        "../Resources/app.asar",
+    };
+    for (relative_candidates) |relative_path| {
+        const path = std.fs.path.join(allocator, &.{ exe_dir, relative_path }) catch continue;
+        defer allocator.free(path);
+        fadviseWillneed(path);
+    }
+
+    const system_directories = [_][]const u8{
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+    };
+    for (system_directories) |directory_path| {
+        var directory = std.Io.Dir.openDirAbsolute(g_io, directory_path, .{ .iterate = true }) catch continue;
+        defer directory.close(g_io);
+        var iterator = directory.iterate();
+        while (iterator.next(g_io) catch null) |entry| {
+            if (std.mem.startsWith(u8, entry.name, "libWPEWebKit-") or
+                std.mem.startsWith(u8, entry.name, "libwebkit2gtk-") or
+                std.mem.startsWith(u8, entry.name, "libjavascriptcoregtk-"))
+            {
+                const path = std.fs.path.join(allocator, &.{ directory_path, entry.name }) catch continue;
+                defer allocator.free(path);
+                fadviseWillneed(path);
+            }
+        }
+    }
+}
+
 const MainProcess = enum {
     bun,
     cottontail,
@@ -230,6 +282,8 @@ pub fn main(init: std.process.Init) !void {
         }
         break :blk args_list.items;
     };
+
+    readaheadStartupFiles(arena_alloc, exe_dir);
     const main_process = detectMainProcess(arena_alloc, exe_dir);
 
     // Platform-specific paths

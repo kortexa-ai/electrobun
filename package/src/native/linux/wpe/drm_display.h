@@ -62,13 +62,27 @@ public:
     uint32_t logicalHeight() const;
 
     // Acquire the next writable frame buffer. Blocks until a buffer is
-    // available (the previous present completed).
+    // available (the previous present completed). Event-loop-integrated
+    // callers should check flipPending() first and defer instead of
+    // blocking — see fd()/handleEvents().
     DrmFrame acquire();
 
     // Submit the acquired frame for scanout. Non-blocking; returns when the
     // page-flip is queued (not when it completes). A subsequent acquire()
     // waits for completion.
     void present();
+
+    // DRM device fd. Watch it for readability (page-flip completion events)
+    // and call handleEvents() to drain them, so presentation never blocks
+    // the caller's event loop.
+    int fd() const;
+
+    // True while a queued page flip has not completed — acquire() would block.
+    bool flipPending() const;
+
+    // Drain pending DRM events (page-flip completions). Call when fd() is
+    // readable; blocks otherwise.
+    void handleEvents();
 
     const std::string& getLastError() const;
 

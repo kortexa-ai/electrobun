@@ -423,7 +423,13 @@ fn signalHostMessageWakeup() void {
 
 fn enqueuePendingHostMessage(webview_id: u32, message: [*:0]const u8) void {
     const owned_message = dupeZ(message) catch return;
+    enqueueOwnedHostMessage(webview_id, owned_message);
+}
 
+// Takes ownership of `owned_message` (frees it if the queue append fails).
+// Callers that already hold a heap copy use this to avoid a second full
+// duplicate on the per-message hot path.
+fn enqueueOwnedHostMessage(webview_id: u32, owned_message: [:0]u8) void {
     pending_host_messages_mutex.lockUncancelable(coreIo());
     defer pending_host_messages_mutex.unlock(coreIo());
 
@@ -955,13 +961,26 @@ fn writeWebSocketFrame(stream: std.Io.net.Stream, opcode: u8, payload: []const u
         }
     }
 
+    // Send header and payload through one logical write to avoid delayed-ACK
+    // latency, while retaining the current std.Io buffered-stream API.
+    const total = header_len + payload.len;
+    var stack_frame: [4096]u8 = undefined;
+    const frame = if (total <= stack_frame.len) blk: {
+        @memcpy(stack_frame[0..header_len], header[0..header_len]);
+        @memcpy(stack_frame[header_len..total], payload);
+        break :blk stack_frame[0..total];
+    } else blk: {
+        const allocated = try allocator.alloc(u8, total);
+        @memcpy(allocated[0..header_len], header[0..header_len]);
+        @memcpy(allocated[header_len..], payload);
+        break :blk allocated;
+    };
+    defer if (total > stack_frame.len) allocator.free(frame);
+
     var write_buffer: [1024]u8 = undefined;
     var stream_writer = stream.writer(coreIo(), &write_buffer);
     const out = &stream_writer.interface;
-    try out.writeAll(header[0..header_len]);
-    if (payload.len > 0) {
-        try out.writeAll(payload);
-    }
+    try out.writeAll(frame);
     try out.flush();
 }
 
@@ -1144,14 +1163,14 @@ fn isPlaintextHostTransportPacket(message_json: []const u8) bool {
 }
 
 fn enqueueHostTransportPlaintext(webview_id: u32, context: WebviewTransportContext, plaintext: []const u8) void {
-    if (context.socket_handle) |socket_handle| {
-        markWebviewTransportReady(webview_id, socket_handle);
+    if (!context.transport_ready) {
+        if (context.socket_handle) |socket_handle| {
+            markWebviewTransportReady(webview_id, socket_handle);
+        }
     }
 
     const message_z = allocator.dupeZ(u8, plaintext) catch return;
-    defer allocator.free(message_z);
-
-    enqueuePendingHostMessage(webview_id, message_z.ptr);
+    enqueueOwnedHostMessage(webview_id, message_z);
 }
 
 fn dispatchHostTransportMessage(webview_id: u32, encrypted_packet: []const u8) void {
@@ -1175,6 +1194,16 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
     const io = coreIo();
     incrementHostTransportDebug("connections");
     defer stream.close(io);
+
+    // Small request/response frames on loopback — Nagle only adds delayed-ACK
+    // latency here (up to ~40ms per RPC round-trip). TCP_NODELAY == 1 and
+    // IPPROTO_TCP == 6 on every platform we build core for.
+    std.posix.setsockopt(
+        stream.socket.handle,
+        6, // IPPROTO_TCP
+        1, // TCP_NODELAY
+        &std.mem.toBytes(@as(c_int, 1)),
+    ) catch {};
 
     var read_buffer: [16 * 1024]u8 = undefined;
     var write_buffer: [1024]u8 = undefined;
@@ -1204,6 +1233,10 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
     if (!attachWebviewSocketHandle(webview_id, stream.socket.handle)) {
         return;
     }
+
+    // The browser installs its listener when the WebSocket handshake completes,
+    // so host-to-webview frames are ready before the first inbound message.
+    markWebviewTransportReady(webview_id, stream.socket.handle);
 
     // Any bytes the client sent after the HTTP head remain buffered in `in`,
     // so WebSocket frames are read from the same reader.
