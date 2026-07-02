@@ -80,6 +80,9 @@ class Electroview<T extends RPCWithTransport> {
 		const socket = new WebSocket(
 			`ws://127.0.0.1:${HOST_SOCKET_PORT}/socket?webviewId=${WEBVIEW_ID}`,
 		);
+		// The host sends binary packets (iv | ciphertext | tag); arraybuffer
+		// avoids the async Blob→buffer hop per message.
+		socket.binaryType = "arraybuffer";
 
 		this.hostSocket = socket;
 
@@ -90,7 +93,16 @@ class Electroview<T extends RPCWithTransport> {
 
 		socket.addEventListener("message", async (event) => {
 			const message = event.data;
-			if (typeof message === "string") {
+			if (message instanceof ArrayBuffer) {
+				try {
+					const decrypted = await window.__electrobun_decrypt_binary!(message);
+					this.hostSocketCanSend = true;
+					this.rpcHandler?.(JSON.parse(decrypted));
+				} catch (err) {
+					console.error("Error decrypting bun message:", err);
+				}
+			} else if (typeof message === "string") {
+				// Legacy base64+JSON envelope from an older host runtime.
 				try {
 					const packet = JSON.parse(message);
 					this.hostSocketCanSend = true;
@@ -111,8 +123,6 @@ class Electroview<T extends RPCWithTransport> {
 				} catch (err) {
 					console.error("Error parsing bun message:", err);
 				}
-			} else if (message instanceof Blob) {
-				// Handle binary data (e.g., convert Blob to ArrayBuffer if needed)
 			} else {
 				console.error("UNKNOWN DATA TYPE RECEIVED:", event.data);
 			}
@@ -185,6 +195,15 @@ class Electroview<T extends RPCWithTransport> {
 				this.hostSocket!.send(msg);
 				return true;
 			}
+
+			if (window.__electrobun_encrypt_binary) {
+				// Binary packet: iv | ciphertext | tag — no base64/JSON envelope.
+				this.hostSocket!.send(await window.__electrobun_encrypt_binary(msg));
+				return true;
+			}
+
+			// Compatibility with older preload bundles that only expose the
+			// base64+JSON encryption helpers.
 			const { encryptedData, iv, tag } =
 				await window.__electrobun_encrypt(msg);
 

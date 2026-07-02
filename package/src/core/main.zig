@@ -739,13 +739,6 @@ fn decodeBase64Alloc(input: []const u8) ![]u8 {
     return decoded;
 }
 
-fn encodeBase64Alloc(input: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(input.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(encoded, input);
-    return encoded;
-}
-
 fn parseRequestHeaderValue(headers: []const u8, header_name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     _ = lines.next();
@@ -1086,28 +1079,47 @@ fn enqueueHostTransportSend(webview_id: u32, socket_handle: std.posix.socket_t, 
     return true;
 }
 
-fn encryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
+// Binary transport packet: iv(12) | ciphertext | tag(16). The tag trails the
+// ciphertext because that's SubtleCrypto's native ciphertext||tag layout —
+// the webview side just prepends/strips the iv, no re-packing. Compared to
+// the legacy base64+JSON envelope this saves ~33% wire size and the
+// per-message base64/JSON CPU on both ends (the dominant per-byte cost on a
+// Pi; AES-GCM itself is nearly free on ARMv8 crypto extensions).
+fn encryptHostTransportPacketBinary(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
+    const iv_len = Aes256Gcm.nonce_length;
+    const tag_len = Aes256Gcm.tag_length;
+
+    const packet = try allocator.alloc(u8, iv_len + message_json.len + tag_len);
+    errdefer allocator.free(packet);
+
     var nonce: [Aes256Gcm.nonce_length]u8 = undefined;
     coreIo().random(&nonce);
-
-    const ciphertext = try allocator.alloc(u8, message_json.len);
-    defer allocator.free(ciphertext);
+    @memcpy(packet[0..iv_len], &nonce);
 
     var tag: [Aes256Gcm.tag_length]u8 = undefined;
-    Aes256Gcm.encrypt(ciphertext, &tag, message_json, "", nonce, secret_key);
+    Aes256Gcm.encrypt(packet[iv_len .. iv_len + message_json.len], &tag, message_json, "", nonce, secret_key);
+    @memcpy(packet[iv_len + message_json.len ..], &tag);
 
-    const encrypted_data_b64 = try encodeBase64Alloc(ciphertext);
-    defer allocator.free(encrypted_data_b64);
-    const nonce_b64 = try encodeBase64Alloc(&nonce);
-    defer allocator.free(nonce_b64);
-    const tag_b64 = try encodeBase64Alloc(&tag);
-    defer allocator.free(tag_b64);
+    return packet;
+}
 
-    return try std.json.Stringify.valueAlloc(allocator, .{
-        .encryptedData = encrypted_data_b64,
-        .iv = nonce_b64,
-        .tag = tag_b64,
-    }, .{});
+// Decrypts a binary packet (layout above) into a null-terminated buffer
+// ready for enqueueOwnedHostMessage — no intermediate copies.
+fn decryptHostTransportPacketBinary(packet: []const u8, secret_key: WebviewSecretKey) ![:0]u8 {
+    const iv_len = Aes256Gcm.nonce_length;
+    const tag_len = Aes256Gcm.tag_length;
+    if (packet.len < iv_len + tag_len) return error.InvalidTransportPacket;
+
+    var nonce: [Aes256Gcm.nonce_length]u8 = undefined;
+    @memcpy(&nonce, packet[0..iv_len]);
+    var tag: [Aes256Gcm.tag_length]u8 = undefined;
+    @memcpy(&tag, packet[packet.len - tag_len ..]);
+    const ciphertext = packet[iv_len .. packet.len - tag_len];
+
+    const plaintext = try allocator.allocSentinel(u8, ciphertext.len, 0);
+    errdefer allocator.free(plaintext);
+    try Aes256Gcm.decrypt(plaintext, ciphertext, tag, "", nonce, secret_key);
+    return plaintext;
 }
 
 fn decryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
@@ -1149,6 +1161,15 @@ fn decryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecre
     return plaintext;
 }
 
+fn finishHostTransportDispatch(webview_id: u32, context: WebviewTransportContext, owned_plaintext: [:0]u8) void {
+    if (!context.transport_ready) {
+        if (context.socket_handle) |socket_handle| {
+            markWebviewTransportReady(webview_id, socket_handle);
+        }
+    }
+    enqueueOwnedHostMessage(webview_id, owned_plaintext);
+}
+
 fn isPlaintextHostTransportPacket(message_json: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, message_json, .{}) catch return false;
     defer parsed.deinit();
@@ -1163,16 +1184,24 @@ fn isPlaintextHostTransportPacket(message_json: []const u8) bool {
 }
 
 fn enqueueHostTransportPlaintext(webview_id: u32, context: WebviewTransportContext, plaintext: []const u8) void {
-    if (!context.transport_ready) {
-        if (context.socket_handle) |socket_handle| {
-            markWebviewTransportReady(webview_id, socket_handle);
-        }
-    }
-
     const message_z = allocator.dupeZ(u8, plaintext) catch return;
-    enqueueOwnedHostMessage(webview_id, message_z);
+    finishHostTransportDispatch(webview_id, context, message_z);
 }
 
+fn dispatchHostTransportMessageBinary(webview_id: u32, packet: []const u8) void {
+    incrementHostTransportDebug("frames_dispatched");
+    const context = lookupWebviewTransportContext(webview_id) orelse return;
+
+    const plaintext = decryptHostTransportPacketBinary(packet, context.secret_key) catch {
+        incrementHostTransportDebug("decrypt_errors");
+        return;
+    };
+    incrementHostTransportDebug("decrypt_ok");
+    finishHostTransportDispatch(webview_id, context, plaintext);
+}
+
+// Legacy base64+JSON envelope (text WS frames, opcode 0x1). Plaintext mode
+// also uses text frames, guarded by an RPC-packet shape check.
 fn dispatchHostTransportMessage(webview_id: u32, encrypted_packet: []const u8) void {
     incrementHostTransportDebug("frames_dispatched");
     const context = lookupWebviewTransportContext(webview_id) orelse return;
@@ -1250,6 +1279,7 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
 
         switch (frame.opcode) {
             0x1 => dispatchHostTransportMessage(webview_id, frame.payload),
+            0x2 => dispatchHostTransportMessageBinary(webview_id, frame.payload),
             0x8 => {
                 writeWebSocketFrameSerialized(stream, 0x8, "") catch {};
                 break;
@@ -1503,10 +1533,26 @@ fn lookupNativeSymbol(comptime T: type, comptime name: [:0]const u8) ?T {
         return null;
     }
 
-    return native_wrapper_state.lib.lookup(T, name) orelse {
+    // Per-(T, name) cache: each comptime instantiation gets its own static
+    // slot, so repeat calls skip the dlsym hash lookup — this sits on
+    // per-message paths (evaluateJavaScriptWithNoCompletion, loadURL, ...).
+    // The wrapper library is dlopen'ed once and never unloaded, so cached
+    // pointers stay valid for the process lifetime. A concurrent first call
+    // may resolve twice; both writes store the same pointer, so the race is
+    // benign. Failed lookups aren't cached (each call reports the error).
+    const Cache = struct {
+        var symbol: ?T = null;
+    };
+    if (Cache.symbol) |cached| {
+        return cached;
+    }
+
+    const resolved = native_wrapper_state.lib.lookup(T, name) orelse {
         setLastError("Native wrapper is missing {s}", .{name});
         return null;
     };
+    Cache.symbol = resolved;
+    return resolved;
 }
 
 fn createNativeTrayForState(tray_id: u32, state: *TrayState) bool {
@@ -3258,12 +3304,12 @@ export fn sendHostMessageToWebviewViaTransport(webview_id: u32, message_json: [*
         return enqueueHostTransportSend(webview_id, socket_handle, 0x1, plaintext_packet);
     }
 
-    const encrypted_packet = encryptHostTransportPacket(std.mem.span(message_json), context.secret_key) catch |err| {
+    const encrypted_packet = encryptHostTransportPacketBinary(std.mem.span(message_json), context.secret_key) catch |err| {
         setLastError("Failed to encrypt host transport packet: {s}", .{@errorName(err)});
         return false;
     };
 
-    return enqueueHostTransportSend(webview_id, socket_handle, 0x1, encrypted_packet);
+    return enqueueHostTransportSend(webview_id, socket_handle, 0x2, encrypted_packet);
 }
 
 export fn sendInternalMessageToWebview(webview_id: u32, message_json: [*:0]const u8) bool {

@@ -87,6 +87,41 @@ export async function initEncryption(): Promise<void> {
 		return decoder.decode(decryptedBuffer);
 	};
 
+	// Binary packet variants used by the host WebSocket transport.
+	// Layout: iv(12) | ciphertext | tag(16) — the tail is exactly
+	// SubtleCrypto's native ciphertext||tag output, so encrypt just prepends
+	// the iv and decrypt just strips it. No base64, no JSON envelope.
+	const encryptBinary = async (plaintext: string): Promise<ArrayBuffer> => {
+		const encoded = new TextEncoder().encode(plaintext);
+		const iv = window.crypto.getRandomValues(new Uint8Array(12));
+		const encrypted = await window.crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv },
+			secretKey,
+			encoded,
+		);
+		const packet = new Uint8Array(12 + encrypted.byteLength);
+		packet.set(iv);
+		packet.set(new Uint8Array(encrypted), 12);
+		return packet.buffer;
+	};
+
+	const decryptBinary = async (packet: ArrayBuffer): Promise<string> => {
+		const bytes = new Uint8Array(packet);
+		if (bytes.length < 12 + 16) {
+			throw new Error("Transport packet too short");
+		}
+		const iv = bytes.subarray(0, 12);
+		const ciphertextAndTag = bytes.subarray(12);
+		const decrypted = await window.crypto.subtle.decrypt(
+			{ name: "AES-GCM", iv: iv as unknown as ArrayBuffer },
+			secretKey,
+			ciphertextAndTag as unknown as ArrayBuffer,
+		);
+		return new TextDecoder().decode(decrypted);
+	};
+
 	window.__electrobun_encrypt = encryptString;
 	window.__electrobun_decrypt = decryptString;
+	window.__electrobun_encrypt_binary = encryptBinary;
+	window.__electrobun_decrypt_binary = decryptBinary;
 }

@@ -33,6 +33,10 @@ declare global {
 			iv: string,
 			tag: string,
 		) => Promise<string>;
+		// Binary packet variants (iv(12) | ciphertext | tag(16)) used by the
+		// host WebSocket transport. Optional: older preloads don't set them.
+		__electrobun_encrypt_binary?: (plaintext: string) => Promise<ArrayBuffer>;
+		__electrobun_decrypt_binary?: (packet: ArrayBuffer) => Promise<string>;
 		__electrobunSendToHost: (message: unknown) => void;
 		__electrobunPendingHostMessages?: unknown[];
 		// titleBarStyle from BrowserWindow options. The page reads it only for

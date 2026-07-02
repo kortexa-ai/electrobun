@@ -363,7 +363,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 
 	queueHostMessageToWebview(message: unknown): Promise<void> {
 		return new Promise((markSent) => {
-			if (!this.ptr || this.isRemoved) {
+			if (this.isRemoved) {
 				markSent();
 				return;
 			}

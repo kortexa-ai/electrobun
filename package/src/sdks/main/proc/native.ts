@@ -1833,6 +1833,10 @@ const _ffiImpl = {
 				throw getCoreLastError() || "Failed to create webview";
 			}
 
+			if (hostWebviewId) {
+				webviewsWithHost.add(webviewId);
+			}
+
 			return webviewId;
 		},
 		getWebviewPointer: (params: { id: number }): Pointer | null => {
@@ -1881,6 +1885,7 @@ const _ffiImpl = {
 			core_.symbols.webviewReload(params.id);
 		},
 		webviewRemove: (params: { id: number }) => {
+			webviewsWithHost.delete(params.id);
 			core_.symbols.webviewRemove(params.id);
 		},
 		setWebviewHTMLContent: (params: { id: number; html: string }) => {
@@ -3087,33 +3092,42 @@ const webviewDecideNavigation = new JSCallback(
 	},
 );
 
+// Webview ids created with a hostWebviewId (webview-tag OOPIFs). Only these
+// need the dispatchHostWebviewEvent FFI forward on every event — for
+// top-level webviews (the common case) the zig side would just look up a
+// null host and return, so skip the FFI call, both toCString copies, and
+// the registry lock entirely.
+const webviewsWithHost = new Set<number>();
+
+const webviewEventMap: Record<string, string> = {
+	"will-navigate": "willNavigate",
+	"did-navigate": "didNavigate",
+	"did-navigate-in-page": "didNavigateInPage",
+	"did-commit-navigation": "didCommitNavigation",
+	"dom-ready": "domReady",
+	"new-window-open": "newWindowOpen",
+	"host-message": "hostMessage",
+	"download-started": "downloadStarted",
+	"download-progress": "downloadProgress",
+	"download-completed": "downloadCompleted",
+	"download-failed": "downloadFailed",
+	"load-started": "loadStarted",
+	"load-committed": "loadCommitted",
+	"load-finished": "loadFinished",
+};
+
 const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 	BrowserView.ensureWrapped(id);
 
-	core_.symbols.dispatchHostWebviewEvent(
-		id,
-		toCString(eventName),
-		toCString(detail),
-	);
+	if (webviewsWithHost.has(id)) {
+		core_.symbols.dispatchHostWebviewEvent(
+			id,
+			toCString(eventName),
+			toCString(detail),
+		);
+	}
 
-	const eventMap: Record<string, string> = {
-		"will-navigate": "willNavigate",
-		"did-navigate": "didNavigate",
-		"did-navigate-in-page": "didNavigateInPage",
-		"did-commit-navigation": "didCommitNavigation",
-		"dom-ready": "domReady",
-		"new-window-open": "newWindowOpen",
-		"host-message": "hostMessage",
-		"download-started": "downloadStarted",
-		"download-progress": "downloadProgress",
-		"download-completed": "downloadCompleted",
-		"download-failed": "downloadFailed",
-		"load-started": "loadStarted",
-		"load-committed": "loadCommitted",
-		"load-finished": "loadFinished",
-	};
-
-	const mappedName = eventMap[eventName];
+	const mappedName = webviewEventMap[eventName];
 	const handler = mappedName
 		? (electrobunEventEmitter.events.webview as Record<string, unknown>)[
 				mappedName
@@ -3384,12 +3398,18 @@ export function toCString(
 	jsString: string,
 	addNullTerminator: boolean = true,
 ): CString {
-	let appendWith = "";
-
 	if (addNullTerminator && !jsString.endsWith("\0")) {
-		appendWith = "\0";
+		// Single-copy encode: write the utf8 bytes into a buffer sized with
+		// room for the terminator, instead of building `jsString + "\0"`
+		// (a full JS string copy) and then encoding that. This is on the
+		// per-message FFI path.
+		const buff = Buffer.allocUnsafe(Buffer.byteLength(jsString, "utf8") + 1);
+		const written = buff.write(jsString, 0, "utf8");
+		buff[written] = 0;
+		// @ts-ignore - This is valid in Bun
+		return ptr(buff);
 	}
-	const buff = Buffer.from(jsString + appendWith, "utf8");
+	const buff = Buffer.from(jsString, "utf8");
 
 	// @ts-ignore - This is valid in Bun
 	return ptr(buff);

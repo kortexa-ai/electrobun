@@ -106,9 +106,18 @@ static AsarArchive*    g_asarArchive = nullptr;
 static std::once_flag  g_asarInitFlag;
 static std::mutex      g_asarReadMutex;
 
+// Per-request logging is off unless ELECTROBUN_LOG_VIEWS is set — the
+// handler runs for every asset fetch on page load.
+static bool viewsLogEnabled() {
+    static const bool enabled = g_getenv("ELECTROBUN_LOG_VIEWS") != nullptr;
+    return enabled;
+}
+
 static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
     const char* uri = webkit_uri_scheme_request_get_uri(request);
-    fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
+    if (viewsLogEnabled()) {
+        fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
+    }
     // Strip ?query and #fragment from the URL before resolving against
     // ASAR / disk — a request like `views://main/index.html?t=12345` should
     // serve `main/index.html`. (The GTK handler in nativeWrapper.cpp has the
@@ -122,16 +131,25 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
         fullPath = pathBuf.c_str();
     }
 
-    gchar* cwd = g_get_current_dir();
-    gchar* resourcesDir = g_build_filename(cwd, "..", "Resources", nullptr);
-    gchar* asarPath = g_build_filename(resourcesDir, "app.asar", nullptr);
+    // Resolved once — cwd doesn't change after launch, and this handler runs
+    // per asset fetch.
+    static gchar* resourcesDir = nullptr;
+    static gchar* asarPath = nullptr;
+    static std::once_flag pathsInitFlag;
+    std::call_once(pathsInitFlag, []() {
+        gchar* cwd = g_get_current_dir();
+        resourcesDir = g_build_filename(cwd, "..", "Resources", nullptr);
+        asarPath = g_build_filename(resourcesDir, "app.asar", nullptr);
+        g_free(cwd);
+    });
 
     gchar* fileContents = nullptr;
     gsize  fileSize = 0;
     bool   foundFile = false;
 
     if (g_file_test(asarPath, G_FILE_TEST_EXISTS)) {
-        std::call_once(g_asarInitFlag, [asarPath]() {
+        std::call_once(g_asarInitFlag, []() {
+            // asarPath has static storage now — referenced directly, not captured.
             g_asarArchive = asar_open(asarPath);
             if (!g_asarArchive) {
                 fprintf(stderr, "[wpe] failed to open ASAR at %s\n", asarPath);
@@ -172,20 +190,19 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
 
     if (foundFile && fileContents) {
         std::string mime = electrobun::getMimeTypeFromUrl(fullPath);
-        fprintf(stderr, "[wpe views://] serving %s (%zu bytes, %s)\n", fullPath, (size_t)fileSize, mime.c_str()); fflush(stderr);
+        if (viewsLogEnabled()) {
+            fprintf(stderr, "[wpe views://] serving %s (%zu bytes, %s)\n", fullPath, (size_t)fileSize, mime.c_str()); fflush(stderr);
+        }
         GInputStream* stream = g_memory_input_stream_new_from_data(fileContents, fileSize, g_free);
         webkit_uri_scheme_request_finish(request, stream, fileSize, mime.c_str());
         g_object_unref(stream);
     } else {
+        // 404s always log — they're a real signal, not per-request noise.
         fprintf(stderr, "[wpe views://] 404 for %s\n", fullPath); fflush(stderr);
         GError* err = g_error_new(G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "File not found: %s", fullPath);
         webkit_uri_scheme_request_finish_error(request, err);
         g_error_free(err);
     }
-
-    g_free(cwd);
-    g_free(resourcesDir);
-    g_free(asarPath);
 }
 
 // ---------------------------------------------------------------------------
