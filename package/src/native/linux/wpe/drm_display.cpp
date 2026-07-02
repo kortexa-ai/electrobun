@@ -23,9 +23,11 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace electrobun {
 namespace wpe {
@@ -87,16 +89,55 @@ struct DrmDisplay::Impl {
         fprintf(stderr, "[DrmDisplay] %s\n", msg.c_str());
     }
 
-    bool openDevice() {
-        fd = open(cfg.cardPath.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
-            setError(std::string("open(") + cfg.cardPath + ") failed: " + strerror(errno));
-            return false;
+    // True if this DRM fd exposes at least one connected connector with modes.
+    static bool hasUsableConnector(int checkFd) {
+        drmModeResPtr res = drmModeGetResources(checkFd);
+        if (!res) return false;
+        bool found = false;
+        for (int i = 0; i < res->count_connectors && !found; i++) {
+            drmModeConnectorPtr c = drmModeGetConnector(checkFd, res->connectors[i]);
+            if (c) {
+                found = (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0);
+                drmModeFreeConnector(c);
+            }
         }
-        // Become DRM master if possible (no-op if we already are).
-        // TODO(phase2): handle logind seat grabbing for a proper systemd launch.
-        drmSetMaster(fd);  // fine to ignore return — best effort.
-        return true;
+        drmModeFreeResources(res);
+        return found;
+    }
+
+    bool openDevice() {
+        // Candidate order: ELECTROBUN_DRM_CARD override, configured path,
+        // then a scan of card0..card3. Pi card0/card1 assignment (v3d render
+        // node vs vc4 KMS) is not stable across models and kernel versions,
+        // so a hardcoded path is fragile.
+        std::vector<std::string> candidates;
+        if (const char* env = getenv("ELECTROBUN_DRM_CARD")) {
+            candidates.push_back(env);
+        }
+        candidates.push_back(cfg.cardPath);
+        for (int i = 0; i < 4; i++) {
+            std::string p = "/dev/dri/card" + std::to_string(i);
+            if (p != cfg.cardPath) candidates.push_back(p);
+        }
+
+        for (const auto& path : candidates) {
+            int candidate = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            if (candidate < 0) continue;
+            if (!hasUsableConnector(candidate)) {
+                close(candidate);
+                continue;
+            }
+            fd = candidate;
+            if (path != cfg.cardPath) {
+                fprintf(stderr, "[DrmDisplay] using %s (auto-detected)\n", path.c_str());
+            }
+            // Become DRM master if possible (no-op if we already are).
+            // TODO(phase2): handle logind seat grabbing for a proper systemd launch.
+            drmSetMaster(fd);  // fine to ignore return — best effort.
+            return true;
+        }
+        setError("no DRM device with a connected connector found (env/config/card0-3)");
+        return false;
     }
 
     bool pickModeAndOutput() {
