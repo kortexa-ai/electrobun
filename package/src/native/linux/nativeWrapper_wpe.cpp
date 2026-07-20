@@ -324,6 +324,20 @@ ELECTROBUN_EXPORT void setNextWebviewTrust(const char* trust) {
     g_nextTrust.store((trust && std::strcmp(trust, "untrusted") == 0) ? 1 : 0);
 }
 
+// Parent BrowserWindow's frame x/y for the next initWebview call. Used by
+// the WPE backend to place non-main primary views (About dialogs, etc.)
+// at the requested panel position — the inner BrowserView's own frame is
+// hardcoded to (0, 0) by BrowserWindow.init for cross-target portability,
+// so this is how we communicate "where on the panel does the BrowserWindow
+// belong" without changing the cross-target API.
+static std::atomic<int32_t> g_nextWindowFrameX{0};
+static std::atomic<int32_t> g_nextWindowFrameY{0};
+
+ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t x, int32_t y) {
+    g_nextWindowFrameX.store(x);
+    g_nextWindowFrameY.store(y);
+}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             void* window,
                                             const char* renderer,
@@ -363,6 +377,8 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
     spec.customPreloadScript     = customPreloadScript     ? customPreloadScript     : "";
     spec.trust                   = (g_nextTrust.exchange(0) == 1) ? "untrusted" : "trusted";
+    spec.windowFrameX            = g_nextWindowFrameX.exchange(0);
+    spec.windowFrameY            = g_nextWindowFrameY.exchange(0);
 
     auto view = currentWebviewBackend().createWebview(spec);
     return view ? view.get() : nullptr;

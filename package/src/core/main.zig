@@ -102,6 +102,8 @@ const WindowState = struct {
     ptr: WindowPtr,
     transparent: bool,
     title_bar_style: TitleBarStyle,
+    frame_x: i32,
+    frame_y: i32,
     close_handler: ?WindowCloseHandler,
     should_close_handler: ?WindowShouldCloseHandler,
     move_handler: ?WindowMoveHandler,
@@ -2582,6 +2584,8 @@ export fn createWindow(
         .ptr = null,
         .transparent = transparent,
         .title_bar_style = parseTitleBarStyle(title_bar_style),
+        .frame_x = @intFromFloat(x),
+        .frame_y = @intFromFloat(y),
         .close_handler = close_handler,
         .should_close_handler = should_close_handler,
         .move_handler = move_handler,
@@ -2904,6 +2908,7 @@ export fn createWebview(
 
     const SetNextWebviewFlagsFn = *const fn (bool, bool) callconv(.c) void;
     const SetNextWebviewTrustFn = *const fn ([*:0]const u8) callconv(.c) void;
+    const SetNextWebviewWindowFrameFn = *const fn (i32, i32) callconv(.c) void;
     const InitWebviewFn = *const fn (
         u32,
         WindowPtr,
@@ -2937,6 +2942,10 @@ export fn createWebview(
     };
     const set_next_webview_flags = lookupNativeSymbol(SetNextWebviewFlagsFn, "setNextWebviewFlags") orelse return 0;
     const set_next_webview_trust = lookupNativeSymbol(SetNextWebviewTrustFn, "setNextWebviewTrust") orelse return 0;
+    const set_next_webview_window_frame = lookupNativeSymbol(
+        SetNextWebviewWindowFrameFn,
+        "setNextWebviewWindowFrame",
+    ) orelse return 0;
     const init_webview = lookupNativeSymbol(InitWebviewFn, "initWebview") orelse return 0;
     const parsed_secret_key = parseWebviewSecretKey(secret_key) orelse return 0;
 
@@ -2996,6 +3005,7 @@ export fn createWebview(
 
     set_next_webview_flags(start_transparent, start_passthrough);
     set_next_webview_trust(trust);
+    set_next_webview_window_frame(window_state.frame_x, window_state.frame_y);
 
     const webview_ptr = init_webview(
         webview_id,

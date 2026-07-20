@@ -7657,6 +7657,11 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
 // every WebKitWebView its own WebProcess, so trust class is a no-op here.
 ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
 
+// Stub for FFI symbol parity with the WPE backend. The OS window manager
+// places GTK windows; primary views are positioned by the window itself,
+// so the parent BrowserWindow's frame x/y is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          void* window,
                          const char* renderer,

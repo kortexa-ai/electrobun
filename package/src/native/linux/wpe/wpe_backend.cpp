@@ -683,6 +683,15 @@ public:
         } else if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
             // Default any unset bounds to fullscreen.
             impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+        } else if (isPrimaryView) {
+            // Non-main BrowserWindow primary view (About dialog, OAuth popup,
+            // etc.). The inner BrowserView's frame.x/y is hardcoded to (0, 0)
+            // by BrowserWindow.init for cross-target portability — apply the
+            // parent BrowserWindow's frame x/y so the dialog renders at the
+            // panel position the app asked for. Only the offset moves; the
+            // size already came through spec.frame.width/height.
+            impl->frame_.x = spec.windowFrameX;
+            impl->frame_.y = spec.windowFrameY;
         }
         impl->visualBounds = impl->frame_;
         // Partition convention for chrome views: the magic string flags this

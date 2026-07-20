@@ -767,6 +767,17 @@ export const native = (() => {
 				],
 				returns: FFIType.void,
 			},
+			// Pre-set parent BrowserWindow frame x/y for the next initWebview call.
+			// Used by WPE to position non-main BrowserWindow primary views (About
+			// dialogs, OAuth popups) at the requested panel coordinates. No-op on
+			// macOS/GTK/CEF/Win where the OS window manager handles placement.
+			setNextWebviewWindowFrame: {
+				args: [
+					FFIType.i32, // x
+					FFIType.i32, // y
+				],
+				returns: FFIType.void,
+			},
 
 			// webviewtag
 			webviewCanGoBack: {

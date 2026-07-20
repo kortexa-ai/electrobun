@@ -78,6 +78,13 @@ struct WebviewSpec {
     // WPE backend; ignored on macOS/GTK/CEF/Win where the per-view default
     // already gives every view its own process.
     std::string trust;
+    // Parent BrowserWindow's frame on the rendering surface. Honored only by
+    // the WPE backend for non-main BrowserWindow primary views (About
+    // dialogs, OAuth popups, etc.) so they render at the requested panel
+    // position. Other backends use the OS window manager for placement and
+    // ignore these fields.
+    int windowFrameX = 0;
+    int windowFrameY = 0;
 };
 
 // Display backend: owns the platform window, the output surface, and the
