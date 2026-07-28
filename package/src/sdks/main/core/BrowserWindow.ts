@@ -368,9 +368,10 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		this.webviewId = webview.id;
 
 		if (usesEmbeddedChrome) {
+			const chromeHTML = embeddedChromeHTML(this.title);
 			const chrome = new BrowserView({
 				url: null,
-				html: embeddedChromeHTML(this.title),
+				html: null,
 				renderer: this.renderer,
 				partition: "__electrobun_chrome__",
 				frame: {
@@ -384,6 +385,11 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				sandbox: true,
 				trust: "trusted",
 			});
+			// WPE chrome views come from an already-initialized view pool, so
+			// load the document now. BrowserView's generic `html` constructor
+			// path waits on a timer, which can expose the pooled about:blank
+			// frame as a permanent black titlebar in the embedded runtime.
+			chrome.loadHTML(chromeHTML);
 			this.chromeWebviewId = chrome.id;
 		}
 	}
