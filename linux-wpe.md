@@ -1145,3 +1145,24 @@ The remaining ~6 seconds are in Electrobun/Bun app startup and are now
 separate from WebKit rendering. `WpeBackend` logs both “first WPE frame” and
 “first frame after loadURL” timings so this regression is visible directly in
 the journal next time, without summoning the strace kraken.
+
+### Remaining Cottontail startup
+
+A network-only trace ruled out `hello-embedded`'s Vite development-server
+probe: the failed localhost request took about 27 ms. Most of the remaining
+delay was Cottontail loading the app's Bun entrypoint.
+
+The tiny main process bundled to more than 9 MB because `electrobun/bun`
+currently re-exports Three.js and Babylon.js, pulling 1,930 modules into the
+bundle even though this app does not use them. Setting `minify: true` in
+`build.cottontail` preserved the same cross-platform source while producing:
+
+- Bun entrypoint: **9,108,349 → 5,676,505 bytes**
+- complete `app.asar`: **10,443,856 → 7,012,004 bytes**
+- entrypoint written → `createWebview`: **4.94 → 4.32 seconds**
+- launcher → first app frame: **7.50 → 6.94 seconds**
+
+Those control runs used an already-running portal service. The next larger
+upstream opportunity is making the main SDK entrypoint tree-shake its optional
+Three.js/Babylon.js exports; minification is a safe proving-ground win, not a
+substitute for that cleanup.
