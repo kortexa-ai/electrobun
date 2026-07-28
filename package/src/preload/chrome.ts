@@ -87,7 +87,7 @@ const CHROME_HTML = `
     ">&#x2715;</button>
   </div>
 </header>
-<button data-electrobun-chrome-restore type="button" aria-label="Restore window" style="
+<button data-electrobun-chrome-restore type="button" aria-label="Reveal window controls" style="
   appearance: none; -webkit-appearance: none;
   position: fixed;
   top: 0; left: 50%;
@@ -109,7 +109,7 @@ const CHROME_HTML = `
      can't modify the body itself (apps may have already laid it out)
      but we can add a marker margin-top via a body padding shim. */
   body { padding-top: 60px !important; box-sizing: border-box; }
-  body[data-electrobun-chrome-hidden] { padding-top: 0 !important; }
+  body[data-electrobun-chrome-maximized] { padding-top: 0 !important; }
   [data-electrobun-chrome="true"] {
     transition: transform 160ms ease-out, opacity 160ms ease-out;
     will-change: transform, opacity;
@@ -119,7 +119,7 @@ const CHROME_HTML = `
     opacity: 0 !important;
     pointer-events: none !important;
   }
-  body[data-electrobun-chrome-hidden] [data-electrobun-chrome-restore] {
+  body[data-electrobun-chrome-concealed] [data-electrobun-chrome-restore] {
     display: block !important;
   }
   [data-electrobun-chrome-fs]:hover,
@@ -162,49 +162,86 @@ function injectChrome() {
     postChromeAction("close");
   });
 
-  // Maximized state persists across navigations via sessionStorage so
-  // the user doesn't have to re-tap [⛶] every time they change pages.
+  // Maximized state persists across navigations via sessionStorage so the
+  // user doesn't have to re-tap [⛶] every time they change pages.
   // Same origin (e.g. views://main) → shared storage automatically.
   // Note: this requires the views:// scheme to be registered as secure
   // in the native backend (see WpeBackend::primeWpeView for WPE) — without
   // that, WebKit silently no-ops DOM storage on custom schemes.
-  const HIDE_KEY = "__electrobun_chrome_hidden";
-  const setHidden = (hidden: boolean) => {
-    if (hidden) {
-      header.setAttribute("data-hidden", "");
-      document.body.setAttribute("data-electrobun-chrome-hidden", "");
-      try { sessionStorage.setItem(HIDE_KEY, "1"); } catch {}
-    } else {
-      header.removeAttribute("data-hidden");
-      document.body.removeAttribute("data-electrobun-chrome-hidden");
-      try { sessionStorage.removeItem(HIDE_KEY); } catch {}
-    }
+  const MAXIMIZED_KEY = "__electrobun_chrome_maximized";
+  let maximized = false;
+
+  const updateMaximizeButton = () => {
+    fsBtn.setAttribute(
+      "aria-label",
+      maximized ? "Restore window" : "Maximize window",
+    );
+    fsBtn.textContent = maximized ? "\u2750" : "\u26F6";
   };
-  // Restore hidden state on injection if it was set on a previous page.
+
+  const concealChrome = () => {
+    header.setAttribute("data-hidden", "");
+    document.body.setAttribute("data-electrobun-chrome-concealed", "");
+  };
+
+  const revealChrome = () => {
+    if (!maximized) return;
+    header.removeAttribute("data-hidden");
+    document.body.removeAttribute("data-electrobun-chrome-concealed");
+  };
+
+  const maximizeWindow = () => {
+    maximized = true;
+    document.body.setAttribute("data-electrobun-chrome-maximized", "");
+    concealChrome();
+    updateMaximizeButton();
+    try { sessionStorage.setItem(MAXIMIZED_KEY, "1"); } catch {}
+    postChromeAction("maximize");
+  };
+
+  const restoreWindow = () => {
+    maximized = false;
+    header.removeAttribute("data-hidden");
+    document.body.removeAttribute("data-electrobun-chrome-concealed");
+    document.body.removeAttribute("data-electrobun-chrome-maximized");
+    updateMaximizeButton();
+    try { sessionStorage.removeItem(MAXIMIZED_KEY); } catch {}
+    postChromeAction("restore");
+  };
+
+  // Restore maximized + concealed state on injection if it was set on a
+  // previous page in this webview.
   try {
-    if (sessionStorage.getItem(HIDE_KEY) === "1") setHidden(true);
+    if (sessionStorage.getItem(MAXIMIZED_KEY) === "1") {
+      maximized = true;
+      document.body.setAttribute("data-electrobun-chrome-maximized", "");
+      concealChrome();
+    }
   } catch {}
+  updateMaximizeButton();
 
   fsBtn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    setHidden(true);
-    postChromeAction("maximize");
+    if (maximized) {
+      restoreWindow();
+    } else {
+      maximizeWindow();
+    }
   });
-  const restoreWindow = () => {
-    setHidden(false);
-    postChromeAction("restore");
-  };
+
   restoreBtn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    restoreWindow();
+    revealChrome();
   });
 
-  // Pull down from the physical top edge to restore. Merely tapping there
-  // is left entirely to the app, so its own buttons keep working. We only
-  // claim the gesture after a clearly vertical drag crosses the threshold.
-  // The visible restore tab is also a larger, tappable fallback.
+  // Pull down from the physical top edge to reveal the titlebar over the
+  // still-maximized content. The titlebar's maximize button then performs
+  // the actual restore. Merely tapping the edge is left entirely to the app,
+  // so its own buttons keep working. We only claim the gesture after a
+  // clearly vertical drag crosses the threshold. The visible tab is also a
+  // larger, tappable reveal fallback.
   const PULL_START_ZONE_PX = 16;
   const PULL_THRESHOLD_PX = 36;
   let pull:
@@ -247,7 +284,7 @@ function injectChrome() {
     suppressClickUntil = Date.now() + 500;
     e.preventDefault();
     e.stopImmediatePropagation();
-    restoreWindow();
+    revealChrome();
   }, { capture: true, passive: false });
 
   const finishPull = () => {
