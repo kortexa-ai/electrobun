@@ -32,6 +32,8 @@ const IS_LINUX_EMBEDDED: boolean = (() => {
 	}
 })();
 
+export const isLinuxEmbedded = IS_LINUX_EMBEDDED;
+
 // Menu data reference system to avoid serialization overhead
 const menuDataRegistry = new Map<string, any>();
 let menuDataCounter = 0;

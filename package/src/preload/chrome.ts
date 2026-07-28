@@ -17,12 +17,15 @@ import "./globals.d.ts";
 const CHROME_CLOSE_URL = "electrobun://chrome/close";
 const CHROME_MAXIMIZE_URL = "electrobun://chrome/maximize";
 const CHROME_RESTORE_URL = "electrobun://chrome/restore";
+const CHROME_REVEAL_URL = "electrobun://chrome/reveal";
 
 type NativeChromeBridge = {
-  postMessage: (action: "close" | "maximize" | "restore") => void;
+  postMessage: (action: ChromeAction) => void;
 };
 
-function postChromeAction(action: "close" | "maximize" | "restore") {
+type ChromeAction = "close" | "maximize" | "restore" | "reveal";
+
+function postChromeAction(action: ChromeAction) {
   const bridge = (
     window as unknown as {
       webkit?: { messageHandlers?: { electrobunChrome?: NativeChromeBridge } };
@@ -40,7 +43,79 @@ function postChromeAction(action: "close" | "maximize" | "restore") {
       ? CHROME_CLOSE_URL
       : action === "maximize"
         ? CHROME_MAXIMIZE_URL
-        : CHROME_RESTORE_URL;
+        : action === "restore"
+          ? CHROME_RESTORE_URL
+          : CHROME_REVEAL_URL;
+}
+
+function initCompositedChromeGesture() {
+  const MAXIMIZED_KEY = "__electrobun_composited_chrome_maximized";
+  let maximized = false;
+  try {
+    maximized = sessionStorage.getItem(MAXIMIZED_KEY) === "1";
+  } catch {}
+
+  window.__electrobunSetChromeMaximized = (value: boolean) => {
+    maximized = value;
+    try {
+      if (value) {
+        sessionStorage.setItem(MAXIMIZED_KEY, "1");
+      } else {
+        sessionStorage.removeItem(MAXIMIZED_KEY);
+      }
+    } catch {}
+  };
+
+  const PULL_START_ZONE_PX = 16;
+  const PULL_THRESHOLD_PX = 36;
+  let pull:
+    | { identifier: number; startX: number; startY: number }
+    | undefined;
+  let suppressClickUntil = 0;
+
+  const findTouch = (touches: TouchList, identifier: number) => {
+    for (let i = 0; i < touches.length; i++) {
+      const touch = touches.item(i);
+      if (touch?.identifier === identifier) return touch;
+    }
+  };
+
+  document.addEventListener("touchstart", (e) => {
+    if (!maximized || e.touches.length !== 1) return;
+    const touch = e.touches.item(0);
+    if (!touch || touch.clientY > PULL_START_ZONE_PX) return;
+    pull = {
+      identifier: touch.identifier,
+      startX: touch.clientX,
+      startY: touch.clientY,
+    };
+  }, { capture: true, passive: true });
+
+  document.addEventListener("touchmove", (e) => {
+    if (!pull || !maximized) return;
+    const touch = findTouch(e.touches, pull.identifier);
+    if (!touch) return;
+    const dx = touch.clientX - pull.startX;
+    const dy = touch.clientY - pull.startY;
+    if (dy < PULL_THRESHOLD_PX || dy <= Math.abs(dx) * 1.2) return;
+
+    pull = undefined;
+    suppressClickUntil = Date.now() + 500;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    postChromeAction("reveal");
+  }, { capture: true, passive: false });
+
+  const finishPull = () => {
+    pull = undefined;
+  };
+  document.addEventListener("touchend", finishPull, { capture: true });
+  document.addEventListener("touchcancel", finishPull, { capture: true });
+  document.addEventListener("click", (e) => {
+    if (Date.now() >= suppressClickUntil) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true });
 }
 
 const CHROME_HTML = `
@@ -303,6 +378,10 @@ function injectChrome() {
 }
 
 export function initChrome() {
+  if (window.__electrobunCompositedChrome) {
+    initCompositedChromeGesture();
+    return;
+  }
   if (!window.__electrobunAutoInjectChrome) return;
 
   if (document.readyState === "loading") {

@@ -44,6 +44,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -144,6 +145,11 @@ static bool chromeActionForURL(const std::string& url,
     if (url == "electrobun://chrome/restore" ||
         url == "electrobun://chrome/restore/") {
         action = WindowChromeAction::Restore;
+        return true;
+    }
+    if (url == "electrobun://chrome/reveal" ||
+        url == "electrobun://chrome/reveal/") {
+        action = WindowChromeAction::Reveal;
         return true;
     }
     return false;
@@ -305,7 +311,13 @@ public:
         }
     }
     void loadHTML(const char* htmlString) override {
-        if (webView_ && htmlString) webkit_web_view_load_html(webView_, htmlString, nullptr);
+        if (!webView_ || !htmlString) return;
+        std::string html = htmlString;
+        dispatchSyncMain([this, html = std::move(html)]() {
+            if (webView_) {
+                webkit_web_view_load_html(webView_, html.c_str(), nullptr);
+            }
+        });
     }
     void goBack()     override { if (webView_) webkit_web_view_go_back(webView_); }
     void goForward()  override { if (webView_) webkit_web_view_go_forward(webView_); }
@@ -582,6 +594,7 @@ public:
         primaryView_ = activeViews_.empty() ? nullptr : activeViews_.back();
         if (recycledHostPrimary && recycledHostWindow) {
             windowRestoreFrames_.erase(recycledHostWindow);
+            windowChromeRestoreFrames_.erase(recycledHostWindow);
             primaryBoundFor_.erase(recycledHostWindow);
         }
 
@@ -629,11 +642,11 @@ public:
         if (!window) return;
         dispatchSyncMain([this, window, maximized]() {
             WpeWebViewImpl* primary = nullptr;
+            WpeWebViewImpl* chrome = nullptr;
             for (auto* view : activeViews_) {
-                if (view && view->hostWindow_ == window && view->isHostPrimary_) {
-                    primary = view;
-                    break;
-                }
+                if (!view || view->hostWindow_ != window) continue;
+                if (view->isHostPrimary_) primary = view;
+                if (view->alwaysTopmost_) chrome = view;
             }
             if (!primary) return;
 
@@ -645,6 +658,21 @@ public:
                 primary->resize(
                     Rect{0, 0, (int)landscapeW_, (int)landscapeH_},
                     "[]");
+                if (chrome) {
+                    windowChromeRestoreFrames_[window] = chrome->frame_;
+                    const int handleW = std::min(76, (int)landscapeW_);
+                    const int handleH = std::min(28, (int)landscapeH_);
+                    chrome->resize(
+                        Rect{((int)landscapeW_ - handleW) / 2,
+                             0, handleW, handleH},
+                        "[]");
+                }
+                for (auto* view : activeViews_) {
+                    if (view && view->hostWindow_ == window) {
+                        view->evaluateJavaScriptWithNoCompletion(
+                            "window.__electrobunSetChromeMaximized?.(true)");
+                    }
+                }
                 fprintf(stderr,
                         "[WpeBackend] maximized host window %p (webviewId=%u)\n",
                         window, primary->webviewId);
@@ -653,6 +681,17 @@ public:
                 if (it == windowRestoreFrames_.end()) return;
                 primary->resize(it->second, "[]");
                 windowRestoreFrames_.erase(it);
+                auto chromeIt = windowChromeRestoreFrames_.find(window);
+                if (chrome && chromeIt != windowChromeRestoreFrames_.end()) {
+                    chrome->resize(chromeIt->second, "[]");
+                }
+                windowChromeRestoreFrames_.erase(window);
+                for (auto* view : activeViews_) {
+                    if (view && view->hostWindow_ == window) {
+                        view->evaluateJavaScriptWithNoCompletion(
+                            "window.__electrobunSetChromeMaximized?.(false)");
+                    }
+                }
                 fprintf(stderr,
                         "[WpeBackend] restored host window %p (webviewId=%u)\n",
                         window, primary->webviewId);
@@ -670,6 +709,34 @@ public:
                 windowRestoreFrames_.find(window) != windowRestoreFrames_.end();
         });
         return maximized;
+    }
+
+    void revealWindowChrome(void* window) override {
+        if (!window) return;
+        dispatchSyncMain([this, window]() {
+            auto restoreIt = windowChromeRestoreFrames_.find(window);
+            if (restoreIt == windowChromeRestoreFrames_.end()) return;
+
+            WpeWebViewImpl* chrome = nullptr;
+            for (auto* view : activeViews_) {
+                if (view && view->hostWindow_ == window &&
+                    view->alwaysTopmost_) {
+                    chrome = view;
+                }
+            }
+            if (!chrome) return;
+
+            const int chromeH = std::max(1, restoreIt->second.height);
+            chrome->resize(
+                Rect{0, 0, (int)landscapeW_, chromeH},
+                "[]");
+            fprintf(stderr,
+                    "[WpeBackend] revealed maximized chrome for host window %p "
+                    "(webviewId=%u)\n",
+                    window, chrome->webviewId);
+            fflush(stderr);
+            scheduleCompose();
+        });
     }
 
     void* createWindow(const WindowSpec& spec) override {
@@ -795,15 +862,11 @@ public:
         impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
         impl->customPreloadScript_     = spec.customPreloadScript;
         impl->frame_                = spec.frame;
-        // Bare-DRM has no window manager. The *first* BrowserWindow's primary
-        // view (the chrome bar + app on a kiosk) is force-fitted to fill the
-        // panel so apps written for cross-target portability don't have to
-        // special-case the kiosk dimensions. Subsequent BrowserWindows (About
-        // dialogs, OAuth popups, etc.) honor their requested frame so visual
-        // dialogs work — without this multi-window apps would overlay every
-        // window fullscreen on top of each other. Explicit BrowserViews
-        // (chrome bars, overlays) attach to a host window with their own
-        // frames — those are honored as-is regardless of host window.
+        // Bare-DRM has no window manager. The first BrowserWindow is fitted to
+        // the physical panel. With framework-owned composited chrome its app
+        // view starts below the titlebar and receives the actual remaining
+        // WebKit viewport; without chrome it fills the panel. Secondary
+        // BrowserWindows honor their requested frame.
         const bool isPrimaryView =
             spec.hostWindow != nullptr &&
             primaryBoundFor_.insert(spec.hostWindow).second;
@@ -814,36 +877,39 @@ public:
         const bool isMainPrimary =
             isPrimaryView && spec.hostWindow == firstHostWindow_;
         if (isMainPrimary) {
-            impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+            if (spec.usesCompositedChrome && impl->frame_.y > 0) {
+                const int contentY =
+                    std::min(std::max(0, impl->frame_.y),
+                             std::max(0, (int)landscapeH_ - 1));
+                impl->frame_ = Rect{
+                    0, contentY, (int)landscapeW_,
+                    std::max(1, (int)landscapeH_ - contentY)};
+            } else {
+                impl->frame_ =
+                    Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+            }
         } else if (impl->frame_.width <= 0 || impl->frame_.height <= 0) {
             // Default any unset bounds to fullscreen.
             impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
         } else if (isPrimaryView) {
-            // Non-main BrowserWindow primary view (About dialog, OAuth popup,
-            // etc.). The inner BrowserView's frame.x/y is hardcoded to (0, 0)
-            // by BrowserWindow.init for cross-target portability — apply the
-            // parent BrowserWindow's frame x/y so the dialog renders at the
-            // panel position the app asked for. Only the offset moves; the
-            // size already came through spec.frame.width/height.
-            impl->frame_.x = spec.windowFrameX;
-            impl->frame_.y = spec.windowFrameY;
+            // BrowserView coordinates are relative to their BrowserWindow;
+            // translate them into the panel compositor's coordinate space.
+            impl->frame_.x += spec.windowFrameX;
+            impl->frame_.y += spec.windowFrameY;
         }
         impl->visualBounds = impl->frame_;
         // Partition convention for chrome views: the magic string flags this
-        // view as alwaysTopmost so it stays above app views regardless of
-        // creation order. Other backends (macOS/GTK/CEF/Win) ignore the
-        // partition value or treat it as a normal cookie partition; on WPE
-        // bare-DRM the multi-view compositor needs an explicit topmost hint
-        // because there's no native window-system z-order.
+        // view as topmost within its host BrowserWindow. Other backends
+        // (macOS/GTK/CEF/Win) treat it as a normal cookie partition.
         impl->alwaysTopmost_ = (spec.partition == "__electrobun_chrome__");
-        // Same portability rule as for the BrowserWindow primary view: the
-        // app's hardcoded chrome width is a desktop-only hint. On bare-DRM
-        // an alwaysTopmost chrome bar should span the panel — keep the app's
-        // requested y/height (so it can sit at the top, bottom, or any band),
-        // but pin x=0 and width=panelW.
         if (impl->alwaysTopmost_) {
-            impl->frame_.x     = 0;
-            impl->frame_.width = (int)landscapeW_;
+            if (spec.hostWindow == firstHostWindow_) {
+                impl->frame_.x = 0;
+                impl->frame_.width = (int)landscapeW_;
+            } else {
+                impl->frame_.x += spec.windowFrameX;
+                impl->frame_.y += spec.windowFrameY;
+            }
             impl->visualBounds = impl->frame_;
         }
 
@@ -861,15 +927,36 @@ public:
         if (!spec.customPreloadScript.empty()) {
             impl->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
         }
-        // Insertion order: app views go before any alwaysTopmost views;
-        // alwaysTopmost views go at the end (back = topmost). Same z-rule
-        // as nativeWrapper.cpp:7828 — last in list = topmost.
+        // Keep each BrowserWindow's views as one z-order group. A newer
+        // BrowserWindow (e.g. About) sits above the complete older group,
+        // while the magic chrome view stays above app views in its own group.
         if (impl->alwaysTopmost_) {
-            activeViews_.push_back(impl);
+            auto insertAt = activeViews_.end();
+            for (auto it = activeViews_.begin(); it != activeViews_.end(); ++it) {
+                if ((*it)->hostWindow_ == impl->hostWindow_) {
+                    insertAt = std::next(it);
+                }
+            }
+            activeViews_.insert(insertAt, impl);
         } else {
-            auto it = activeViews_.begin();
-            while (it != activeViews_.end() && !(*it)->alwaysTopmost_) ++it;
-            activeViews_.insert(it, impl);
+            auto hostChrome = std::find_if(
+                activeViews_.begin(), activeViews_.end(),
+                [impl](WpeWebViewImpl* view) {
+                    return view->hostWindow_ == impl->hostWindow_ &&
+                           view->alwaysTopmost_;
+                });
+            if (hostChrome != activeViews_.end()) {
+                activeViews_.insert(hostChrome, impl);
+            } else {
+                auto insertAt = activeViews_.end();
+                for (auto it = activeViews_.begin();
+                     it != activeViews_.end(); ++it) {
+                    if ((*it)->hostWindow_ == impl->hostWindow_) {
+                        insertAt = std::next(it);
+                    }
+                }
+                activeViews_.insert(insertAt, impl);
+            }
         }
         // primaryView_ tracks the topmost active view for back-compat with
         // commit 1's still-single-source rendering (commit 2 replaces this
@@ -1225,6 +1312,8 @@ private:
             action = WindowChromeAction::Maximize;
         } else if (strcmp(raw, "restore") == 0) {
             action = WindowChromeAction::Restore;
+        } else if (strcmp(raw, "reveal") == 0) {
+            action = WindowChromeAction::Reveal;
         } else {
             recognized = false;
         }
@@ -1702,6 +1791,10 @@ private:
     // to restore. This makes secondary windows expand across the actual panel
     // instead of merely hiding decorations inside their old rectangle.
     std::unordered_map<void*, Rect>             windowRestoreFrames_;
+    // Normal compositor frame of the framework-owned chrome view. While
+    // maximized that view shrinks to the top-center reveal handle; revealing
+    // temporarily expands it across the panel without resizing app content.
+    std::unordered_map<void*, Rect>             windowChromeRestoreFrames_;
     std::atomic<uint64_t>                      framesRendered_{0};
     bool                                       signalsInstalled_ = false;
 

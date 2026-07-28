@@ -50,6 +50,10 @@ declare global {
 		// chrome to fall back on. chrome.ts reads only this boolean and stays
 		// platform-agnostic itself.
 		__electrobunAutoInjectChrome?: boolean;
+		// WPE's default decorations live in a separate compositor view. App
+		// pages use this flag only to install the top-edge reveal gesture.
+		__electrobunCompositedChrome?: boolean;
+		__electrobunSetChromeMaximized?: (maximized: boolean) => void;
 		__electrobun: {
 			receiveMessageFromHost: (msg: unknown) => void;
 			receiveInternalMessageFromHost: (msg: unknown) => void;

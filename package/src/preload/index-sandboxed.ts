@@ -10,6 +10,7 @@
 // - window.__electrobunEventBridge (event emission only)
 
 import "./globals.d.ts";
+import { initChrome } from "./chrome";
 import {
 	initHostMessageBridge,
 	initLifecycleEvents,
@@ -28,3 +29,4 @@ initLifecycleEvents();
 initCmdClickHandling();
 initSPANavigationInterception();
 initOverscrollPrevention();
+initChrome();

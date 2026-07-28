@@ -1,4 +1,4 @@
-import { ffi } from "../proc/native";
+import { ffi, isLinuxEmbedded } from "../proc/native";
 import electrobunEventEmitter from "../events/eventEmitter";
 import { BrowserView } from "./BrowserView";
 import { type Pointer } from "bun:ffi";
@@ -74,6 +74,90 @@ const defaultOptions: WindowOptionsType = {
 	trust: "trusted",
 };
 
+const EMBEDDED_CHROME_HEIGHT = 60;
+
+function embeddedChromeHTML(title: string) {
+	const titleJSON = JSON.stringify(title).replaceAll("<", "\\u003c");
+	const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; margin: 0; overflow: hidden;
+    font-family: sans-serif; color: #fff5e6;
+    -webkit-user-select: none; user-select: none;
+  }
+  #bar {
+    width: 100%; height: 100%; display: flex; align-items: center;
+    justify-content: space-between; padding-left: 16px;
+    background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #title { font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85; }
+  #actions { height: 100%; display: flex; align-items: center; gap: 5px; }
+  button {
+    appearance: none; -webkit-appearance: none; border: 0;
+    width: 68px; height: 60px; padding: 0; border-radius: 10px;
+    background: transparent; color: #fff5e6;
+    font: 26px/1 sans-serif; cursor: pointer; touch-action: manipulation;
+  }
+  button:active { background: rgba(255,255,255,.12); transform: scale(.92); }
+  #close { color: #cc3300; font-weight: 700; }
+  #handle {
+    display: none; width: 100%; height: 100%; border-radius: 0 0 10px 10px;
+    align-items: center; justify-content: center;
+    background: rgba(26,26,26,.88); font: 700 19px/1 sans-serif;
+  }
+  @media (max-height: 40px) {
+    #bar { display: none; }
+    #handle { display: flex; }
+  }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <div id="title"></div>
+    <div id="actions">
+      <button id="maximize" type="button" aria-label="Maximize window">&#x26f6;</button>
+      <button id="close" type="button" aria-label="Close window">&#x2715;</button>
+    </div>
+  </div>
+  <button id="handle" type="button" aria-label="Reveal window controls">&#x25be;</button>
+<script>
+  (() => {
+    const bridge = window.webkit?.messageHandlers?.electrobunChrome;
+    const maximize = document.getElementById("maximize");
+    let maximized = false;
+    const post = (action) => bridge?.postMessage(action);
+    const update = () => {
+      maximize.textContent = maximized ? "\u2750" : "\u26f6";
+      maximize.setAttribute(
+        "aria-label",
+        maximized ? "Restore window" : "Maximize window",
+      );
+    };
+    window.__electrobunSetChromeMaximized = (value) => {
+      maximized = Boolean(value);
+      update();
+    };
+    document.getElementById("title").textContent = ${titleJSON};
+    maximize.addEventListener("click", () => {
+      maximized = !maximized;
+      update();
+      post(maximized ? "maximize" : "restore");
+    });
+    document.getElementById("close").addEventListener("click", () => post("close"));
+    document.getElementById("handle").addEventListener("click", () => post("reveal"));
+    update();
+  })();
+</script>
+</body>
+</html>`;
+	return html;
+}
+
 export const BrowserWindowMap: {
 	[id: number]: BrowserWindow<RPCWithTransport>;
 } = {};
@@ -138,6 +222,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	};
 	// todo (yoav): make this an array of ids or something
 	webviewId!: number;
+	chromeWebviewId?: number;
 
 	get ptr(): Pointer | null {
 		return ffi.request.getWindowPointer({ winId: this.id }) as Pointer | null;
@@ -242,6 +327,9 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		}
 
 		BrowserWindowMap[this.id] = this;
+		const usesEmbeddedChrome =
+			isLinuxEmbedded && this.titleBarStyle === "default";
+		const contentY = usesEmbeddedChrome ? EMBEDDED_CHROME_HEIGHT : 0;
 
 		// todo (yoav): user should be able to override this and pass in their
 		// own webview instance, or instances for attaching to the window.
@@ -253,13 +341,16 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			html: this.html,
 			preload: this.preload,
 			viewsRoot: this.viewsRoot,
+			partition: usesEmbeddedChrome
+				? "__electrobun_content_with_chrome__"
+				: null,
 			// frame: this.frame,
 			renderer: this.renderer,
 			frame: {
 				x: 0,
-				y: 0,
+				y: contentY,
 				width: this.frame.width,
-				height: this.frame.height,
+				height: Math.max(1, this.frame.height - contentY),
 			},
 			rpc,
 			// todo: we need to send the window here and attach it in one go
@@ -275,6 +366,26 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		});
 
 		this.webviewId = webview.id;
+
+		if (usesEmbeddedChrome) {
+			const chrome = new BrowserView({
+				url: null,
+				html: embeddedChromeHTML(this.title),
+				renderer: this.renderer,
+				partition: "__electrobun_chrome__",
+				frame: {
+					x: 0,
+					y: 0,
+					width: this.frame.width,
+					height: EMBEDDED_CHROME_HEIGHT,
+				},
+				windowId: this.id,
+				autoResize: false,
+				sandbox: true,
+				trust: "trusted",
+			});
+			this.chromeWebviewId = chrome.id;
+		}
 	}
 
 	get webview() {

@@ -82,6 +82,10 @@ struct WebviewSpec {
     // WPE backend; ignored on macOS/GTK/CEF/Win where the per-view default
     // already gives every view its own process.
     std::string trust;
+    // True when linux-embedded provides this BrowserWindow's default
+    // decorations as a separate compositor view. The WPE backend uses this
+    // to give the primary app view a real content rectangle below the bar.
+    bool usesCompositedChrome = false;
     // Parent BrowserWindow's frame on the rendering surface. Honored only by
     // the WPE backend for non-main BrowserWindow primary views (About
     // dialogs, OAuth popups, etc.) so they render at the requested panel
@@ -119,6 +123,9 @@ public:
     virtual bool isWindowMaximized(void* window) {
         (void)window;
         return false;
+    }
+    virtual void revealWindowChrome(void* window) {
+        (void)window;
     }
 };
 

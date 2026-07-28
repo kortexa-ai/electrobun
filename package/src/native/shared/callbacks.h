@@ -25,7 +25,7 @@ enum class ChromeStyle : uint32_t { Default, Hidden, HiddenInset };
 // Actions emitted by Electrobun's injected bare-DRM window decorations.
 // These stay native so close/maximize never depend on an asynchronous Bun FFI
 // callback retaining C-string arguments after the WebKit signal returns.
-enum class WindowChromeAction : uint32_t { Close, Maximize, Restore };
+enum class WindowChromeAction : uint32_t { Close, Maximize, Restore, Reveal };
 typedef void (*WindowChromeActionHandler)(void* window, WindowChromeAction action);
 
 // Window event callbacks

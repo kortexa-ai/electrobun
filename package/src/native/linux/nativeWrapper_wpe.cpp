@@ -91,10 +91,18 @@ namespace electrobun { AbstractView* wpeFindViewById(uint32_t webviewId); }
 struct WpeWindowEntry {
     uint32_t            windowId;
     WindowCloseCallback closeCallback;
+    bool                usesCompositedChrome;
 };
 
 static std::mutex                                              g_windowsMutex;
 static std::unordered_map<void*, std::unique_ptr<WpeWindowEntry>> g_windows;
+
+static bool windowUsesCompositedChrome(void* window) {
+    if (!window) return false;
+    std::lock_guard<std::mutex> lock(g_windowsMutex);
+    auto it = g_windows.find(window);
+    return it != g_windows.end() && it->second->usesCompositedChrome;
+}
 
 static void closeWpeWindow(void* window) {
     // Look up the per-window entry by handle. Fire its close callback so the
@@ -123,6 +131,9 @@ static void handleWindowChromeAction(void* window, WindowChromeAction action) {
             break;
         case WindowChromeAction::Restore:
             currentDisplayBackend().setWindowMaximized(window, false);
+            break;
+        case WindowChromeAction::Reveal:
+            currentDisplayBackend().revealWindowChrome(window);
             break;
     }
 }
@@ -193,7 +204,7 @@ ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, d
     (void)x; (void)y;
     (void)moveCallback; (void)resizeCallback;
     (void)focusCallback; (void)blurCallback; (void)keyCallback;
-    (void)titleBarStyle; (void)transparent;
+    (void)transparent;
     // Initialize the DRM scanout on the first call. WpeBackend::createWindow
     // is idempotent — subsequent calls return the same DrmDisplay pointer —
     // so it's safe to invoke per BrowserWindow even though there's only one
@@ -212,6 +223,8 @@ ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, d
     auto entry = std::make_unique<WpeWindowEntry>();
     entry->windowId      = windowId;
     entry->closeCallback = closeCallback;
+    entry->usesCompositedChrome =
+        !titleBarStyle || std::strcmp(titleBarStyle, "default") == 0;
     void* handle = entry.get();
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
@@ -400,6 +413,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
     spec.customPreloadScript     = customPreloadScript     ? customPreloadScript     : "";
     spec.trust                   = (g_nextTrust.exchange(0) == 1) ? "untrusted" : "trusted";
+    spec.usesCompositedChrome    = windowUsesCompositedChrome(window);
     spec.windowFrameX            = g_nextWindowFrameX.exchange(0);
     spec.windowFrameY            = g_nextWindowFrameY.exchange(0);
 

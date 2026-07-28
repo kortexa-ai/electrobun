@@ -1378,6 +1378,7 @@ fn buildElectrobunPreload(
     secret_key: [*:0]const u8,
     sandbox: bool,
     title_bar_style: TitleBarStyle,
+    uses_composited_chrome: bool,
 ) ?[:0]u8 {
     if (!ensureWebviewRuntimeConfigured()) {
         return null;
@@ -1390,11 +1391,18 @@ fn buildElectrobunPreload(
             \\window.__electrobunPlatform = "{s}";
             \\window.__electrobunWebviewId = {d};
             \\window.__electrobunWindowId = {d};
+            \\window.__electrobunCompositedChrome = {};
             \\window.__electrobunEventBridge = window.__electrobunEventBridge || window.webkit?.messageHandlers?.eventBridge || window.eventBridge || window.chrome?.webview?.hostObjects?.eventBridge;
             \\window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
             \\{s}
         ,
-            .{ @tagName(builtin.os.tag), webview_id, window_id, sandboxed_preload_script },
+            .{
+                @tagName(builtin.os.tag),
+                webview_id,
+                window_id,
+                uses_composited_chrome,
+                sandboxed_preload_script,
+            },
         ) catch |err| {
             setLastError("Failed to build sandboxed preload script: {s}", .{@errorName(err)});
             return null;
@@ -1416,6 +1424,7 @@ fn buildElectrobunPreload(
         \\window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
         \\window.__electrobunTitleBarStyle = "{s}";
         \\window.__electrobunAutoInjectChrome = {};
+        \\window.__electrobunCompositedChrome = {};
         \\{s}
     ,
         .{
@@ -1426,7 +1435,10 @@ fn buildElectrobunPreload(
             webview_runtime_state.rpc_port,
             std.mem.span(secret_key),
             titleBarStyleName(title_bar_style),
-            webview_runtime_state.is_linux_embedded and title_bar_style == .default,
+            webview_runtime_state.is_linux_embedded and
+                title_bar_style == .default and
+                !uses_composited_chrome,
+            uses_composited_chrome,
             preload_script,
         },
     ) catch |err| {
@@ -2995,6 +3007,11 @@ export fn createWebview(
         secret_key,
         sandbox,
         window_state.title_bar_style,
+        std.mem.eql(
+            u8,
+            std.mem.span(partition_identifier),
+            "__electrobun_content_with_chrome__",
+        ),
     ) orelse {
         webview_registry_mutex.lockUncancelable(coreIo());
         _ = webview_registry.remove(webview_id);
