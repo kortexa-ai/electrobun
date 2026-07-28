@@ -41,9 +41,15 @@ import {
 } from "../shared/naming";
 import { getTemplate, getTemplateNames } from "./templates/embedded";
 import {
+import {
 	MACOS_DEPLOYMENT_TARGET,
 	macosZigTarget,
 } from "../../scripts/macos-release.js";
+import {
+	assertRuntimeArtifacts,
+	RUNTIME_MANIFEST_FILENAME,
+	type RuntimeManifest,
+} from "../shared/runtime-manifest";
 // import { loadBsdiff, loadBspatch } from 'bsdiff-wasm';
 // MacOS named pipes hang at around 4KB
 // @ts-expect-error - reserved for future use
@@ -890,6 +896,80 @@ async function ensureCoreDependencies(
 		);
 		process.exit(1);
 	}
+}
+
+function verifyRuntimeArtifactsForBuild(
+	targetOS: "macos" | "win" | "linux",
+	targetArch: "arm64" | "x64",
+	linuxWrapper: "default" | "cef" | "wpe",
+	platformPaths: ReturnType<typeof getPlatformPaths>,
+) {
+	const manifestPath = join(
+		ELECTROBUN_DEP_PATH,
+		`dist-${targetOS}-${targetArch}`,
+		RUNTIME_MANIFEST_FILENAME,
+	);
+	const requireManifest = targetOS === "linux" && linuxWrapper === "wpe";
+
+	if (!existsSync(manifestPath)) {
+		if (requireManifest) {
+			throw new Error(
+				`Electrobun runtime manifest is missing: ${manifestPath}\n` +
+					"Refusing to build linux-embedded because its core and WPE wrapper may be from different builds. " +
+					"Rebuild Electrobun, then reinstall the app dependencies.",
+			);
+		}
+		return;
+	}
+
+	let manifest: RuntimeManifest;
+	try {
+		manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RuntimeManifest;
+	} catch (error) {
+		throw new Error(`Invalid Electrobun runtime manifest at ${manifestPath}: ${error}`);
+	}
+
+	const core =
+		targetOS === "macos"
+			? platformPaths.CORE_MACOS
+			: targetOS === "win"
+				? platformPaths.CORE_WIN
+				: platformPaths.CORE_LINUX;
+	const nativeWrapper =
+		targetOS === "macos"
+			? platformPaths.NATIVE_WRAPPER_MACOS
+			: targetOS === "win"
+				? platformPaths.NATIVE_WRAPPER_WIN
+				: linuxWrapper === "wpe"
+					? platformPaths.NATIVE_WRAPPER_LINUX_WPE
+					: linuxWrapper === "cef"
+						? platformPaths.NATIVE_WRAPPER_LINUX_CEF
+						: platformPaths.NATIVE_WRAPPER_LINUX;
+	const nativeWrapperName =
+		targetOS === "linux"
+			? `native-wrapper-${linuxWrapper}`
+			: "native-wrapper-default";
+
+	try {
+		assertRuntimeArtifacts(manifest, {
+			launcher: platformPaths.LAUNCHER_RELEASE,
+			extractor: platformPaths.EXTRACTOR,
+			core,
+			[nativeWrapperName]: nativeWrapper,
+			"main-js": platformPaths.MAIN_JS,
+			"preload-full": platformPaths.PRELOAD_FULL_JS,
+			"preload-sandboxed": platformPaths.PRELOAD_SANDBOXED_JS,
+		});
+	} catch (error) {
+		throw new Error(
+			`${error}\nRuntime manifest: ${manifestPath}\n` +
+				"Rebuild Electrobun, then reinstall the app dependencies before retrying.",
+		);
+	}
+
+	console.log(
+		`✓ Verified Electrobun runtime ${manifest.buildId.slice(0, 12)} (${targetOS}-${targetArch})`,
+	);
 }
 
 /**
@@ -2337,6 +2417,12 @@ ${utiDecls}
 
 		// Get platform-specific paths for the current target
 		const targetPaths = getPlatformPaths(currentTarget.os, currentTarget.arch);
+		verifyRuntimeArtifactsForBuild(
+			currentTarget.os,
+			currentTarget.arch,
+			linuxWrapper,
+			targetPaths,
+		);
 
 		// Helper to run lifecycle hook scripts
 		const runHook = (

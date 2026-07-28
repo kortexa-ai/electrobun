@@ -39,6 +39,7 @@ import { RUST_VERSION } from "./src/shared/rust-version";
 import { GO_VERSION } from "./src/shared/go-version";
 import { ODIN_VERSION } from "./src/shared/odin-version";
 import {
+import {
 	MACOS_DEPLOYMENT_TARGET,
 	macosZigTarget,
 } from "./scripts/macos-release.js";
@@ -47,6 +48,10 @@ import {
 	serializeNativeCompileFlags,
 	type NativeCompilePlatform,
 } from "./src/shared/native-compile-flags";
+import {
+	createRuntimeManifest,
+	RUNTIME_MANIFEST_FILENAME,
+} from "./src/shared/runtime-manifest";
 
 console.log("building...", platform(), arch());
 
@@ -1013,8 +1018,37 @@ async function copyToDist() {
 	}
 
 	normalizeDistExecutableModes("dist");
+	writeRuntimeManifest(coreLibName);
 	// Create platform-specific dist folder and copy all files
 	await createPlatformDistFolder();
+}
+
+function writeRuntimeManifest(coreLibName: string) {
+	const platformName = `${OS}-${ARCH}`;
+	const manifest = createRuntimeManifest(platformName, {
+		launcher: join("dist", `launcher${binExt}`),
+		extractor: join("dist", `extractor${binExt}`),
+		core: join("dist", coreLibName),
+		"native-wrapper-default": join(
+			"dist",
+			OS === "win"
+				? "libNativeWrapper.dll"
+				: OS === "macos"
+					? "libNativeWrapper.dylib"
+					: "libNativeWrapper.so",
+		),
+		"native-wrapper-cef": join("dist", "libNativeWrapper_cef.so"),
+		"native-wrapper-wpe": join("dist", "libNativeWrapper_wpe.so"),
+		"main-js": join("dist", "main.js"),
+		"preload-full": join("dist", "preload-full.js"),
+		"preload-sandboxed": join("dist", "preload-sandboxed.js"),
+	});
+
+	writeFileSync(
+		join("dist", RUNTIME_MANIFEST_FILENAME),
+		`${JSON.stringify(manifest, null, 2)}\n`,
+	);
+	console.log(`✓ Wrote runtime manifest ${manifest.buildId.slice(0, 12)}`);
 }
 
 function normalizeDistExecutableModes(directory: string) {
