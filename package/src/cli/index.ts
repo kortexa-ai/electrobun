@@ -156,6 +156,27 @@ function getPlatformPaths(
 	};
 }
 
+function getCottontailBinaryPath(
+	targetOS: "macos" | "win" | "linux",
+	targetArch: "arm64" | "x64",
+	platformPaths = getPlatformPaths(targetOS, targetArch),
+) {
+	if (existsSync(platformPaths.COTTONTAIL_BINARY)) {
+		return platformPaths.COTTONTAIL_BINARY;
+	}
+
+	const runtimeName = targetOS === "win" ? "cottontail.exe" : "cottontail";
+	if (
+		targetOS === OS &&
+		targetArch === ARCH &&
+		basename(process.execPath).toLowerCase() === runtimeName
+	) {
+		return process.execPath;
+	}
+
+	return platformPaths.COTTONTAIL_BINARY;
+}
+
 // Default PATHS for host platform (backward compatibility)
 // @ts-expect-error - reserved for future use
 const _PATHS = getPlatformPaths(OS, ARCH);
@@ -646,10 +667,15 @@ async function ensureCoreDependencies(
 
 	// Get platform-specific paths
 	const platformPaths = getPlatformPaths(platformOS, platformArch);
+	const cottontailBinary = getCottontailBinaryPath(
+		platformOS,
+		platformArch,
+		platformPaths,
+	);
 
 	// Check platform-specific binaries
 	const requiredBinaries = [
-		platformPaths.COTTONTAIL_BINARY,
+		cottontailBinary,
 		platformPaths.BSDIFF,
 		platformPaths.BSPATCH,
 	];
@@ -807,7 +833,7 @@ async function ensureCoreDependencies(
 
 		// Verify extraction completed successfully - check platform-specific binaries only
 		const requiredBinaries = [
-			platformPaths.COTTONTAIL_BINARY,
+			getCottontailBinaryPath(platformOS, platformArch, platformPaths),
 			platformPaths.BSDIFF,
 			platformPaths.BSPATCH,
 			platformPaths.ZSTD,
@@ -2323,8 +2349,9 @@ ${utiDecls}
 			console.log(`Running ${String(hookName)} script:`, hookScript);
 			// Hooks execute with the host Cottontail runtime.
 			const hostPaths = getPlatformPaths(OS, ARCH);
+			const hostCottontail = getCottontailBinaryPath(OS, ARCH, hostPaths);
 
-			const result = Bun.spawnSync([hostPaths.COTTONTAIL_BINARY, hookScript], {
+			const result = Bun.spawnSync([hostCottontail, hookScript], {
 				stdio: ["ignore", "inherit", "inherit"],
 				cwd: projectRoot,
 				env: {
@@ -2354,7 +2381,7 @@ ${utiDecls}
 				}
 				console.error(
 					"Tried to run with Cottontail at:",
-					hostPaths.COTTONTAIL_BINARY,
+					hostCottontail,
 				);
 				console.error("Script path:", hookScript);
 				console.error("Working directory:", projectRoot);
@@ -2824,7 +2851,11 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 				dereference: true,
 			});
 
-			const cottontailBinarySourcePath = targetPaths.COTTONTAIL_BINARY;
+			const cottontailBinarySourcePath = getCottontailBinaryPath(
+				targetOS,
+				targetARCH,
+				targetPaths,
+			);
 			if (!existsSync(cottontailBinarySourcePath)) {
 				throw new Error(
 					`Cottontail runtime is missing for ${currentTarget.os}-${currentTarget.arch}: ${cottontailBinarySourcePath}`,
