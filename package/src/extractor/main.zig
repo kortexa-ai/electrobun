@@ -1013,7 +1013,46 @@ fn doUninstall(allocator: std.mem.Allocator) !void {
     }
 }
 
+// WPE WebKit's sandbox uses desktop portals. Disable external GUI portal
+// backends for a console-only embedded session to avoid startup timeouts.
+fn installEmbeddedPortalConfig(allocator: std.mem.Allocator) !void {
+    const home = getEnvOwned(allocator, "HOME") catch {
+        std.debug.print("Warning: HOME not set; skipping WPE portal configuration\n", .{});
+        return;
+    };
+    defer allocator.free(home);
 
+    const config_home = getEnvOwned(allocator, "XDG_CONFIG_HOME") catch
+        try std.fs.path.join(allocator, &.{ home, ".config" });
+    defer allocator.free(config_home);
+
+    const portal_dir = try std.fs.path.join(allocator, &.{ config_home, "xdg-desktop-portal" });
+    defer allocator.free(portal_dir);
+    try std.Io.Dir.cwd().createDirPath(g_io, portal_dir);
+
+    const portal_path = try std.fs.path.join(allocator, &.{ portal_dir, "portals.conf" });
+    defer allocator.free(portal_path);
+    const portal_text =
+        \\[preferred]
+        \\default=none
+        \\
+    ;
+    const portal_file = try std.Io.Dir.cwd().createFile(g_io, portal_path, .{ .truncate = true });
+    defer portal_file.close(g_io);
+    try portal_file.writeStreamingAll(g_io, portal_text);
+    std.debug.print("✓ wrote headless portal config: {s}\n", .{portal_path});
+
+    runBestEffort(
+        allocator,
+        &.{ "systemctl", "--user", "restart", "xdg-desktop-portal.service" },
+        "systemctl --user restart xdg-desktop-portal",
+    );
+}
+
+// Phase A: linux-wpe kiosk install.
+//   1. Point `<app_base>/current` at the extracted versioned directory.
+//   2. Configure xdg-desktop-portal for a headless console session.
+//   3. Install and start the templated systemd user service unless --no-kiosk.
 fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
     const app_base_dir = std.fs.path.dirname(app_dir) orelse {
         std.debug.print("Warning: could not derive app base directory from {s}\n", .{app_dir});
@@ -1031,6 +1070,10 @@ fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metad
         return;
     };
 
+    try installEmbeddedPortalConfig(allocator);
+
+    // --no-kiosk keeps the extracted files, current link, and portal config,
+    // but skips systemd integration.
     if (g_skip_kiosk) {
         const launcher_hint = try std.fs.path.join(allocator, &.{ app_base_dir, "current", "bin", "launcher" });
         defer allocator.free(launcher_hint);

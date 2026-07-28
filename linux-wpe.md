@@ -1094,3 +1094,54 @@ Test app at `/home/pi/src/hello-embedded` got these adjustments — kept around 
 - **`closeWindow` callback not wired on WPE.** If a future session adds programmatic window close (`BrowserWindow.close()` instead of `Utils.quit()`), wire the close callback so Bun's `BrowserWindowMap` cleanup runs and `exitOnLastWindowClosed` triggers `Utils.quit()`. Today the only programmatic exit is `Utils.quit()` directly.
 - **`callAsyncJavascript` and `updateCustomPreloadScript` on WpeWebViewImpl** are still TODO stubs — not exercised by the chrome flow but the next webview-tag or context-menu work will hit them.
 - **Chrome theming** is hard-coded charcoal/orange in `chrome.ts`. Apps will eventually want to override colors / hide buttons / customize. Probably opt-in via window options (`chrome: { background, accent, buttons: [...] }`) once a second use case emerges.
+
+## 19. Session results (2026-07-28 — first-frame latency)
+
+### Measured baseline
+
+On moodymoose, `hello-embedded` took about 45 seconds from
+`loadURL("views://mainview/index.html")` to its first exported SHM frame. CPU
+and memory were idle, and installing AT-SPI did not change the result.
+
+`strace -ff -ttt -T` found two sequential 25-second `ppoll()` timeouts in
+`WPEWebProcess`. Debugger stacks identified them as:
+
+1. GLib's `g_power_profile_monitor_dup_default()` creating the portal-backed
+   power-profile monitor.
+2. WebKit's realtime-thread fallback creating
+   `org.freedesktop.portal.Realtime`.
+
+Both calls activate `org.freedesktop.portal.Desktop`. With no portal
+configuration and no graphical session, xdg-desktop-portal selected its GTK
+backend as a last-resort fallback. GTK could not start on the console, so the
+portal frontend never acquired its bus name before WebKit's calls timed out.
+
+### Fix
+
+The linux-embedded extractor now writes:
+
+```ini
+[preferred]
+default=none
+```
+
+to `~/.config/xdg-desktop-portal/portals.conf` and restarts the user portal
+service before starting the kiosk. The setting applies to `--no-kiosk`
+installs too, so a launcher run manually from a TTY gets the same behavior.
+
+`default=none` disables GUI portal backends; it does not disable the portal
+frontend's built-in PowerProfileMonitor and Realtime interfaces. This is the
+correct contract for a bare-DRM console with deliberately no GTK.
+
+### Result
+
+Cold D-Bus activation after the change:
+
+- launcher start → seed WPE frame: **0.64 seconds**
+- app `loadURL` → first app frame: **44 milliseconds**
+- launcher start → first app frame: **6.90 seconds**
+
+The remaining ~6 seconds are in Electrobun/Bun app startup and are now
+separate from WebKit rendering. `WpeBackend` logs both “first WPE frame” and
+“first frame after loadURL” timings so this regression is visible directly in
+the journal next time, without summoning the strace kraken.

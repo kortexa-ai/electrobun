@@ -11,7 +11,8 @@
 // Runtime dependencies:
 //   libwpe-1.0, libwpebackend-fdo-1.0 (SHM path — no EGL),
 //   libwpewebkit-2.0, libwayland-server (for wl_shm_buffer),
-//   libdrm, libgbm, libinput, libudev, glib-2.0.
+//   libdrm, libgbm, libinput, libudev, glib-2.0,
+//   xdg-desktop-portal (headless `default=none`; installed by the extractor).
 
 #include "../abstract_view.h"
 #include "../backend.h"
@@ -217,7 +218,8 @@ public:
         : AbstractView(webviewId_),
           backend_(backend),
           webView_(webView),
-          exportable_(exportable) {}
+          exportable_(exportable),
+          createdAt_(std::chrono::steady_clock::now()) {}
 
     ~WpeWebViewImpl() override {
         if (pendingShm_ && exportable_) {
@@ -240,7 +242,11 @@ public:
 
     void loadURL(const char* urlString) override {
         fprintf(stderr, "[WpeWebViewImpl] loadURL %s (webView=%p)\n", urlString ? urlString : "(null)", (void*)webView_); fflush(stderr);
-        if (webView_ && urlString) webkit_web_view_load_uri(webView_, urlString);
+        if (webView_ && urlString) {
+            loadRequestedAt_ = std::chrono::steady_clock::now();
+            firstFrameAfterLoadPending_ = true;
+            webkit_web_view_load_uri(webView_, urlString);
+        }
     }
     void loadHTML(const char* htmlString) override {
         if (webView_ && htmlString) webkit_web_view_load_html(webView_, htmlString, nullptr);
@@ -473,6 +479,10 @@ private:
     // Per-slot last touch position so TouchUp (no coords) can dispatch at the right spot.
     int32_t                                  lastTouchX_[16] = {0};
     int32_t                                  lastTouchY_[16] = {0};
+    std::chrono::steady_clock::time_point     createdAt_;
+    std::chrono::steady_clock::time_point     loadRequestedAt_;
+    bool                                     firstFrameLogged_ = false;
+    bool                                     firstFrameAfterLoadPending_ = false;
 
 };
 
@@ -1072,6 +1082,25 @@ private:
 
     static void onExportShmStatic(void* userData, struct wpe_fdo_shm_exported_buffer* buffer) {
         auto* impl = static_cast<WpeWebViewImpl*>(userData);
+        const auto now = std::chrono::steady_clock::now();
+        if (impl && !impl->firstFrameLogged_) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - impl->createdAt_);
+            fprintf(stderr,
+                    "[WpeBackend] first WPE frame in %lld ms (view %p, webviewId=%u)\n",
+                    static_cast<long long>(elapsed.count()), (void*)impl, impl->webviewId);
+            fflush(stderr);
+            impl->firstFrameLogged_ = true;
+        }
+        if (impl && impl->firstFrameAfterLoadPending_) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - impl->loadRequestedAt_);
+            fprintf(stderr,
+                    "[WpeBackend] first frame after loadURL in %lld ms (webviewId=%u)\n",
+                    static_cast<long long>(elapsed.count()), impl->webviewId);
+            fflush(stderr);
+            impl->firstFrameAfterLoadPending_ = false;
+        }
         static std::atomic<int> n{0};
         int i = ++n;
         if (i <= 3 || (i % 60) == 0) {

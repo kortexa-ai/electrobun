@@ -80,10 +80,17 @@ inspect image).
 
 ## Prerequisites (verified in Phase 0)
 
-- `apt install cog libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libwpe-1.0-dev libwpebackend-fdo-1.0-dev libinput-dev libudev-dev libdrm-dev libgbm-dev libvulkan-dev`
+- `apt install cog libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libwpe-1.0-dev libwpebackend-fdo-1.0-dev libinput-dev libudev-dev libdrm-dev libgbm-dev libvulkan-dev xdg-desktop-portal`
 - V3DV (Mesa 25.0.7+) with Vulkan 1.3, `VK_KHR_display` extension — confirmed present
 - Rotation: **cannot** rely on DRM CRTC rotation property on V3D vc4;
   do it in software (Phase 2) or in composite shader (Phase 4+)
+
+The embedded installer writes
+`~/.config/xdg-desktop-portal/portals.conf` with `default=none`. This is
+intentional for the bare-console target: xdg-desktop-portal still exposes its
+built-in power-profile and realtime APIs, but does not probe GTK or another GUI
+backend. Without it, WPE WebKit waits twice for 25 seconds before producing its
+first frame on a session with no desktop.
 
 ## How to run (once implementations are filled in)
 
