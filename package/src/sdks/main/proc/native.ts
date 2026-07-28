@@ -3127,8 +3127,43 @@ const webviewEventMap: Record<string, string> = {
 	"load-finished": "loadFinished",
 };
 
+function closeEmbeddedChromeWindow(windowId?: number) {
+	// Inline require to avoid pulling Utils into the module-init cycle
+	// (BrowserWindow → events → Utils path is already touchy).
+	const { quit } = require("../core/Utils");
+	const remainingWindows = Object.keys(BrowserWindowMap).length;
+	if (windowId != null && remainingWindows > 1) {
+		const win = BrowserWindow.getById(windowId);
+		if (win) {
+			win.close();
+			return;
+		}
+	}
+	quit();
+}
+
 const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 	BrowserView.ensureWrapped(id);
+
+	if (IS_LINUX_EMBEDDED && eventName === "will-navigate") {
+		try {
+			const navigation = JSON.parse(detail) as { url?: string };
+			if (
+				navigation.url === "electrobun://chrome/close" ||
+				navigation.url === "electrobun://chrome/close/"
+			) {
+				const webview = BrowserView.getById(id);
+				// Navigation events also exist in sandboxed views. Only the
+				// trusted framework preload is allowed to drive window chrome.
+				if (webview?.trust === "trusted") {
+					closeEmbeddedChromeWindow(webview.windowId);
+				}
+				return { success: true };
+			}
+		} catch {
+			// Let malformed navigation details flow through as a normal event.
+		}
+	}
 
 	if (webviewsWithHost.has(id)) {
 		core_.symbols.dispatchHostWebviewEvent(
@@ -3527,26 +3562,11 @@ export const internalRpcHandlers = {
 		},
 	},
 	message: {
-		// Auto-chrome bar's [✕] button (§18 in linux-wpe.md) routes here so
-		// apps that opt into titleBarStyle: "hidden" get a working close
-		// button without any per-app wiring. Context-aware: closes the
-		// originating window if there are others still open, quits the app
-		// if it's the last one. Without windowId in the payload (older
-		// chrome.ts builds) we always quit, matching the original behavior.
+		// Compatibility route for older auto-chrome preloads. Current WPE
+		// chrome uses its blocked internal navigation URL because that path
+		// remains synchronous under Cottontail.
 		electrobunChromeQuit: (params?: { windowId?: number }) => {
-			// Inline require to avoid pulling Utils into the module-init cycle
-			// (BrowserWindow → events → Utils path is already touchy).
-			const { quit } = require("../core/Utils");
-			const windowId = params?.windowId;
-			const remainingWindows = Object.keys(BrowserWindowMap).length;
-			if (windowId != null && remainingWindows > 1) {
-				const win = BrowserWindow.getById(windowId);
-				if (win) {
-					win.close();
-					return;
-				}
-			}
-			quit();
+			closeEmbeddedChromeWindow(params?.windowId);
 		},
 		webviewTagResize: (params: {
 			id: number;

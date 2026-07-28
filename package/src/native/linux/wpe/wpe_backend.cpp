@@ -405,7 +405,10 @@ public:
             const char* uri = webkit_uri_request_get_uri(request);
 
             std::string url = uri ? uri : "";
-            bool shouldAllow = shouldAllowNavigationToURL(url);
+            const bool isChromeClose =
+                url == "electrobun://chrome/close" ||
+                url == "electrobun://chrome/close/";
+            bool shouldAllow = !isChromeClose && shouldAllowNavigationToURL(url);
 
             // Fire will-navigate event with allowed status.
             if (eventHandler_) {

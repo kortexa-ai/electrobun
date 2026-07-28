@@ -13,7 +13,8 @@
 // AND multi-page apps.
 
 import "./globals.d.ts";
-import { send } from "./internalRpc";
+
+const CHROME_CLOSE_URL = "electrobun://chrome/close";
 
 const CHROME_HTML = `
 <header data-electrobun-chrome="true" style="
@@ -103,14 +104,11 @@ function injectChrome() {
 
   closeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    // Routes through the internal RPC bridge to a built-in handler that
-    // closes this window if it isn't the last one, otherwise quits the app.
-    // Pass our windowId so the handler can pick the right BrowserWindow —
-    // without it, the handler can't tell whether to close-vs-quit when the
-    // app has multiple windows (About dialogs, OAuth popups, etc.).
-    const windowId = (window as unknown as { __electrobunWindowId?: number })
-      .__electrobunWindowId;
-    send("electrobunChromeQuit", windowId != null ? { windowId } : {});
+    // WPE's navigation callback is synchronous and survives runtimes where
+    // async FFI message callbacks are delayed. The backend blocks this
+    // internal URL, then the Bun-side navigation event closes this view's
+    // BrowserWindow (or quits when it is the last one).
+    window.location.href = CHROME_CLOSE_URL;
   });
 
   // Fullscreen state persists across navigations via sessionStorage so
