@@ -70,6 +70,12 @@ class WpeBackend;  // fwd
 static std::atomic<long> g_mainThreadTid{-1};
 
 static inline bool onMainThread() {
+    // The launcher and ElectrobunCore can both run the shared default GLib
+    // context from different threads. A callback already executing inside
+    // that context is safe to run inline regardless of which runner acquired
+    // it; dispatching synchronously from there would wait on ourselves.
+    if (g_main_context_is_owner(g_main_context_default())) return true;
+
     long t = g_mainThreadTid.load(std::memory_order_relaxed);
     return t > 0 && (long)syscall(SYS_gettid) == t;
 }
@@ -1225,6 +1231,11 @@ private:
         g_free(raw);
 
         if (recognized) {
+            fprintf(stderr,
+                    "[WpeBackend] received window chrome action %u "
+                    "(webviewId=%u)\n",
+                    static_cast<unsigned>(action), impl->webviewId);
+            fflush(stderr);
             impl->requestWindowChromeAction(action);
         }
     }
