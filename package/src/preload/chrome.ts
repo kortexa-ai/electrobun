@@ -47,7 +47,7 @@ const CHROME_HTML = `
 <header data-electrobun-chrome="true" style="
   position: fixed;
   top: 0; left: 0; right: 0;
-  height: 44px;
+  height: 60px;
   background: #1a1a1a;
   color: #fff5e6;
   display: flex;
@@ -71,18 +71,18 @@ const CHROME_HTML = `
       appearance: none; -webkit-appearance: none;
       border: none; background: transparent;
       color: #fff5e6;
-      font: inherit; font-size: 22px; line-height: 1;
-      width: 44px; height: 44px;
-      border-radius: 8px;
+      font: inherit; font-size: 26px; line-height: 1;
+      width: 68px; height: 60px;
+      border-radius: 10px;
       cursor: pointer;
     ">&#x26F6;</button>
     <button data-electrobun-chrome-close type="button" aria-label="Close" style="
       appearance: none; -webkit-appearance: none;
       border: none; background: transparent;
       color: #cc3300;
-      font: inherit; font-size: 22px; font-weight: 700; line-height: 1;
-      width: 44px; height: 44px;
-      border-radius: 8px;
+      font: inherit; font-size: 26px; font-weight: 700; line-height: 1;
+      width: 68px; height: 60px;
+      border-radius: 10px;
       cursor: pointer;
     ">&#x2715;</button>
   </div>
@@ -94,24 +94,31 @@ const CHROME_HTML = `
   transform: translateX(-50%);
   z-index: 2147483647;
   display: none;
-  width: 52px; height: 20px;
+  width: 76px; height: 28px;
   padding: 0;
   border: none;
-  border-radius: 0 0 8px 8px;
+  border-radius: 0 0 10px 10px;
   background: rgba(26, 26, 26, 0.82);
   color: #fff5e6;
-  font: 700 16px/20px sans-serif;
+  font: 700 19px/28px sans-serif;
   cursor: pointer;
+  touch-action: none;
 ">&#x25BE;</button>
 <style data-electrobun-chrome-style>
   /* Nudge the document down so the chrome doesn't overlap content. We
      can't modify the body itself (apps may have already laid it out)
      but we can add a marker margin-top via a body padding shim. */
-  body { padding-top: 44px !important; box-sizing: border-box; }
+  body { padding-top: 60px !important; box-sizing: border-box; }
   body[data-electrobun-chrome-hidden] { padding-top: 0 !important; }
-  /* !important needed because the chrome <header> has display:flex in its
-     inline style (which wins over plain external CSS otherwise). */
-  [data-electrobun-chrome="true"][data-hidden] { display: none !important; }
+  [data-electrobun-chrome="true"] {
+    transition: transform 160ms ease-out, opacity 160ms ease-out;
+    will-change: transform, opacity;
+  }
+  [data-electrobun-chrome="true"][data-hidden] {
+    transform: translateY(-100%) !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
   body[data-electrobun-chrome-hidden] [data-electrobun-chrome-restore] {
     display: block !important;
   }
@@ -162,13 +169,11 @@ function injectChrome() {
   // in the native backend (see WpeBackend::primeWpeView for WPE) — without
   // that, WebKit silently no-ops DOM storage on custom schemes.
   const HIDE_KEY = "__electrobun_chrome_hidden";
-  let lastHideAt = 0;
   const setHidden = (hidden: boolean) => {
     if (hidden) {
       header.setAttribute("data-hidden", "");
       document.body.setAttribute("data-electrobun-chrome-hidden", "");
       try { sessionStorage.setItem(HIDE_KEY, "1"); } catch {}
-      lastHideAt = Date.now();
     } else {
       header.removeAttribute("data-hidden");
       document.body.removeAttribute("data-electrobun-chrome-hidden");
@@ -195,21 +200,69 @@ function injectChrome() {
     e.stopPropagation();
     restoreWindow();
   });
-  // Restore chrome only on a deliberate top-edge tap (within the strip of
-  // pixels the chrome bar normally occupies). The original "tap anywhere"
-  // gesture is hostile to touch UX — every interactive element on the page
-  // (including app navigation buttons) would restore chrome before the
-  // app's own onclick fired, which also defeats sessionStorage persistence
-  // because the navigating tap clears the hide flag pre-navigation.
-  // Top-edge restore is discoverable (chrome was visible there) and
-  // disjoint from normal interactions further down the page.
-  const RESTORE_ZONE_PX = 44; // matches CHROME_HTML's header height
-  document.addEventListener("click", (e) => {
-    if (!header.hasAttribute("data-hidden")) return;
-    if (Date.now() - lastHideAt < 250) return;
-    if (typeof e.clientY === "number" && e.clientY > RESTORE_ZONE_PX) return;
+
+  // Pull down from the physical top edge to restore. Merely tapping there
+  // is left entirely to the app, so its own buttons keep working. We only
+  // claim the gesture after a clearly vertical drag crosses the threshold.
+  // The visible restore tab is also a larger, tappable fallback.
+  const PULL_START_ZONE_PX = 16;
+  const PULL_THRESHOLD_PX = 36;
+  let pull:
+    | { identifier: number; startX: number; startY: number }
+    | undefined;
+  let suppressClickUntil = 0;
+
+  const findTouch = (touches: TouchList, identifier: number) => {
+    for (let i = 0; i < touches.length; i++) {
+      const touch = touches.item(i);
+      if (touch?.identifier === identifier) return touch;
+    }
+  };
+
+  document.addEventListener("touchstart", (e) => {
+    if (!header.hasAttribute("data-hidden") || e.touches.length !== 1) return;
+    const touch = e.touches.item(0);
+    if (!touch) return;
+    const target = e.target;
+    const startedOnHandle =
+      target instanceof Node && restoreBtn.contains(target);
+    if (touch.clientY > PULL_START_ZONE_PX && !startedOnHandle) return;
+    pull = {
+      identifier: touch.identifier,
+      startX: touch.clientX,
+      startY: touch.clientY,
+    };
+  }, { capture: true, passive: true });
+
+  document.addEventListener("touchmove", (e) => {
+    if (!pull || !header.hasAttribute("data-hidden")) return;
+    const touch = findTouch(e.touches, pull.identifier);
+    if (!touch) return;
+    const dx = touch.clientX - pull.startX;
+    const dy = touch.clientY - pull.startY;
+
+    if (dy < PULL_THRESHOLD_PX || dy <= Math.abs(dx) * 1.2) return;
+
+    pull = undefined;
+    suppressClickUntil = Date.now() + 500;
+    e.preventDefault();
+    e.stopImmediatePropagation();
     restoreWindow();
-  });
+  }, { capture: true, passive: false });
+
+  const finishPull = () => {
+    pull = undefined;
+  };
+  document.addEventListener("touchend", finishPull, { capture: true });
+  document.addEventListener("touchcancel", finishPull, { capture: true });
+
+  // A browser may synthesize a click after touchend even though the pull was
+  // consumed. Swallow only that short-lived click; ordinary taps are untouched.
+  document.addEventListener("click", (e) => {
+    if (Date.now() >= suppressClickUntil) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true });
 }
 
 export function initChrome() {
