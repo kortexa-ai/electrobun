@@ -937,38 +937,27 @@ async function copyToDist() {
 		cpSync("src/native/build/process_helper.exe", "dist/process_helper.exe", { force: true });
 	} else if (OS === "linux") {
 		// Copy both GTK-only and CEF native wrappers for flexible deployment
-		if (
-			existsSync(
-				join(process.cwd(), "src", "native", "build", "libNativeWrapper.so"),
-			)
-		) {
+		const nativeBuildDir = join(process.cwd(), "src", "native", "build");
+		const gtkWrapper = join(nativeBuildDir, "libNativeWrapper.so");
+		const cefWrapper = join(nativeBuildDir, "libNativeWrapper_cef.so");
+		const wpeWrapper = join(nativeBuildDir, "libNativeWrapper_wpe.so");
+		const hasGtkWrapper = existsSync(gtkWrapper);
+		const hasWpeWrapper = existsSync(wpeWrapper);
+
+		if (hasGtkWrapper) {
 			await $`cp src/native/build/libNativeWrapper.so dist/libNativeWrapper.so`;
 		}
-		if (
-			existsSync(
-				join(
-					process.cwd(),
-					"src",
-					"native",
-					"build",
-					"libNativeWrapper_cef.so",
-				),
-			)
-		) {
+		if (existsSync(cefWrapper)) {
 			await $`cp src/native/build/libNativeWrapper_cef.so dist/libNativeWrapper_cef.so`;
 		}
-		if (
-			existsSync(
-				join(
-					process.cwd(),
-					"src",
-					"native",
-					"build",
-					"libNativeWrapper_wpe.so",
-				),
-			)
-		) {
+		if (hasWpeWrapper) {
 			await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper_wpe.so`;
+
+			// Hutch packages the canonical wrapper name. On an embedded-only
+			// host, make the WPE wrapper available under that name too.
+			if (!hasGtkWrapper) {
+				await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper.so`;
+			}
 		}
 
 		// CEF binaries for Linux - copy to cef/ subdirectory
@@ -2448,6 +2437,14 @@ async function buildNative() {
 			}
 		} else {
 			console.log("Running in CI - skipping package checks");
+		}
+
+		if (!gtkAvailable) {
+			// Do not let artifacts from an earlier desktop build mask the WPE
+			// fallback when this host can only build the embedded backend.
+			const nativeBuildDir = join(process.cwd(), "src", "native", "build");
+			rmSync(join(nativeBuildDir, "libNativeWrapper.so"), { force: true });
+			rmSync(join(nativeBuildDir, "libNativeWrapper_cef.so"), { force: true });
 		}
 
 		try {
