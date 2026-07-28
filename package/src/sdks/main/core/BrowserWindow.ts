@@ -158,6 +158,12 @@ function embeddedChromeHTML(title: string) {
 	return html;
 }
 
+function embeddedChromeURL(title: string) {
+	return `data:text/html;charset=utf-8;base64,${Buffer.from(
+		embeddedChromeHTML(title),
+	).toString("base64")}`;
+}
+
 export const BrowserWindowMap: {
 	[id: number]: BrowserWindow<RPCWithTransport>;
 } = {};
@@ -368,9 +374,11 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		this.webviewId = webview.id;
 
 		if (usesEmbeddedChrome) {
-			const chromeHTML = embeddedChromeHTML(this.title);
 			const chrome = new BrowserView({
-				url: null,
+				// WPE's initial URI path is also how normal application views
+				// are bootstrapped, so use it for the framework-owned chrome
+				// instead of relying on a later loadHTML call.
+				url: embeddedChromeURL(this.title),
 				html: null,
 				renderer: this.renderer,
 				partition: "__electrobun_chrome__",
@@ -385,11 +393,6 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				sandbox: true,
 				trust: "trusted",
 			});
-			// WPE chrome views come from an already-initialized view pool, so
-			// load the document now. BrowserView's generic `html` constructor
-			// path waits on a timer, which can expose the pooled about:blank
-			// frame as a permanent black titlebar in the embedded runtime.
-			chrome.loadHTML(chromeHTML);
 			this.chromeWebviewId = chrome.id;
 		}
 	}
