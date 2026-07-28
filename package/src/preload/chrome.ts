@@ -15,6 +15,33 @@
 import "./globals.d.ts";
 
 const CHROME_CLOSE_URL = "electrobun://chrome/close";
+const CHROME_MAXIMIZE_URL = "electrobun://chrome/maximize";
+const CHROME_RESTORE_URL = "electrobun://chrome/restore";
+
+type NativeChromeBridge = {
+  postMessage: (action: "close" | "maximize" | "restore") => void;
+};
+
+function postChromeAction(action: "close" | "maximize" | "restore") {
+  const bridge = (
+    window as unknown as {
+      webkit?: { messageHandlers?: { electrobunChrome?: NativeChromeBridge } };
+    }
+  ).webkit?.messageHandlers?.electrobunChrome;
+
+  if (bridge) {
+    bridge.postMessage(action);
+    return;
+  }
+
+  // Compatibility fallback for an older WPE runtime paired with this preload.
+  window.location.href =
+    action === "close"
+      ? CHROME_CLOSE_URL
+      : action === "maximize"
+        ? CHROME_MAXIMIZE_URL
+        : CHROME_RESTORE_URL;
+}
 
 const CHROME_HTML = `
 <header data-electrobun-chrome="true" style="
@@ -40,7 +67,7 @@ const CHROME_HTML = `
     opacity: 0.85;
   "></div>
   <div style="display: flex; align-items: center; gap: 0.3em;">
-    <button data-electrobun-chrome-fs type="button" aria-label="Fullscreen" style="
+    <button data-electrobun-chrome-fs type="button" aria-label="Maximize" style="
       appearance: none; -webkit-appearance: none;
       border: none; background: transparent;
       color: #fff5e6;
@@ -60,6 +87,22 @@ const CHROME_HTML = `
     ">&#x2715;</button>
   </div>
 </header>
+<button data-electrobun-chrome-restore type="button" aria-label="Restore window" style="
+  appearance: none; -webkit-appearance: none;
+  position: fixed;
+  top: 0; left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: none;
+  width: 52px; height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 0 0 8px 8px;
+  background: rgba(26, 26, 26, 0.82);
+  color: #fff5e6;
+  font: 700 16px/20px sans-serif;
+  cursor: pointer;
+">&#x25BE;</button>
 <style data-electrobun-chrome-style>
   /* Nudge the document down so the chrome doesn't overlap content. We
      can't modify the body itself (apps may have already laid it out)
@@ -69,6 +112,9 @@ const CHROME_HTML = `
   /* !important needed because the chrome <header> has display:flex in its
      inline style (which wins over plain external CSS otherwise). */
   [data-electrobun-chrome="true"][data-hidden] { display: none !important; }
+  body[data-electrobun-chrome-hidden] [data-electrobun-chrome-restore] {
+    display: block !important;
+  }
   [data-electrobun-chrome-fs]:hover,
   [data-electrobun-chrome-close]:hover {
     background: rgba(255, 255, 255, 0.08) !important;
@@ -91,8 +137,9 @@ function injectChrome() {
   const header = document.querySelector<HTMLElement>('[data-electrobun-chrome="true"]');
   const closeBtn = document.querySelector<HTMLButtonElement>('[data-electrobun-chrome-close]');
   const fsBtn = document.querySelector<HTMLButtonElement>('[data-electrobun-chrome-fs]');
+  const restoreBtn = document.querySelector<HTMLButtonElement>('[data-electrobun-chrome-restore]');
   const titleEl = document.querySelector<HTMLElement>('[data-electrobun-chrome-title]');
-  if (!header || !closeBtn || !fsBtn || !titleEl) return;
+  if (!header || !closeBtn || !fsBtn || !restoreBtn || !titleEl) return;
 
   titleEl.textContent = document.title || "";
   // Keep the title in sync if the app sets document.title later.
@@ -103,15 +150,12 @@ function injectChrome() {
   if (titleNode) titleObserver.observe(titleNode, { childList: true, subtree: true });
 
   closeBtn.addEventListener("click", (e) => {
+    e.preventDefault();
     e.stopPropagation();
-    // WPE's navigation callback is synchronous and survives runtimes where
-    // async FFI message callbacks are delayed. The backend blocks this
-    // internal URL, then the Bun-side navigation event closes this view's
-    // BrowserWindow (or quits when it is the last one).
-    window.location.href = CHROME_CLOSE_URL;
+    postChromeAction("close");
   });
 
-  // Fullscreen state persists across navigations via sessionStorage so
+  // Maximized state persists across navigations via sessionStorage so
   // the user doesn't have to re-tap [⛶] every time they change pages.
   // Same origin (e.g. views://main) → shared storage automatically.
   // Note: this requires the views:// scheme to be registered as secure
@@ -137,8 +181,19 @@ function injectChrome() {
   } catch {}
 
   fsBtn.addEventListener("click", (e) => {
+    e.preventDefault();
     e.stopPropagation();
     setHidden(true);
+    postChromeAction("maximize");
+  });
+  const restoreWindow = () => {
+    setHidden(false);
+    postChromeAction("restore");
+  };
+  restoreBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    restoreWindow();
   });
   // Restore chrome only on a deliberate top-edge tap (within the strip of
   // pixels the chrome bar normally occupies). The original "tap anywhere"
@@ -153,7 +208,7 @@ function injectChrome() {
     if (!header.hasAttribute("data-hidden")) return;
     if (Date.now() - lastHideAt < 250) return;
     if (typeof e.clientY === "number" && e.clientY > RESTORE_ZONE_PX) return;
-    setHidden(false);
+    restoreWindow();
   });
 }
 

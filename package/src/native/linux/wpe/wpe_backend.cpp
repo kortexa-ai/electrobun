@@ -48,6 +48,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -95,6 +96,51 @@ static void dispatchSyncMain(std::function<void()> fn) {
     });
 
     fut.wait();
+}
+
+struct PendingWindowChromeAction {
+    WindowChromeActionHandler handler;
+    void* window;
+    WindowChromeAction action;
+};
+
+static void queueWindowChromeAction(WindowChromeActionHandler handler,
+                                    void* window,
+                                    WindowChromeAction action) {
+    if (!handler || !window) return;
+    auto* pending = new PendingWindowChromeAction{handler, window, action};
+    // Closing recycles the WebKitWebView, so wait until the current WebKit
+    // signal has unwound before touching the owning logical window.
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+        +[](gpointer ud) -> gboolean {
+            auto* p = static_cast<PendingWindowChromeAction*>(ud);
+            p->handler(p->window, p->action);
+            return G_SOURCE_REMOVE;
+        },
+        pending,
+        +[](gpointer ud) {
+            delete static_cast<PendingWindowChromeAction*>(ud);
+        });
+}
+
+static bool chromeActionForURL(const std::string& url,
+                               WindowChromeAction& action) {
+    if (url == "electrobun://chrome/close" ||
+        url == "electrobun://chrome/close/") {
+        action = WindowChromeAction::Close;
+        return true;
+    }
+    if (url == "electrobun://chrome/maximize" ||
+        url == "electrobun://chrome/maximize/") {
+        action = WindowChromeAction::Maximize;
+        return true;
+    }
+    if (url == "electrobun://chrome/restore" ||
+        url == "electrobun://chrome/restore/") {
+        action = WindowChromeAction::Restore;
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +283,10 @@ public:
     }
 
     struct wpe_view_backend_exportable_fdo* exportable() const { return exportable_; }
+
+    void requestWindowChromeAction(WindowChromeAction action) {
+        queueWindowChromeAction(windowChromeActionHandler_, hostWindow_, action);
+    }
 
     // AbstractView
 
@@ -411,10 +461,13 @@ public:
             const char* uri = webkit_uri_request_get_uri(request);
 
             std::string url = uri ? uri : "";
-            const bool isChromeClose =
-                url == "electrobun://chrome/close" ||
-                url == "electrobun://chrome/close/";
-            bool shouldAllow = !isChromeClose && shouldAllowNavigationToURL(url);
+            WindowChromeAction chromeAction = WindowChromeAction::Close;
+            if (chromeActionForURL(url, chromeAction)) {
+                webkit_policy_decision_ignore(decision);
+                requestWindowChromeAction(chromeAction);
+                return TRUE;
+            }
+            bool shouldAllow = shouldAllowNavigationToURL(url);
 
             // Fire will-navigate event with allowed status.
             if (eventHandler_) {
@@ -476,6 +529,9 @@ private:
     WpeBackend*                              backend_    = nullptr;
     WebKitWebView*                           webView_    = nullptr;
     struct wpe_view_backend_exportable_fdo*  exportable_ = nullptr;
+    void*                                    hostWindow_ = nullptr;
+    WindowChromeActionHandler                windowChromeActionHandler_ = nullptr;
+    bool                                     isHostPrimary_ = false;
     // Per-slot last touch position so TouchUp (no coords) can dispatch at the right spot.
     int32_t                                  lastTouchX_[16] = {0};
     int32_t                                  lastTouchY_[16] = {0};
@@ -512,10 +568,16 @@ public:
     // exportable_fdo are kept hot so the next createWebview is cheap.
     void recyclePooledView(WpeWebViewImpl* impl) {
         if (!impl || impl->inFreePool_) return;
+        void* recycledHostWindow = impl->hostWindow_;
+        const bool recycledHostPrimary = impl->isHostPrimary_;
         activeViews_.erase(
             std::remove(activeViews_.begin(), activeViews_.end(), impl),
             activeViews_.end());
         primaryView_ = activeViews_.empty() ? nullptr : activeViews_.back();
+        if (recycledHostPrimary && recycledHostWindow) {
+            windowRestoreFrames_.erase(recycledHostWindow);
+            primaryBoundFor_.erase(recycledHostWindow);
+        }
 
         // Tear down user state.
         impl->navigationCallback_   = nullptr;
@@ -523,6 +585,9 @@ public:
         impl->bunBridgeHandler_     = nullptr;
         impl->internalBridgeHandler_= nullptr;
         impl->eventBridgeHandler_   = nullptr;
+        impl->windowChromeActionHandler_ = nullptr;
+        impl->hostWindow_    = nullptr;
+        impl->isHostPrimary_ = false;
         impl->electrobunPreloadScript_.clear();
         impl->customPreloadScript_.clear();
         impl->isRemoved      = false;
@@ -553,6 +618,53 @@ public:
     }
 
     // IDisplayBackend
+
+    void setWindowMaximized(void* window, bool maximized) override {
+        if (!window) return;
+        dispatchSyncMain([this, window, maximized]() {
+            WpeWebViewImpl* primary = nullptr;
+            for (auto* view : activeViews_) {
+                if (view && view->hostWindow_ == window && view->isHostPrimary_) {
+                    primary = view;
+                    break;
+                }
+            }
+            if (!primary) return;
+
+            if (maximized) {
+                if (windowRestoreFrames_.find(window) != windowRestoreFrames_.end()) {
+                    return;
+                }
+                windowRestoreFrames_[window] = primary->frame_;
+                primary->resize(
+                    Rect{0, 0, (int)landscapeW_, (int)landscapeH_},
+                    "[]");
+                fprintf(stderr,
+                        "[WpeBackend] maximized host window %p (webviewId=%u)\n",
+                        window, primary->webviewId);
+            } else {
+                auto it = windowRestoreFrames_.find(window);
+                if (it == windowRestoreFrames_.end()) return;
+                primary->resize(it->second, "[]");
+                windowRestoreFrames_.erase(it);
+                fprintf(stderr,
+                        "[WpeBackend] restored host window %p (webviewId=%u)\n",
+                        window, primary->webviewId);
+            }
+            fflush(stderr);
+            scheduleCompose();
+        });
+    }
+
+    bool isWindowMaximized(void* window) override {
+        if (!window) return false;
+        bool maximized = false;
+        dispatchSyncMain([this, window, &maximized]() {
+            maximized =
+                windowRestoreFrames_.find(window) != windowRestoreFrames_.end();
+        });
+        return maximized;
+    }
 
     void* createWindow(const WindowSpec& spec) override {
         (void)spec;  // DRM uses the native display mode; no per-window options.
@@ -671,6 +783,9 @@ public:
         impl->bunBridgeHandler_     = (HandlePostMessage)spec.bunBridgeHandler;
         impl->internalBridgeHandler_= (HandlePostMessage)spec.internalBridgeHandler;
         impl->eventBridgeHandler_   = (HandlePostMessage)spec.eventBridgeHandler;
+        impl->windowChromeActionHandler_ =
+            (WindowChromeActionHandler)spec.windowChromeActionHandler;
+        impl->hostWindow_           = spec.hostWindow;
         impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
         impl->customPreloadScript_     = spec.customPreloadScript;
         impl->frame_                = spec.frame;
@@ -686,6 +801,7 @@ public:
         const bool isPrimaryView =
             spec.hostWindow != nullptr &&
             primaryBoundFor_.insert(spec.hostWindow).second;
+        impl->isHostPrimary_ = isPrimaryView;
         if (isPrimaryView && !firstHostWindow_) {
             firstHostWindow_ = spec.hostWindow;
         }
@@ -914,6 +1030,13 @@ private:
         g_signal_connect(manager, "script-message-received::eventBridge",
                          G_CALLBACK(&WpeBackend::onEventBridgeMessageStatic), impl);
         webkit_user_content_manager_register_script_message_handler(manager, "eventBridge", nullptr);
+        // Dedicated native-only path for the injected decoration buttons.
+        // Unlike the general bridges, this never forwards a C string through
+        // Bun's asynchronous FFI callback machinery.
+        g_signal_connect(manager, "script-message-received::electrobunChrome",
+                         G_CALLBACK(&WpeBackend::onWindowChromeMessageStatic), impl);
+        webkit_user_content_manager_register_script_message_handler(
+            manager, "electrobunChrome", nullptr);
 
         // Navigation + load signals — same per-view binding as bridges.
         g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeBackend::onDecidePolicyStatic), impl);
@@ -1076,6 +1199,34 @@ private:
         auto* impl = static_cast<WpeWebViewImpl*>(user_data);
         if (!impl) return;
         forwardBridgeMessage(impl->eventBridgeHandler_, impl->webviewId, value);
+    }
+    static void onWindowChromeMessageStatic(WebKitUserContentManager*,
+                                            JSCValue* value,
+                                            gpointer user_data) {
+        auto* impl = static_cast<WpeWebViewImpl*>(user_data);
+        if (!impl || !value || !JSC_IS_VALUE(value) ||
+            !jsc_value_is_string(value)) {
+            return;
+        }
+
+        gchar* raw = jsc_value_to_string(value);
+        if (!raw) return;
+        WindowChromeAction action = WindowChromeAction::Close;
+        bool recognized = true;
+        if (strcmp(raw, "close") == 0) {
+            action = WindowChromeAction::Close;
+        } else if (strcmp(raw, "maximize") == 0) {
+            action = WindowChromeAction::Maximize;
+        } else if (strcmp(raw, "restore") == 0) {
+            action = WindowChromeAction::Restore;
+        } else {
+            recognized = false;
+        }
+        g_free(raw);
+
+        if (recognized) {
+            impl->requestWindowChromeAction(action);
+        }
     }
 
     // ---- SHM export → DRM blit ----
@@ -1534,11 +1685,12 @@ private:
     // primary-view bind; never reset.
     void*                                      firstHostWindow_   = nullptr;
     // Tracks which hostWindows have already had their primary (BrowserWindow's
-    // implicit) view bound. The first createWebview for a given hostWindow is
-    // forced to full-panel — on bare-DRM the BrowserWindow.frame is fictional
-    // (no compositor, single window = the panel). Explicit BrowserViews keep
-    // their requested frames so chrome bars / overlays still position freely.
+    // implicit) view bound. Entries are removed when that primary is recycled.
     std::unordered_set<void*>                  primaryBoundFor_;
+    // Presence means maximized; value is the primary view's compositor frame
+    // to restore. This makes secondary windows expand across the actual panel
+    // instead of merely hiding decorations inside their old rectangle.
+    std::unordered_map<void*, Rect>             windowRestoreFrames_;
     std::atomic<uint64_t>                      framesRendered_{0};
     bool                                       signalsInstalled_ = false;
 

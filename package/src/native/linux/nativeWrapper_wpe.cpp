@@ -96,6 +96,37 @@ struct WpeWindowEntry {
 static std::mutex                                              g_windowsMutex;
 static std::unordered_map<void*, std::unique_ptr<WpeWindowEntry>> g_windows;
 
+static void closeWpeWindow(void* window) {
+    // Look up the per-window entry by handle. Fire its close callback so the
+    // core runs BrowserWindow cleanup, removes that window's views, and
+    // applies exitOnLastWindowClosed.
+    std::unique_ptr<WpeWindowEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_windows.find(window);
+        if (it == g_windows.end()) return;
+        entry = std::move(it->second);
+        g_windows.erase(it);
+    }
+    if (entry && entry->closeCallback) {
+        entry->closeCallback(entry->windowId);
+    }
+}
+
+static void handleWindowChromeAction(void* window, WindowChromeAction action) {
+    switch (action) {
+        case WindowChromeAction::Close:
+            closeWpeWindow(window);
+            break;
+        case WindowChromeAction::Maximize:
+            currentDisplayBackend().setWindowMaximized(window, true);
+            break;
+        case WindowChromeAction::Restore:
+            currentDisplayBackend().setWindowMaximized(window, false);
+            break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // extern "C" — exported FFI surface
 // ---------------------------------------------------------------------------
@@ -213,30 +244,21 @@ ELECTROBUN_EXPORT void showWindow(void* window, bool activate)         { (void)w
 ELECTROBUN_EXPORT void activateWindow(void* window)                    { (void)window; }
 ELECTROBUN_EXPORT void hideWindow(void* window)                        { (void)window; }
 ELECTROBUN_EXPORT void closeWindow(void* window) {
-    // Look up the per-window entry by handle. Fire its close callback so the
-    // bun side runs its BrowserWindowMap-cleanup + view-removal +
-    // exitOnLastWindowClosed logic (BrowserWindow.ts:77 and ::close listener).
-    // Don't stopEventLoop here — bun's quit() handler reaches us via a
-    // separate FFI symbol when it decides to actually exit.
-    std::unique_ptr<WpeWindowEntry> entry;
-    {
-        std::lock_guard<std::mutex> lock(g_windowsMutex);
-        auto it = g_windows.find(window);
-        if (it == g_windows.end()) return;  // already closed or unknown handle
-        entry = std::move(it->second);
-        g_windows.erase(it);
-    }
-    if (entry && entry->closeCallback) {
-        entry->closeCallback(entry->windowId);
-    }
+    closeWpeWindow(window);
 }
 
 ELECTROBUN_EXPORT void minimizeWindow(void* window)                  { (void)window; }
 ELECTROBUN_EXPORT void restoreWindow(void* window)                   { (void)window; }
 ELECTROBUN_EXPORT bool isWindowMinimized(void* window)               { (void)window; return false; }
-ELECTROBUN_EXPORT void maximizeWindow(void* window)                  { (void)window; }
-ELECTROBUN_EXPORT void unmaximizeWindow(void* window)                { (void)window; }
-ELECTROBUN_EXPORT bool isWindowMaximized(void* window)               { (void)window; return true; }
+ELECTROBUN_EXPORT void maximizeWindow(void* window) {
+    currentDisplayBackend().setWindowMaximized(window, true);
+}
+ELECTROBUN_EXPORT void unmaximizeWindow(void* window) {
+    currentDisplayBackend().setWindowMaximized(window, false);
+}
+ELECTROBUN_EXPORT bool isWindowMaximized(void* window) {
+    return currentDisplayBackend().isWindowMaximized(window);
+}
 ELECTROBUN_EXPORT void setWindowFullScreen(void* window, bool full)  { (void)window; (void)full; }
 ELECTROBUN_EXPORT bool isWindowFullScreen(void* window)              { (void)window; return true; }
 ELECTROBUN_EXPORT void setWindowAlwaysOnTop(void* window, bool top)  { (void)window; (void)top; }
@@ -374,6 +396,7 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     spec.eventBridgeHandler   = (void*)eventBridgeHandler;
     spec.bunBridgeHandler     = (void*)bunBridgeHandler;
     spec.internalBridgeHandler= (void*)internalBridgeHandler;
+    spec.windowChromeActionHandler = (void*)handleWindowChromeAction;
     spec.electrobunPreloadScript = electrobunPreloadScript ? electrobunPreloadScript : "";
     spec.customPreloadScript     = customPreloadScript     ? customPreloadScript     : "";
     spec.trust                   = (g_nextTrust.exchange(0) == 1) ? "untrusted" : "trusted";

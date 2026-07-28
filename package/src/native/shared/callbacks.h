@@ -22,6 +22,12 @@ typedef void (*AsyncJavascriptCompletionHandler)(const char* messageId, uint32_t
 // Window chrome style enum, shared across platforms for titleBarStyle handling
 enum class ChromeStyle : uint32_t { Default, Hidden, HiddenInset };
 
+// Actions emitted by Electrobun's injected bare-DRM window decorations.
+// These stay native so close/maximize never depend on an asynchronous Bun FFI
+// callback retaining C-string arguments after the WebKit signal returns.
+enum class WindowChromeAction : uint32_t { Close, Maximize, Restore };
+typedef void (*WindowChromeActionHandler)(void* window, WindowChromeAction action);
+
 // Window event callbacks
 typedef void (*WindowCloseHandler)(uint32_t windowId);
 typedef void (*WindowShouldCloseHandler)(uint32_t windowId);

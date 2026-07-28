@@ -62,6 +62,10 @@ struct WebviewSpec {
     void* eventBridgeHandler = nullptr;    // HandlePostMessage  (2 args): JSON-bridge for events from JS preload scripts
     void* bunBridgeHandler = nullptr;
     void* internalBridgeHandler = nullptr;
+    // WindowChromeActionHandler (hostWindow + enum). WPE's injected
+    // decorations use a dedicated native WebKit message handler so window
+    // operations do not depend on Bun's asynchronous string callbacks.
+    void* windowChromeActionHandler = nullptr;
     // Compiled JS injected at document-start of every navigation. Sets up
     // window.__electrobun{WebviewId,WindowId,RpcSocketPort,SecretKeyBytes,*Bridge}
     // and runs Electrobun's full preload pipeline (RPC, drag regions, webview
@@ -104,6 +108,18 @@ public:
 
     // Request the main loop to exit. Safe to call from any thread.
     virtual void stopEventLoop() = 0;
+
+    // Bare-DRM logical-window operations. Desktop backends use their native
+    // window manager and keep these defaults; WPE overrides them in its
+    // compositor.
+    virtual void setWindowMaximized(void* window, bool maximized) {
+        (void)window;
+        (void)maximized;
+    }
+    virtual bool isWindowMaximized(void* window) {
+        (void)window;
+        return false;
+    }
 };
 
 // Webview backend: produces HTML pixels into a window created by an
