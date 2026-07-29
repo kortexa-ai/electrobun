@@ -92,11 +92,18 @@ function embeddedChromeHTML(title: string) {
   }
   #bar {
     width: 100%; height: 100%; display: flex; align-items: center;
-    justify-content: space-between; padding-left: 16px;
+    position: relative; padding: 0 157px 0 16px;
     background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.4);
   }
-  #title { font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85; }
-  #actions { height: 100%; display: flex; align-items: center; gap: 5px; }
+  #title {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85;
+  }
+  #actions {
+    position: absolute; top: 0; right: 0; width: 151px; height: 60px;
+    display: flex; align-items: center; justify-content: flex-end; gap: 5px;
+    padding-right: 5px; background: #222;
+  }
   button {
     appearance: none; -webkit-appearance: none; border: 0;
     width: 68px; height: 60px; padding: 0; border-radius: 10px;
