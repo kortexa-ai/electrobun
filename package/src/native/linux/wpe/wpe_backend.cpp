@@ -9,9 +9,9 @@
 // nativeWrapper.cpp's GTK/WebKitGTK/CEF code path and never sees this file.
 //
 // Runtime dependencies:
-//   libwpe-1.0, libwpebackend-fdo-1.0 (SHM path — no EGL),
+//   libwpe-1.0, libwpebackend-fdo-1.0 (EGLImage path; SHM fallback),
 //   libwpewebkit-2.0, libwayland-server (for wl_shm_buffer),
-//   libdrm, libgbm, libinput, libudev, glib-2.0,
+//   libdrm, libgbm, EGL, GLESv2, libinput, libudev, glib-2.0,
 //   xdg-desktop-portal (headless `default=none`; installed by the extractor).
 
 #include "../abstract_view.h"
@@ -21,10 +21,12 @@
 #include "../../shared/mime_types.h"
 
 #include "drm_display.h"
+#include "egl_readback.h"
 #include "input.h"
 
 #include <wpe/wpe.h>
 #include <wpe/fdo.h>
+#include <wpe/fdo-egl.h>
 #include <wpe/unstable/fdo-shm.h>
 #include <wpe/webkit.h>
 #include <wayland-server.h>
@@ -41,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
@@ -280,11 +283,10 @@ public:
           createdAt_(std::chrono::steady_clock::now()) {}
 
     ~WpeWebViewImpl() override {
-        if (pendingShm_ && exportable_) {
-            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-                exportable_, pendingShm_);
+        const bool hadPendingFrame = pendingEgl_ || pendingShm_;
+        releasePendingBuffer();
+        if ((hadPendingFrame || awaitingFrameComplete_) && exportable_) {
             wpe_view_backend_exportable_fdo_dispatch_frame_complete(exportable_);
-            pendingShm_ = nullptr;
         }
         if (webView_)    g_object_unref(webView_);
         if (exportable_) wpe_view_backend_exportable_fdo_destroy(exportable_);
@@ -295,6 +297,25 @@ public:
     }
 
     struct wpe_view_backend_exportable_fdo* exportable() const { return exportable_; }
+
+    void releasePendingBuffer() {
+        if (!exportable_) return;
+        if (pendingEgl_) {
+            wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(
+                exportable_, pendingEgl_);
+            pendingEgl_ = nullptr;
+        }
+        if (pendingShm_) {
+            if (usesEgl_) {
+                wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(
+                    exportable_, pendingShm_);
+            } else {
+                wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
+                    exportable_, pendingShm_);
+            }
+            pendingShm_ = nullptr;
+        }
+    }
 
     void requestWindowChromeAction(WindowChromeAction action) {
         queueWindowChromeAction(windowChromeActionHandler_, hostWindow_, action);
@@ -469,12 +490,13 @@ public:
     bool trusted_     = true;
     Rect frame_ = {};            // bounds within the rotated landscape space
 
-    // Most-recent SHM buffer this view exported. Held (not released) across
-    // composites so static views (chrome) keep contributing pixels even when
-    // they're not producing new frames. onViewExportedShm releases the old
-    // one and stores the new; composeAndPresent reads it; teardown releases
-    // whatever's left. nullptr until the view's first paint.
+    // Most-recent frame this view exported. EGL is the normal GPU path; SHM
+    // is retained as a startup fallback. Held across composites so static
+    // views (chrome) keep contributing pixels even when they are not
+    // producing new frames.
+    struct wpe_fdo_egl_exported_image* pendingEgl_ = nullptr;
     struct wpe_fdo_shm_exported_buffer* pendingShm_ = nullptr;
+    bool usesEgl_ = false;
 
     // True while this view has produced a frame whose frame_complete ack is
     // deferred until the composite that includes it is presented. Ties the
@@ -640,11 +662,9 @@ public:
         if (impl->userContentManager_) {
             webkit_user_content_manager_remove_all_scripts(impl->userContentManager_);
         }
-        if (impl->pendingShm_ && impl->exportable()) {
-            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-                impl->exportable(), impl->pendingShm_);
+        if ((impl->pendingEgl_ || impl->pendingShm_) && impl->exportable()) {
+            impl->releasePendingBuffer();
             wpe_view_backend_exportable_fdo_dispatch_frame_complete(impl->exportable());
-            impl->pendingShm_ = nullptr;
         } else if (impl->awaitingFrameComplete_ && impl->exportable()) {
             // Deferred ack never fired (recycled between export and compose)
             // — release the WebProcess so the pooled view keeps rendering.
@@ -1025,7 +1045,6 @@ private:
     // safe to call from any thread that can dispatch to the main loop).
     void primeWpeView() {
         if (display_) return;  // already primed
-        initWpeOnce();
 
         DrmDisplayConfig cfg{};
         cfg.rotation = Rotation::None;  // rotate in our blit
@@ -1036,7 +1055,7 @@ private:
             display_.reset();
             return;
         }
-        rotationQuarters_ = rotationFromEnvOrDefault();
+        rotationQuarters_ = rotationFromRuntime();
         if (rotationQuarters_ == 1 || rotationQuarters_ == 3) {
             landscapeW_ = display_->logicalHeight();
             landscapeH_ = display_->logicalWidth();
@@ -1047,6 +1066,17 @@ private:
         fprintf(stderr, "[WpeBackend] primeWpeView: wpe %ux%u, drm %ux%u, rot=%d\n",
                 landscapeW_, landscapeH_, display_->logicalWidth(), display_->logicalHeight(),
                 rotationQuarters_); fflush(stderr);
+
+        eglReadback_ = std::make_unique<EglReadback>();
+        if (!eglReadback_->init(
+                landscapeW_, landscapeH_, rotationQuarters_)) {
+            fprintf(stderr,
+                    "[WpeBackend] EGL readback unavailable; falling back to SHM: %s\n",
+                    eglReadback_->lastError().c_str());
+            fflush(stderr);
+            eglReadback_.reset();
+        }
+        initWpeOnce(eglReadback_ ? eglReadback_->display() : nullptr);
 
         // Page-flip completions arrive on the DRM fd. Watching it from the
         // main loop lets composeAndPresent defer instead of blocking in
@@ -1121,10 +1151,6 @@ private:
                                         WebKitWebView* relatedView,
                                         uint32_t initialWidth,
                                         uint32_t initialHeight) {
-        // Static — WPE-FDO holds the pointer, doesn't copy. See §15.
-        static wpe_view_backend_exportable_fdo_client client = {};
-        client.export_shm_buffer = &WpeBackend::onExportShmStatic;
-
         auto pendingImpl = std::make_shared<WpeWebViewImpl>(/*webviewId=*/0, this,
                                                             /*webView=*/nullptr,
                                                             /*exportable=*/nullptr);
@@ -1133,8 +1159,20 @@ private:
         WpeWebViewImpl* impl = pendingImpl.get();
         impl->trusted_ = trusted;
 
-        auto* exportable = wpe_view_backend_exportable_fdo_create(
-            &client, /*user_data=*/impl, initialWidth, initialHeight);
+        struct wpe_view_backend_exportable_fdo* exportable = nullptr;
+        if (eglReadback_) {
+            // Static — WPE-FDO holds the pointer, doesn't copy.
+            static wpe_view_backend_exportable_fdo_egl_client eglClient = {};
+            eglClient.export_fdo_egl_image = &WpeBackend::onExportEglStatic;
+            exportable = wpe_view_backend_exportable_fdo_egl_create(
+                &eglClient, /*user_data=*/impl, initialWidth, initialHeight);
+            impl->usesEgl_ = true;
+        } else {
+            static wpe_view_backend_exportable_fdo_client shmClient = {};
+            shmClient.export_shm_buffer = &WpeBackend::onExportShmStatic;
+            exportable = wpe_view_backend_exportable_fdo_create(
+                &shmClient, /*user_data=*/impl, initialWidth, initialHeight);
+        }
         if (!exportable) {
             fprintf(stderr, "[WpeBackend] createOnePooledView: exportable_fdo_create failed\n");
             return nullptr;
@@ -1206,30 +1244,74 @@ private:
         return impl;
     }
 
-    int rotationFromEnvOrDefault() {
-        // Default CCW90 for the kortexa bar panel (480x1920 portrait native).
-        // Override via ELECTROBUN_ROTATE=0|90|180|270 (CW degrees from native).
+    int rotationFromRuntime() {
+        // An explicit process override wins. This is useful when WPE should
+        // intentionally differ from the console or fbcon is unavailable.
         const char* s = g_getenv("ELECTROBUN_ROTATE");
-        if (!s) return 3;  // CCW90 = 270° CW
-        int q = atoi(s);
-        switch (q) {
-            case 0:   return 0;
-            case 90:  return 1;
-            case 180: return 2;
-            case 270: return 3;
-            default:  return 3;
+        if (s) {
+            char* end = nullptr;
+            const long degrees = std::strtol(s, &end, 10);
+            if (end && *end == '\0') {
+                switch (degrees) {
+                    case 0:   return 0;
+                    case 90:  return 1;
+                    case 180: return 2;
+                    case 270: return 3;
+                }
+            }
+            fprintf(stderr,
+                    "[WpeBackend] ignoring invalid ELECTROBUN_ROTATE=%s\n", s);
+            fflush(stderr);
         }
+
+        // A bare-DRM app replaces the framebuffer console on the same panel,
+        // so inherit the console's configured orientation when available.
+        // Linux defines 0/1/2/3 as 0/90/180/270 degrees respectively.
+        for (const char* path : {
+                 "/sys/class/graphics/fbcon/rotate",
+                 "/sys/class/graphics/fbcon/rotate_all",
+             }) {
+            FILE* file = std::fopen(path, "r");
+            if (!file) continue;
+            int quarters = -1;
+            const bool valid =
+                std::fscanf(file, "%d", &quarters) == 1 &&
+                quarters >= 0 && quarters <= 3;
+            std::fclose(file);
+            if (valid) {
+                fprintf(stderr,
+                        "[WpeBackend] rotation=%d discovered from %s\n",
+                        quarters, path);
+                fflush(stderr);
+                return quarters;
+            }
+        }
+
+        // Generic displays are unrotated unless the system says otherwise.
+        return 0;
     }
 
     // ---- WPE initialization (once per process) ----
-    static void initWpeOnce() {
+    static void initWpeOnce(void* eglDisplay) {
         static std::once_flag once;
-        std::call_once(once, []() {
+        std::call_once(once, [eglDisplay]() {
             fprintf(stderr, "[WpeBackend] wpe_loader_init\n"); fflush(stderr);
             wpe_loader_init("libWPEBackend-fdo-1.0.so");
-            fprintf(stderr, "[WpeBackend] wpe_fdo_initialize_shm\n"); fflush(stderr);
-            if (!wpe_fdo_initialize_shm()) {
-                fprintf(stderr, "[WpeBackend] wpe_fdo_initialize_shm failed\n");
+            if (eglDisplay) {
+                fprintf(stderr,
+                        "[WpeBackend] wpe_fdo_initialize_for_egl_display\n");
+                fflush(stderr);
+                if (!wpe_fdo_initialize_for_egl_display(eglDisplay)) {
+                    fprintf(stderr,
+                            "[WpeBackend] wpe_fdo_initialize_for_egl_display failed\n");
+                }
+            } else {
+                fprintf(stderr, "[WpeBackend] wpe_fdo_initialize_shm\n");
+                fflush(stderr);
+                if (!wpe_fdo_initialize_shm()) {
+                    fprintf(stderr,
+                            "[WpeBackend] wpe_fdo_initialize_shm failed\n");
+                }
             }
             if (!g_getenv("ELECTROBUN_NO_VIEWS_SCHEME")) {
                 fprintf(stderr, "[WpeBackend] webkit_web_context_get_default\n"); fflush(stderr);
@@ -1376,7 +1458,51 @@ private:
         }
     }
 
-    // ---- SHM export → DRM blit ----
+    // ---- EGL/SHM export → DRM presentation ----
+
+    static void onExportEglStatic(
+        void* userData,
+        struct wpe_fdo_egl_exported_image* image) {
+        auto* impl = static_cast<WpeWebViewImpl*>(userData);
+        const auto now = std::chrono::steady_clock::now();
+        const uint32_t imageWidth =
+            image ? wpe_fdo_egl_exported_image_get_width(image) : 0;
+        const uint32_t imageHeight =
+            image ? wpe_fdo_egl_exported_image_get_height(image) : 0;
+        if (impl && !impl->firstFrameLogged_) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - impl->createdAt_);
+            fprintf(stderr,
+                    "[WpeBackend] first WPE frame in %lld ms "
+                    "(view %p, webviewId=%u, egl=%ux%u, frame=%dx%d)\n",
+                    static_cast<long long>(elapsed.count()), (void*)impl,
+                    impl->webviewId, imageWidth, imageHeight,
+                    impl->frame_.width, impl->frame_.height);
+            fflush(stderr);
+            impl->firstFrameLogged_ = true;
+        }
+        if (impl && impl->firstFrameAfterLoadPending_) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - impl->loadRequestedAt_);
+            fprintf(stderr,
+                    "[WpeBackend] first frame after loadURL in %lld ms (webviewId=%u)\n",
+                    static_cast<long long>(elapsed.count()), impl->webviewId);
+            fflush(stderr);
+            impl->firstFrameAfterLoadPending_ = false;
+        }
+        static std::atomic<int> n{0};
+        const int i = ++n;
+        if (i <= 3 || (i % 60) == 0) {
+            fprintf(stderr,
+                    "[WpeBackend] onExportEgl #%d "
+                    "(view %p, webviewId=%u, image=%ux%u)\n",
+                    i, (void*)impl, impl ? impl->webviewId : 0u,
+                    imageWidth, imageHeight);
+            fflush(stderr);
+        }
+        if (!impl || !impl->backend_) return;
+        impl->backend_->onViewExportedEgl(impl, image);
+    }
 
     static void onExportShmStatic(void* userData, struct wpe_fdo_shm_exported_buffer* buffer) {
         auto* impl = static_cast<WpeWebViewImpl*>(userData);
@@ -1418,6 +1544,22 @@ private:
         impl->backend_->onViewExportedShm(impl, buffer);
     }
 
+    void onViewExportedEgl(
+        WpeWebViewImpl* view,
+        struct wpe_fdo_egl_exported_image* image) {
+        if (!view || !view->exportable()) return;
+
+        view->releasePendingBuffer();
+        view->pendingEgl_ = image;
+        if (view->inFreePool_ || !display_) {
+            wpe_view_backend_exportable_fdo_dispatch_frame_complete(
+                view->exportable());
+        } else {
+            view->awaitingFrameComplete_ = true;
+            scheduleCompose();
+        }
+    }
+
     // Per-view SHM frame arrival. The buffer is held on the view (replacing
     // any previous one — old frames are dropped when a newer one arrives
     // before composite). composeAndPresent walks all active views and blits
@@ -1432,10 +1574,7 @@ private:
         if (!view || !view->exportable()) return;
 
         // Release the previous held buffer (if any) back to WPE for reuse.
-        if (view->pendingShm_) {
-            wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(
-                view->exportable(), view->pendingShm_);
-        }
+        view->releasePendingBuffer();
         view->pendingShm_ = buffer;
         // frame_complete tells WPE-FDO it can produce the next frame; every
         // exported frame must eventually get one or the renderer stalls.
@@ -1474,10 +1613,17 @@ private:
     // take the direct-blit fast path. wl_shm_buffer_get_width/height do not
     // require begin_access.
     bool viewCoversComposite(WpeWebViewImpl* v) const {
-        if (!v || !v->pendingShm_) return false;
+        if (!v || (!v->pendingEgl_ && !v->pendingShm_)) return false;
         if (v->frame_.x != 0 || v->frame_.y != 0 ||
             v->frame_.width  < (int)landscapeW_ ||
             v->frame_.height < (int)landscapeH_) return false;
+        if (v->pendingEgl_) {
+            return
+                wpe_fdo_egl_exported_image_get_width(v->pendingEgl_) >=
+                    landscapeW_ &&
+                wpe_fdo_egl_exported_image_get_height(v->pendingEgl_) >=
+                    landscapeH_;
+        }
         struct wl_shm_buffer* shm =
             wpe_fdo_shm_exported_buffer_get_shm_buffer(v->pendingShm_);
         return shm &&
@@ -1506,74 +1652,120 @@ private:
 
         DrmFrame dst = display_->acquire();  // non-blocking (no flip pending)
 
-        const bool singleFullscreen =
-            activeViews_.size() == 1 && viewCoversComposite(activeViews_[0]);
-
-        if (singleFullscreen) {
-            WpeWebViewImpl* view = activeViews_[0];
-            struct wl_shm_buffer* shm =
-                wpe_fdo_shm_exported_buffer_get_shm_buffer(view->pendingShm_);
-            wl_shm_buffer_begin_access(shm);
-            blitWithRotation((const uint8_t*)wl_shm_buffer_get_data(shm),
-                             wl_shm_buffer_get_stride(shm),
-                             landscapeW_, landscapeH_,
-                             dst.pixels, dst.pitch, dst.width, dst.height);
-            wl_shm_buffer_end_access(shm);
+        if (eglReadback_) {
+            std::vector<EglLayer> layers;
+            layers.reserve(activeViews_.size());
+            for (auto* view : activeViews_) {
+                if (!view || !view->pendingEgl_) continue;
+                layers.push_back(EglLayer{
+                    .image = wpe_fdo_egl_exported_image_get_egl_image(
+                        view->pendingEgl_),
+                    .x = view->frame_.x,
+                    .y = view->frame_.y,
+                    .width = view->frame_.width,
+                    .height = view->frame_.height,
+                });
+            }
+            if (eglReadback_->canComposeToScanout()) {
+                if (!eglReadback_->composeToScanout(
+                        layers,
+                        dst.pixels,
+                        dst.pitch,
+                        dst.width,
+                        dst.height)) {
+                    return;
+                }
+            } else {
+                if (!eglReadback_->compose(layers)) return;
+                blitWithRotation(
+                    eglReadback_->pixels(), eglReadback_->stride(),
+                    landscapeW_, landscapeH_,
+                    dst.pixels, dst.pitch, dst.width, dst.height);
+            }
         } else {
-            const size_t neededBytes = (size_t)landscapeW_ * landscapeH_ * 4;
-            // Clear to opaque black so uncovered regions don't show stale
-            // pixels — skippable when some view overwrites every pixel.
-            bool fullyCovered = false;
-            for (auto* view : activeViews_) {
-                if (viewCoversComposite(view)) { fullyCovered = true; break; }
-            }
-            if (compositeBuffer_.size() != neededBytes) {
-                compositeBuffer_.assign(neededBytes, 0);
-            } else if (!fullyCovered) {
-                std::memset(compositeBuffer_.data(), 0, neededBytes);
-            }
-            const uint32_t compStride = landscapeW_ * 4;
+            const bool singleFullscreen =
+                activeViews_.size() == 1 &&
+                viewCoversComposite(activeViews_[0]);
 
-            for (auto* view : activeViews_) {
-                if (!view || !view->pendingShm_) continue;
+            if (singleFullscreen) {
+                WpeWebViewImpl* view = activeViews_[0];
                 struct wl_shm_buffer* shm =
                     wpe_fdo_shm_exported_buffer_get_shm_buffer(view->pendingShm_);
-                if (!shm) continue;
-
                 wl_shm_buffer_begin_access(shm);
-                const uint8_t* src       = (const uint8_t*)wl_shm_buffer_get_data(shm);
-                int32_t        srcStride = wl_shm_buffer_get_stride(shm);
-                int32_t        srcW      = wl_shm_buffer_get_width(shm);
-                int32_t        srcH      = wl_shm_buffer_get_height(shm);
-
-                // Blit src → compositeBuffer_ at (view.frame_.x, view.frame_.y),
-                // sized to min(srcW, frame.w) × min(srcH, frame.h). Negative
-                // origins clipped to 0; out-of-bounds src/dst clipped to the
-                // composite's dims. Plain BGRA copy — alpha math defers to the
-                // next iteration if any view ever needs translucency.
-                const int dstX0 = std::max(0, view->frame_.x);
-                const int dstY0 = std::max(0, view->frame_.y);
-                const int srcX0 = dstX0 - view->frame_.x;
-                const int srcY0 = dstY0 - view->frame_.y;
-                const int blitW = std::min({(int)srcW - srcX0,
-                                            view->frame_.width  - (dstX0 - view->frame_.x),
-                                            (int)landscapeW_   - dstX0});
-                const int blitH = std::min({(int)srcH - srcY0,
-                                            view->frame_.height - (dstY0 - view->frame_.y),
-                                            (int)landscapeH_   - dstY0});
-                if (blitW > 0 && blitH > 0) {
-                    for (int r = 0; r < blitH; r++) {
-                        std::memcpy(
-                            compositeBuffer_.data() + (size_t)(dstY0 + r) * compStride + (size_t)dstX0 * 4,
-                            src + (size_t)(srcY0 + r) * srcStride + (size_t)srcX0 * 4,
-                            (size_t)blitW * 4);
+                blitWithRotation(
+                    (const uint8_t*)wl_shm_buffer_get_data(shm),
+                    wl_shm_buffer_get_stride(shm),
+                    landscapeW_, landscapeH_,
+                    dst.pixels, dst.pitch, dst.width, dst.height);
+                wl_shm_buffer_end_access(shm);
+            } else {
+                const size_t neededBytes =
+                    (size_t)landscapeW_ * landscapeH_ * 4;
+                // Clear to opaque black so uncovered regions don't show stale
+                // pixels — skippable when some view overwrites every pixel.
+                bool fullyCovered = false;
+                for (auto* view : activeViews_) {
+                    if (viewCoversComposite(view)) {
+                        fullyCovered = true;
+                        break;
                     }
                 }
-                wl_shm_buffer_end_access(shm);
-            }
+                if (compositeBuffer_.size() != neededBytes) {
+                    compositeBuffer_.assign(neededBytes, 0);
+                } else if (!fullyCovered) {
+                    std::memset(compositeBuffer_.data(), 0, neededBytes);
+                }
+                const uint32_t compStride = landscapeW_ * 4;
 
-            blitWithRotation(compositeBuffer_.data(), compStride, landscapeW_, landscapeH_,
-                             dst.pixels, dst.pitch, dst.width, dst.height);
+                for (auto* view : activeViews_) {
+                    if (!view || !view->pendingShm_) continue;
+                    struct wl_shm_buffer* shm =
+                        wpe_fdo_shm_exported_buffer_get_shm_buffer(
+                            view->pendingShm_);
+                    if (!shm) continue;
+
+                    wl_shm_buffer_begin_access(shm);
+                    const uint8_t* src =
+                        (const uint8_t*)wl_shm_buffer_get_data(shm);
+                    int32_t srcStride = wl_shm_buffer_get_stride(shm);
+                    int32_t srcW = wl_shm_buffer_get_width(shm);
+                    int32_t srcH = wl_shm_buffer_get_height(shm);
+
+                    // Blit src → compositeBuffer_ at view.frame_, clipped to
+                    // the source, view bounds, and composite bounds.
+                    const int dstX0 = std::max(0, view->frame_.x);
+                    const int dstY0 = std::max(0, view->frame_.y);
+                    const int srcX0 = dstX0 - view->frame_.x;
+                    const int srcY0 = dstY0 - view->frame_.y;
+                    const int blitW = std::min({
+                        (int)srcW - srcX0,
+                        view->frame_.width - (dstX0 - view->frame_.x),
+                        (int)landscapeW_ - dstX0,
+                    });
+                    const int blitH = std::min({
+                        (int)srcH - srcY0,
+                        view->frame_.height - (dstY0 - view->frame_.y),
+                        (int)landscapeH_ - dstY0,
+                    });
+                    if (blitW > 0 && blitH > 0) {
+                        for (int r = 0; r < blitH; r++) {
+                            std::memcpy(
+                                compositeBuffer_.data() +
+                                    (size_t)(dstY0 + r) * compStride +
+                                    (size_t)dstX0 * 4,
+                                src + (size_t)(srcY0 + r) * srcStride +
+                                    (size_t)srcX0 * 4,
+                                (size_t)blitW * 4);
+                        }
+                    }
+                    wl_shm_buffer_end_access(shm);
+                }
+
+                blitWithRotation(
+                    compositeBuffer_.data(), compStride,
+                    landscapeW_, landscapeH_,
+                    dst.pixels, dst.pitch, dst.width, dst.height);
+            }
         }
 
         display_->present();
@@ -1811,11 +2003,13 @@ private:
         primaryView_ = nullptr;
         if (input_) { input_->stop(); input_.reset(); }
         if (drmFdWatchId_) { g_source_remove(drmFdWatchId_); drmFdWatchId_ = 0; }
+        eglReadback_.reset();
         display_.reset();
         if (mainLoop_) { g_main_loop_unref(mainLoop_); mainLoop_ = nullptr; }
     }
 
     std::unique_ptr<DrmDisplay>       display_;
+    std::unique_ptr<EglReadback>      eglReadback_;
     std::unique_ptr<InputDispatcher>  input_;
     GMainLoop*                        mainLoop_ = nullptr;
 

@@ -2639,7 +2639,7 @@ async function buildNative() {
 			//                    libdrm-dev libinput-dev libudev-dev libwayland-dev
 			let wpeAvailable = false;
 			try {
-				await $`pkg-config --exists wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0`.quiet();
+				await $`pkg-config --exists wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
 				wpeAvailable = true;
 			} catch {
 				console.log(
@@ -2652,9 +2652,9 @@ async function buildNative() {
 					"Building WPE/DRM version (libNativeWrapper_wpe.so) for bare-Linux embedded target",
 				);
 				const wpeCflagsResult =
-					await $`pkg-config --cflags wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0`.quiet();
+					await $`pkg-config --cflags wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
 				const wpeLibsResult =
-					await $`pkg-config --libs wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0`.quiet();
+					await $`pkg-config --libs wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
 				const wpeCflags = wpeCflagsResult.stdout.toString().trim();
 				const wpeLibs = wpeLibsResult.stdout.toString().trim();
 
@@ -2672,6 +2672,7 @@ async function buildNative() {
 					"src/native/linux/nativeWrapper_wpe.cpp",
 					"src/native/linux/wpe/wpe_backend.cpp",
 					"src/native/linux/wpe/drm_display.cpp",
+					"src/native/linux/wpe/egl_readback.cpp",
 					"src/native/linux/wpe/input.cpp",
 					asarLib, // views:// scheme handler reads from ASAR archives
 					...wpeLibs.split(/\s+/).filter((f) => f),

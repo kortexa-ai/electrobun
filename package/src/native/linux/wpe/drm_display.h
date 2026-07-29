@@ -8,10 +8,9 @@
 // panels — confirmed Phase 0 step 2). This implementation MUST use the
 // pitch returned by drmModeAddFB2, never `width × bpp`.
 //
-// Rotation (Phase 2 stopgap): if the target panel's native orientation is
-// rotated vs. the desired logical orientation, rotate in CPU during blit.
-// Mark with TODO(phase4) — Phase 4's composite shader absorbs rotation as
-// a sampler transform.
+// The display owns native-orientation scanout buffers. The EGL compositor
+// normally applies panel rotation in its shader; the SHM path keeps a CPU
+// rotation fallback.
 
 #pragma once
 

@@ -1,11 +1,8 @@
 // drm_display.cpp — DRM/KMS output implementation.
 //
-// Phase 2 skeleton: opens DRM, picks a mode, allocates dumb buffers, blits
-// provided pixels to the scanout buffer with CORRECT STRIDE HANDLING, and
-// page-flips. Supports software rotation as a Phase 2 stopgap.
-//
-// Status: right-shaped; init() path is sketched; acquire()/present() are
-// stubbed. Fill in Phase 2 proper.
+// Opens DRM, picks a mode, allocates pitch-correct dumb buffers, and queues
+// asynchronous page flips. Rotation is performed by the EGL compositor or,
+// when EGL is unavailable, by the SHM fallback blitter.
 //
 // References:
 // - kernel.org DRM docs, drmModeAddFB2 / drmModePageFlip
