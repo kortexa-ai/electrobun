@@ -187,10 +187,14 @@ function embeddedChromeHTML(title: string) {
     update();
     requestAnimationFrame(() => {
       const actions = document.getElementById("actions").getBoundingClientRect();
+      const bar = document.getElementById("bar").getBoundingClientRect();
       console.log(
         "[electrobun-chrome] viewport=" + innerWidth + "x" + innerHeight +
+        " visual=" + visualViewport.width + "x" + visualViewport.height +
+        "@" + visualViewport.scale +
         " screen=" + screen.width + "x" + screen.height +
         " dpr=" + devicePixelRatio +
+        " bar=" + [bar.x, bar.y, bar.width, bar.height].join(",") +
         " actions=" + [actions.x, actions.y, actions.width, actions.height].join(","),
       );
     });
