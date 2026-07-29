@@ -101,14 +101,41 @@ function embeddedChromeHTML(title: string) {
     appearance: none; -webkit-appearance: none; border: 0;
     width: 68px; height: 60px; padding: 0; border-radius: 10px;
     background: transparent; color: #fff5e6;
-    font: 26px/1 sans-serif; cursor: pointer; touch-action: manipulation;
+    position: relative; cursor: pointer; touch-action: manipulation;
   }
   button:active { background: rgba(255,255,255,.12); transform: scale(.92); }
   #close { color: #cc3300; font-weight: 700; }
+  #close::before, #close::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 29px; height: 4px; border-radius: 2px;
+    background: currentColor;
+  }
+  #close::before { transform: translate(-50%,-50%) rotate(45deg); }
+  #close::after { transform: translate(-50%,-50%) rotate(-45deg); }
+  #maximize::before, #maximize::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 24px; height: 18px; border: 3px solid currentColor;
+    border-radius: 2px;
+    transform: translate(-50%,-50%);
+  }
+  #maximize::after { display: none; }
+  #maximize.restore::before {
+    transform: translate(calc(-50% - 4px),calc(-50% + 4px));
+  }
+  #maximize.restore::after {
+    display: block; background: #1a1a1a;
+    transform: translate(calc(-50% + 4px),calc(-50% - 4px));
+  }
   #handle {
     display: none; width: 100%; height: 100%; border-radius: 0 0 10px 10px;
     align-items: center; justify-content: center;
-    background: rgba(26,26,26,.88); font: 700 19px/1 sans-serif;
+    background: rgba(26,26,26,.88);
+  }
+  #handle::before {
+    content: ""; width: 0; height: 0;
+    border-left: 10px solid transparent;
+    border-right: 10px solid transparent;
+    border-top: 11px solid currentColor;
   }
   @media (max-height: 40px) {
     #bar { display: none; }
@@ -120,11 +147,11 @@ function embeddedChromeHTML(title: string) {
   <div id="bar">
     <div id="title"></div>
     <div id="actions">
-      <button id="maximize" type="button" aria-label="Maximize window">&#x26f6;</button>
-      <button id="close" type="button" aria-label="Close window">&#x2715;</button>
+      <button id="maximize" type="button" aria-label="Maximize window"></button>
+      <button id="close" type="button" aria-label="Close window"></button>
     </div>
   </div>
-  <button id="handle" type="button" aria-label="Reveal window controls">&#x25be;</button>
+  <button id="handle" type="button" aria-label="Reveal window controls"></button>
 <script>
   (() => {
     const bridge = window.webkit?.messageHandlers?.electrobunChrome;
@@ -132,7 +159,7 @@ function embeddedChromeHTML(title: string) {
     let maximized = false;
     const post = (action) => bridge?.postMessage(action);
     const update = () => {
-      maximize.textContent = maximized ? "\u2750" : "\u26f6";
+      maximize.classList.toggle("restore", maximized);
       maximize.setAttribute(
         "aria-label",
         maximized ? "Restore window" : "Maximize window",
