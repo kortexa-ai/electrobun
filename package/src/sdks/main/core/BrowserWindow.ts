@@ -101,7 +101,8 @@ function embeddedChromeHTML(title: string) {
     background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.4);
   }
   #title {
-    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-width: 0; flex: 1; line-height: 60px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85;
   }
   #actions {
