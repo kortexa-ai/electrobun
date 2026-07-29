@@ -435,7 +435,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				windowId: this.id,
 				autoResize: false,
 				sandbox: true,
-				trust: "trusted",
+				trust: "untrusted",
 			});
 			this.chromeWebviewId = chrome.id;
 		}
