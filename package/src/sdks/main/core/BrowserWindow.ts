@@ -77,7 +77,12 @@ const defaultOptions: WindowOptionsType = {
 const EMBEDDED_CHROME_HEIGHT = 60;
 
 function embeddedChromeHTML(title: string) {
-	const titleJSON = JSON.stringify(title).replaceAll("<", "\\u003c");
+	const escapedTitle = title
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#39;");
 	const html = `<!doctype html>
 <html>
 <head>
@@ -92,7 +97,7 @@ function embeddedChromeHTML(title: string) {
   }
   #bar {
     width: 100%; height: 100%; display: flex; align-items: center;
-    position: relative; padding: 0 157px 0 16px;
+    justify-content: space-between; padding-left: 16px;
     background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.4);
   }
   #title {
@@ -100,9 +105,7 @@ function embeddedChromeHTML(title: string) {
     font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85;
   }
   #actions {
-    position: absolute; top: 0; right: 0; width: 151px; height: 60px;
-    display: flex; align-items: center; justify-content: flex-end; gap: 5px;
-    padding-right: 5px; background: #222;
+    height: 100%; flex: none; display: flex; align-items: center; gap: 5px;
   }
   button {
     appearance: none; -webkit-appearance: none; border: 0;
@@ -152,7 +155,7 @@ function embeddedChromeHTML(title: string) {
 </head>
 <body>
   <div id="bar">
-    <div id="title"></div>
+    <div id="title">${escapedTitle}</div>
     <div id="actions">
       <button id="maximize" type="button" aria-label="Maximize window"></button>
       <button id="close" type="button" aria-label="Close window"></button>
@@ -176,7 +179,6 @@ function embeddedChromeHTML(title: string) {
       maximized = Boolean(value);
       update();
     };
-    document.getElementById("title").textContent = ${titleJSON};
     maximize.addEventListener("click", () => {
       maximized = !maximized;
       update();
@@ -185,19 +187,6 @@ function embeddedChromeHTML(title: string) {
     document.getElementById("close").addEventListener("click", () => post("close"));
     document.getElementById("handle").addEventListener("click", () => post("reveal"));
     update();
-    requestAnimationFrame(() => {
-      const actions = document.getElementById("actions").getBoundingClientRect();
-      const bar = document.getElementById("bar").getBoundingClientRect();
-      console.log(
-        "[electrobun-chrome] viewport=" + innerWidth + "x" + innerHeight +
-        " visual=" + visualViewport.width + "x" + visualViewport.height +
-        "@" + visualViewport.scale +
-        " screen=" + screen.width + "x" + screen.height +
-        " dpr=" + devicePixelRatio +
-        " bar=" + [bar.x, bar.y, bar.width, bar.height].join(",") +
-        " actions=" + [actions.x, actions.y, actions.width, actions.height].join(","),
-      );
-    });
   })();
 </script>
 </body>
@@ -435,6 +424,8 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				windowId: this.id,
 				autoResize: false,
 				sandbox: true,
+				// WPE 2.48 clips a composited secondary view when it shares the
+				// app's related WebProcess. Isolation keeps all 1920 px visible.
 				trust: "untrusted",
 			});
 			this.chromeWebviewId = chrome.id;

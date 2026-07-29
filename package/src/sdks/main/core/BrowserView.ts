@@ -57,7 +57,9 @@ export type BrowserViewOptions<T = undefined> = {
 	// Enables macOS system spell checking for native WKWebView content.
 	// Unsupported renderers/platforms leave their behavior unchanged.
 	spellCheck: boolean;
-	// Trust class for WPE WebProcess isolation. Other backends ignore it.
+	// Trust class for process isolation. On WPE/Linux-embedded, trusted
+	// views may share a related WebProcess; untrusted views are isolated.
+	// Other platforms ignore this option.
 	trust: "trusted" | "untrusted";
 	// renderer:
 };
