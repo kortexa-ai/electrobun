@@ -844,8 +844,14 @@ public:
             // view in primeWpeView, so it's always non-null for trusted
             // requests by the time createWebview runs.
             WebKitWebView* relatedView = wantTrusted ? trustedSourceView_ : nullptr;
-            dispatchSyncMain([this, wantTrusted, relatedView, &impl]() {
-                impl = createOnePooledView(wantTrusted, relatedView);
+            const uint32_t initialWidth =
+                (uint32_t)std::max(1, spec.frame.width);
+            const uint32_t initialHeight =
+                (uint32_t)std::max(1, spec.frame.height);
+            dispatchSyncMain([this, wantTrusted, relatedView,
+                              initialWidth, initialHeight, &impl]() {
+                impl = createOnePooledView(
+                    wantTrusted, relatedView, initialWidth, initialHeight);
             });
             if (!impl) {
                 fprintf(stderr, "[WpeBackend] createWebview: lazy createOnePooledView failed\n");
@@ -1063,7 +1069,9 @@ private:
         // Seed view is trusted with no related-view link — it becomes the
         // shared trusted source for all subsequent trusted views (set inside
         // createOnePooledView).
-        auto* seedImpl = createOnePooledView(/*trusted=*/true, /*relatedView=*/nullptr);
+        auto* seedImpl = createOnePooledView(
+            /*trusted=*/true, /*relatedView=*/nullptr,
+            landscapeW_, landscapeH_);
         if (!seedImpl) {
             fprintf(stderr, "[WpeBackend] primeWpeView: createOnePooledView (seed) failed\n");
             return;
@@ -1088,7 +1096,12 @@ private:
     // WPEWebProcess instead of spawning a new one. Trusted views pass the
     // shared trustedSourceView_ here; untrusted views pass nullptr to force
     // a fresh WebProcess.
-    WpeWebViewImpl* createOnePooledView(bool trusted, WebKitWebView* relatedView) {
+    // `initialWidth`/`initialHeight` must match the first assigned frame:
+    // resizing a preloaded WPE-FDO backend can leave a 512 px tile unpainted.
+    WpeWebViewImpl* createOnePooledView(bool trusted,
+                                        WebKitWebView* relatedView,
+                                        uint32_t initialWidth,
+                                        uint32_t initialHeight) {
         // Static — WPE-FDO holds the pointer, doesn't copy. See §15.
         static wpe_view_backend_exportable_fdo_client client = {};
         client.export_shm_buffer = &WpeBackend::onExportShmStatic;
@@ -1102,7 +1115,7 @@ private:
         impl->trusted_ = trusted;
 
         auto* exportable = wpe_view_backend_exportable_fdo_create(
-            &client, /*user_data=*/impl, landscapeW_, landscapeH_);
+            &client, /*user_data=*/impl, initialWidth, initialHeight);
         if (!exportable) {
             fprintf(stderr, "[WpeBackend] createOnePooledView: exportable_fdo_create failed\n");
             return nullptr;
@@ -1159,7 +1172,8 @@ private:
         impl->webView_ = webView;
         impl->exportable_ = exportable;
         impl->userContentManager_ = manager;
-        impl->frame_ = Rect{0, 0, (int)landscapeW_, (int)landscapeH_};
+        impl->frame_ =
+            Rect{0, 0, (int)initialWidth, (int)initialHeight};
 
         // Capture the first trusted view's WebKitWebView as the related-view
         // source for all subsequent trusted views — this is what makes them
