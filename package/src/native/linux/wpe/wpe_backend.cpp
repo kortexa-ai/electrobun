@@ -330,10 +330,15 @@ public:
     bool canGoForward() override { return webView_ && webkit_web_view_can_go_forward(webView_); }
 
     void evaluateJavaScriptWithNoCompletion(const char* jsString) override {
-        if (webView_ && jsString) {
-            webkit_web_view_evaluate_javascript(webView_, jsString, -1, nullptr, nullptr,
-                                                nullptr, nullptr, nullptr);
-        }
+        if (!webView_ || !jsString) return;
+        std::string js = jsString;
+        dispatchSyncMain([this, js = std::move(js)]() {
+            if (webView_) {
+                webkit_web_view_evaluate_javascript(
+                    webView_, js.c_str(), -1, nullptr, nullptr,
+                    nullptr, nullptr, nullptr);
+            }
+        });
     }
     void callAsyncJavascript(const char*, const char* jsString,
                              uint32_t, uint32_t, void*) override {
