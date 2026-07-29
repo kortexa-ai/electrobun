@@ -425,9 +425,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				windowId: this.id,
 				autoResize: false,
 				sandbox: true,
-				// WPE 2.48 clips a composited secondary view when it shares the
-				// app's related WebProcess. Isolation keeps all 1920 px visible.
-				trust: "untrusted",
+				trust: "trusted",
 			});
 			this.chromeWebviewId = chrome.id;
 		}
