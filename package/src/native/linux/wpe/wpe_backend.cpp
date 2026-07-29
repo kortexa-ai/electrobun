@@ -336,7 +336,21 @@ public:
             if (webView_) {
                 webkit_web_view_evaluate_javascript(
                     webView_, js.c_str(), -1, nullptr, nullptr,
-                    nullptr, nullptr, nullptr);
+                    nullptr,
+                    +[](GObject* source, GAsyncResult* result, gpointer) {
+                        GError* error = nullptr;
+                        JSCValue* value =
+                            webkit_web_view_evaluate_javascript_finish(
+                                WEBKIT_WEB_VIEW(source), result, &error);
+                        if (error) {
+                            fprintf(stderr,
+                                    "[WpeWebViewImpl] evaluate JavaScript failed: %s\n",
+                                    error->message);
+                            g_error_free(error);
+                        }
+                        if (value) g_object_unref(value);
+                    },
+                    nullptr);
             }
         });
     }
