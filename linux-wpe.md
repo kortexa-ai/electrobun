@@ -1166,3 +1166,142 @@ Those control runs used an already-running portal service. The next larger
 upstream opportunity is making the main SDK entrypoint tree-shake its optional
 Three.js/Babylon.js exports; minification is a safe proving-ground win, not a
 substitute for that cleanup.
+
+## 20. Session results (2026-07-28 — native window decorations)
+
+### What was broken
+
+The injected close button navigated to `electrobun://chrome/close`, then relied
+on the general `will-navigate` callback reaching Bun. That path carried C
+strings through a threaded Bun FFI callback which intermittently arrived as
+`Buffer is already detached`. It also intentionally trusted only `trusted`
+views, so an `untrusted` About window could never close through that shortcut.
+
+Maximize was not a native window operation at all. It only hid the injected
+HTML header and removed the body's top padding. That happened to resemble
+fullscreen for the already-panel-sized main window, but an About window kept
+its small compositor rectangle and merely became a borderless small rectangle.
+
+### Native decoration path
+
+WPE now registers a dedicated `electrobunChrome` WebKit script-message handler
+on every view. It recognizes only `close`, `maximize`, and `restore`, associates
+the action with that view's host window, and queues it onto the GLib loop after
+the WebKit signal unwinds. No action string crosses Bun's asynchronous FFI
+boundary.
+
+- Close calls the window's normal core close trampoline. Core removes the
+  window's child views, emits the Bun close event, and applies
+  `exitOnLastWindowClosed`.
+- Maximize saves the primary view's compositor frame and resizes it to the DRM
+  panel.
+- Restore reapplies that exact saved frame.
+- The exported `maximizeWindow`, `unmaximizeWindow`, and
+  `isWindowMaximized` functions use the same WPE state rather than no-ops.
+
+This makes a secondary About window fill the panel when maximized and return to
+its requested position and size when restored. The main view is already fitted
+to the panel, so its native frame stays panel-sized while its framework-owned
+chrome view collapses to the reveal handle.
+
+### The first-tap deadlock
+
+The first panel test froze after maximize. A live debugger stack showed:
+
+```text
+GLib idle callback
+  -> setWindowMaximized
+  -> dispatchSyncMain
+  -> std::future::wait
+```
+
+The launcher and ElectrobunCore both run the shared default GLib context from
+different threads. `dispatchSyncMain` remembered only the most recent runner's
+thread ID, so a callback executing on the other legitimate context-owning
+thread tried to synchronously dispatch to itself.
+
+`dispatchSyncMain` now first asks
+`g_main_context_is_owner(g_main_context_default())`. A current context owner
+runs the operation inline; worker FFI calls still marshal through an idle
+callback and wait. Repeated maximize/restore cycles no longer freeze.
+
+### Touch UX
+
+The broad “tap near the top to restore” behavior is gone because it steals taps
+from application controls. When maximized:
+
+- a touch beginning within 16 px of the physical top edge is observed but not
+  consumed;
+- only a downward, predominantly vertical pull of at least 36 px is claimed;
+- the pull reveals the titlebar over the still-maximized content and sends no
+  native window action;
+- the revealed maximize button changes to Restore; tapping it restores the
+  native frame and returns the content to its normal below-titlebar layout;
+- a possible synthetic post-touch click is suppressed for 500 ms;
+- ordinary taps, including application buttons near the top, remain untouched.
+
+A visible top-center reveal handle remains as a discoverable tap fallback.
+For the 1920×480 touch panel, the titlebar grew from 44 px to 60 px, its two
+button targets grew from 44×44 to 68×60 px, and the restore handle grew from
+52×20 to 76×28 px. The larger titlebar buttons were confirmed more comfortable
+on the physical panel.
+
+### Why the resize fix temporarily lost the titlebar controls
+
+The old header lived inside the application's WebView. Moving it with body
+padding could not resize apps that use `100vh` (including
+`hello-embedded`'s `h-screen`), so the content retained its maximized layout
+and was merely pushed downward. The correct fix was a separate
+framework-owned BrowserView: the app receives a real 1920×420 viewport and the
+60 px chrome view is composited above it.
+
+The pooled-view allocator created every WPE-FDO backend at the full
+1920×480 panel size, loaded `about:blank`, and only then resized the chrome
+slot to 1920×60. WebKit's DOM and visual viewport both reported 1920×60, but
+DRM captures showed a stale 512 px render tile:
+
+- a related/shared WebProcess painted the title while clipping the
+  right-aligned buttons;
+- a separate WebProcess moved the stale tile and painted the buttons while
+  losing the left-side title;
+- CSS geometry changes moved neither underlying failure.
+
+`createOnePooledView` now receives the first assigned frame and creates the
+WPE-FDO exportable at that size. The chrome's first SHM buffer is therefore
+1920×60 rather than 1920×480. Full-panel captures show the title at the left
+and both controls at the right, and shared- versus separate-process captures
+are pixel-identical. Chrome stays `trusted`, so it shares the app's single
+WPEWebProcess without the rendering regression.
+
+The title is also present in the initial HTML rather than inserted after first
+paint, and the control icons use CSS geometry instead of font glyphs. Those
+are deterministic hardening; neither was the cause of the missing 512 px tile.
+
+### JavaScript evaluation thread affinity
+
+The framebuffer probe used `BrowserView.executeJavascript` to try to drive the
+chrome controls automatically. That exposed a separate parity bug: the WPE
+implementation called WebKit directly from Bun's FFI thread. It now copies the
+script, marshals evaluation through the GLib/WebKit context, and consumes the
+async result so WebKit errors are logged instead of silently discarded.
+The related chrome-view probe still produced no DOM effect and no WebKit error,
+so automated control activation remains a follow-up; the physical touch run is
+still the authoritative interaction regression test.
+
+### Verified on moodymoose
+
+With `hello-embedded` built against the matching runtime manifest:
+
+- main maximize → restore completed repeatedly;
+- About maximize filled the panel and restore returned it to its dialog frame;
+- About close removed only About;
+- main close exited the launcher service cleanly;
+- the native log associated every action with the expected `webviewId`;
+- first app frame after `loadURL` remained 22–54 ms;
+- a DRM `kmsgrab` capture verified all 1920 titlebar pixels, and the final
+  shared-process run used one WPEWebProcess.
+
+The general `webviewEventJSCallback` still reports an occasional detached
+buffer while forwarding navigation events. Decoration actions deliberately no
+longer depend on that path, but the general event-string lifetime is a separate
+follow-up goblin.
