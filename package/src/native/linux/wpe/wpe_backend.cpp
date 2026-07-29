@@ -303,7 +303,10 @@ public:
     // AbstractView
 
     void loadURL(const char* urlString) override {
-        fprintf(stderr, "[WpeWebViewImpl] loadURL %s (webView=%p)\n", urlString ? urlString : "(null)", (void*)webView_); fflush(stderr);
+        fprintf(stderr, "[WpeWebViewImpl] loadURL %s (webView=%p)\n",
+                alwaysTopmost_ ? "<internal-chrome>" :
+                    (urlString ? urlString : "(null)"),
+                (void*)webView_); fflush(stderr);
         if (webView_ && urlString) {
             loadRequestedAt_ = std::chrono::steady_clock::now();
             firstFrameAfterLoadPending_ = true;
@@ -800,8 +803,11 @@ public:
     // IWebviewBackend
 
     std::shared_ptr<AbstractView> createWebview(const WebviewSpec& spec) override {
+        const bool isInternalChrome =
+            spec.partition == "__electrobun_chrome__";
         fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
-                (long)syscall(SYS_gettid), spec.webviewId, spec.url.c_str(),
+                (long)syscall(SYS_gettid), spec.webviewId,
+                isInternalChrome ? "<internal-chrome>" : spec.url.c_str(),
                 spec.trust.c_str()); fflush(stderr);
 
         // Trust class drives WebProcess sharing (Stage 2). "" defaults to
@@ -851,8 +857,15 @@ public:
         impl->inFreePool_ = false;
 
         impl->webviewId = spec.webviewId;
-        impl->navigationCallback_   = (DecideNavigationCallback)spec.navigationHandler;
-        impl->eventHandler_         = (WebviewEventHandler)spec.webviewEventHandler;
+        // The framework-owned chrome document has no user navigation
+        // surface. Keeping it off the generic callback path also avoids
+        // copying its base64 data URL through Bun FFI event strings.
+        impl->navigationCallback_   = isInternalChrome
+            ? nullptr
+            : (DecideNavigationCallback)spec.navigationHandler;
+        impl->eventHandler_         = isInternalChrome
+            ? nullptr
+            : (WebviewEventHandler)spec.webviewEventHandler;
         impl->bunBridgeHandler_     = (HandlePostMessage)spec.bunBridgeHandler;
         impl->internalBridgeHandler_= (HandlePostMessage)spec.internalBridgeHandler;
         impl->eventBridgeHandler_   = (HandlePostMessage)spec.eventBridgeHandler;
@@ -901,7 +914,7 @@ public:
         // Partition convention for chrome views: the magic string flags this
         // view as topmost within its host BrowserWindow. Other backends
         // (macOS/GTK/CEF/Win) treat it as a normal cookie partition.
-        impl->alwaysTopmost_ = (spec.partition == "__electrobun_chrome__");
+        impl->alwaysTopmost_ = isInternalChrome;
         if (impl->alwaysTopmost_) {
             if (spec.hostWindow == firstHostWindow_) {
                 impl->frame_.x = 0;
@@ -967,7 +980,8 @@ public:
             std::string url = spec.url;
             dispatchSyncMain([impl, url]() {
                 fprintf(stderr, "[WpeBackend] createWebview: loadURL %s on main (view %p)\n",
-                        url.c_str(), (void*)impl); fflush(stderr);
+                        impl->alwaysTopmost_ ? "<internal-chrome>" : url.c_str(),
+                        (void*)impl); fflush(stderr);
                 impl->loadURL(url.c_str());
             });
         }
