@@ -185,11 +185,26 @@ function embeddedChromeHTML(title: string) {
     document.getElementById("close").addEventListener("click", () => post("close"));
     document.getElementById("handle").addEventListener("click", () => post("reveal"));
     update();
+    requestAnimationFrame(() => {
+      const actions = document.getElementById("actions").getBoundingClientRect();
+      console.log(
+        "[electrobun-chrome] viewport=" + innerWidth + "x" + innerHeight +
+        " screen=" + screen.width + "x" + screen.height +
+        " dpr=" + devicePixelRatio +
+        " actions=" + [actions.x, actions.y, actions.width, actions.height].join(","),
+      );
+    });
   })();
 </script>
 </body>
 </html>`;
 	return html;
+}
+
+function embeddedChromeURL(title: string) {
+	return `data:text/html;charset=utf-8;base64,${Buffer.from(
+		embeddedChromeHTML(title),
+	).toString("base64")}`;
 }
 
 export const BrowserWindowMap: {
@@ -402,9 +417,8 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		this.webviewId = webview.id;
 
 		if (usesEmbeddedChrome) {
-			const chromeHTML = embeddedChromeHTML(this.title);
 			const chrome = new BrowserView({
-				url: null,
+				url: embeddedChromeURL(this.title),
 				html: null,
 				renderer: this.renderer,
 				partition: "__electrobun_chrome__",
@@ -419,10 +433,6 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				sandbox: true,
 				trust: "trusted",
 			});
-			// WPE hands us an initialized pooled view synchronously, so load
-			// its framework-owned document immediately rather than exposing
-			// the pool's about:blank frame while waiting on a timer.
-			chrome.loadHTML(chromeHTML);
 			this.chromeWebviewId = chrome.id;
 		}
 	}
