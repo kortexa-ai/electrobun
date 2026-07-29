@@ -1349,11 +1349,20 @@ private:
         auto* impl = static_cast<WpeWebViewImpl*>(userData);
         const auto now = std::chrono::steady_clock::now();
         if (impl && !impl->firstFrameLogged_) {
+            struct wl_shm_buffer* shm =
+                buffer
+                    ? wpe_fdo_shm_exported_buffer_get_shm_buffer(buffer)
+                    : nullptr;
+            const int32_t shmWidth = shm ? wl_shm_buffer_get_width(shm) : 0;
+            const int32_t shmHeight = shm ? wl_shm_buffer_get_height(shm) : 0;
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - impl->createdAt_);
             fprintf(stderr,
-                    "[WpeBackend] first WPE frame in %lld ms (view %p, webviewId=%u)\n",
-                    static_cast<long long>(elapsed.count()), (void*)impl, impl->webviewId);
+                    "[WpeBackend] first WPE frame in %lld ms "
+                    "(view %p, webviewId=%u, shm=%dx%d, frame=%dx%d)\n",
+                    static_cast<long long>(elapsed.count()), (void*)impl,
+                    impl->webviewId, shmWidth, shmHeight,
+                    impl->frame_.width, impl->frame_.height);
             fflush(stderr);
             impl->firstFrameLogged_ = true;
         }
