@@ -41,7 +41,6 @@ import {
 } from "../shared/naming";
 import { getTemplate, getTemplateNames } from "./templates/embedded";
 import {
-import {
 	MACOS_DEPLOYMENT_TARGET,
 	macosZigTarget,
 } from "../../scripts/macos-release.js";

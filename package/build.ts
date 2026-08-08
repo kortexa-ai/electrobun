@@ -39,7 +39,6 @@ import { RUST_VERSION } from "./src/shared/rust-version";
 import { GO_VERSION } from "./src/shared/go-version";
 import { ODIN_VERSION } from "./src/shared/odin-version";
 import {
-import {
 	MACOS_DEPLOYMENT_TARGET,
 	macosZigTarget,
 } from "./scripts/macos-release.js";
