@@ -150,22 +150,17 @@ fn preheatNativeWrapper(allocator: std.mem.Allocator, exe_dir: []const u8) void 
     defer allocator.free(wrapper_path);
     std.Io.Dir.accessAbsolute(g_io, wrapper_path, .{}) catch return;
 
-    const pid = std.posix.fork() catch return;
+    const pid = std.c.fork();
+    if (pid < 0) return;
     if (pid == 0) {
-        const grandchild = std.posix.fork() catch std.posix.exit(0);
+        const grandchild = std.c.fork();
         if (grandchild == 0) {
             _ = c.dlopen(wrapper_path.ptr, c.RTLD_NOW | c.RTLD_GLOBAL);
-            std.posix.exit(0);
+            std.process.exit(0);
         }
-        std.posix.exit(0);
+        std.process.exit(0);
     }
-    _ = std.posix.waitpid(pid, 0);
-}
-        }
-        std.posix.exit(0);
-    }
-    // Reap the short-lived first child; the grandchild belongs to init now.
-    _ = std.posix.waitpid(pid, 0);
+    _ = std.c.waitpid(pid, null, 0);
 }
 
 const MainProcess = enum {

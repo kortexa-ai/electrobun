@@ -796,6 +796,11 @@ fn getAppDataDir(allocator: std.mem.Allocator) ![]const u8 {
             };
             break :blk xdg_data_home;
         },
+        .macos => blk: {
+            const home = try getEnvOwned(allocator, "HOME");
+            defer allocator.free(home);
+            break :blk try std.fs.path.join(allocator, &.{ home, "Library", "Application Support" });
+        },
         else => @compileError("Unsupported platform for app data directory"),
     };
 }
@@ -904,12 +909,13 @@ fn printHelp() void {
     , .{});
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Action {
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Action {
+    var iterator = try std.process.Args.Iterator.initAllocator(args, allocator);
+    defer iterator.deinit();
+    _ = iterator.next(); // executable name
 
     var action: Action = .install;
-    for (argv[1..]) |arg| {
+    while (iterator.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return .help;
         } else if (std.mem.eql(u8, arg, "--no-kiosk")) {
@@ -1558,7 +1564,7 @@ pub fn main(init: std.process.Init) !void {
     g_environ_map = init.environ_map;
     const allocator = init.gpa;
 
-    const action = try parseArgs(allocator);
+    const action = try parseArgs(init.minimal.args, allocator);
     switch (action) {
         .help => {
             printHelp();
