@@ -91,6 +91,7 @@ namespace electrobun { AbstractView* wpeFindViewById(uint32_t webviewId); }
 struct WpeWindowEntry {
     uint32_t            windowId;
     WindowCloseCallback closeCallback;
+    WindowShouldCloseHandler shouldCloseCallback;
     bool                usesCompositedChrome;
 };
 
@@ -200,6 +201,7 @@ ELECTROBUN_EXPORT void shutdownNativeWrapper() {
 ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, double width, double height, const char* title,
                                        WindowCloseCallback closeCallback, WindowMoveCallback moveCallback, WindowResizeCallback resizeCallback,
                                        WindowFocusCallback focusCallback, WindowBlurCallback blurCallback, WindowKeyHandler keyCallback,
+                                       WindowShouldCloseHandler shouldCloseCallback,
                                        const char* titleBarStyle, bool transparent) {
     (void)x; (void)y;
     (void)moveCallback; (void)resizeCallback;
@@ -223,6 +225,7 @@ ELECTROBUN_EXPORT void* createGTKWindow(uint32_t windowId, double x, double y, d
     auto entry = std::make_unique<WpeWindowEntry>();
     entry->windowId      = windowId;
     entry->closeCallback = closeCallback;
+    entry->shouldCloseCallback = shouldCloseCallback;
     entry->usesCompositedChrome =
         !titleBarStyle || std::strcmp(titleBarStyle, "default") == 0;
     void* handle = entry.get();
@@ -237,12 +240,13 @@ ELECTROBUN_EXPORT void* createWindowWithFrameAndStyleFromWorker(uint32_t windowI
                                                                 uint32_t styleMask, const char* titleBarStyle, bool transparent,
                                                                 double trafficLightOffsetX, double trafficLightOffsetY,
                                                                 WindowCloseCallback closeCallback, WindowMoveCallback moveCallback, WindowResizeCallback resizeCallback,
-                                                                WindowFocusCallback focusCallback, WindowBlurCallback blurCallback, WindowKeyHandler keyCallback) {
+                                                                WindowFocusCallback focusCallback, WindowBlurCallback blurCallback, WindowKeyHandler keyCallback,
+                                                                WindowShouldCloseHandler shouldCloseCallback) {
     (void)styleMask; (void)trafficLightOffsetX; (void)trafficLightOffsetY;
     return createGTKWindow(windowId, x, y, width, height, "Window",
                            closeCallback, moveCallback, resizeCallback,
                            focusCallback, blurCallback, keyCallback,
-                           titleBarStyle, transparent);
+                           shouldCloseCallback, titleBarStyle, transparent);
 }
 
 ELECTROBUN_EXPORT uint32_t getWindowStyle(bool borderless, bool titled, bool closable, bool miniaturizable,
@@ -256,8 +260,23 @@ ELECTROBUN_EXPORT void setWindowTitle(void* window, const char* title) { (void)w
 ELECTROBUN_EXPORT void showWindow(void* window, bool activate)         { (void)window; (void)activate; }
 ELECTROBUN_EXPORT void activateWindow(void* window)                    { (void)window; }
 ELECTROBUN_EXPORT void hideWindow(void* window)                        { (void)window; }
+ELECTROBUN_EXPORT bool isWindowVisible(void* window)                   { (void)window; return true; }
 ELECTROBUN_EXPORT void closeWindow(void* window) {
     closeWpeWindow(window);
+}
+
+ELECTROBUN_EXPORT void requestWindowClose(void* window) {
+    WindowShouldCloseHandler shouldClose = nullptr;
+    uint32_t windowId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_windows.find(window);
+        if (it == g_windows.end()) return;
+        windowId = it->second->windowId;
+        shouldClose = it->second->shouldCloseCallback;
+    }
+    if (shouldClose) shouldClose(windowId);
+    else closeWpeWindow(window);
 }
 
 ELECTROBUN_EXPORT void minimizeWindow(void* window)                  { (void)window; }
@@ -279,7 +298,13 @@ ELECTROBUN_EXPORT bool isWindowAlwaysOnTop(void* window)             { (void)win
 ELECTROBUN_EXPORT void setWindowVisibleOnAllWorkspaces(void* w, bool v) { (void)w; (void)v; }
 ELECTROBUN_EXPORT bool isWindowVisibleOnAllWorkspaces(void* w)       { (void)w; return true; }
 ELECTROBUN_EXPORT void setWindowPosition(void* w, double x, double y){ (void)w; (void)x; (void)y; }
+ELECTROBUN_EXPORT void centerWindow(void* w)                          { (void)w; }
 ELECTROBUN_EXPORT void setWindowButtonPosition(void* w, double x, double y) { (void)w; (void)x; (void)y; }
+ELECTROBUN_EXPORT void getWindowButtonPosition(void* w, double* x, double* y) {
+    (void)w;
+    if (x) *x = 0;
+    if (y) *y = 0;
+}
 ELECTROBUN_EXPORT void setWindowSize(void* w, double width, double height)  { (void)w; (void)width; (void)height; }
 ELECTROBUN_EXPORT void setWindowFrame(void* w, double x, double y, double width, double height) {
     (void)w; (void)x; (void)y; (void)width; (void)height;
@@ -334,6 +359,13 @@ ELECTROBUN_EXPORT const char* getCursorScreenPoint() {
 }
 
 ELECTROBUN_EXPORT uint64_t getMouseButtons() { return 0; }
+
+ELECTROBUN_EXPORT bool captureScreenRegion(double x, double y, uint32_t width, uint32_t height,
+                                            uint8_t* outRgba, uint64_t outLen) {
+    (void)x; (void)y; (void)width; (void)height; (void)outRgba; (void)outLen;
+    warnOnce("captureScreenRegion");
+    return false;
+}
 
 // ===========================================================================
 // Webview lifecycle (real routings)
@@ -657,6 +689,10 @@ ELECTROBUN_EXPORT void webviewSetPassthrough(AbstractView* v, bool enable) {
 ELECTROBUN_EXPORT void webviewSetHidden(AbstractView* v, bool hidden) {
     if (v) v->setHidden(hidden);
 }
+ELECTROBUN_EXPORT bool webviewSetSpellCheck(AbstractView* v, bool enabled) {
+    (void)v; (void)enabled;
+    return false;
+}
 ELECTROBUN_EXPORT void setAppReopenHandler(void (*callback)())           { (void)callback; }
 ELECTROBUN_EXPORT void setDockIconVisible(bool visible)                  { (void)visible; }
 ELECTROBUN_EXPORT bool isDockIconVisible()                               { return false; }
@@ -675,6 +711,7 @@ ELECTROBUN_EXPORT void* wgpuViewGetNativeHandle(AbstractView* v)                
 ELECTROBUN_EXPORT void* wgpuInstanceCreateSurfaceMainThread(void* instance, void* descriptor) { (void)instance; (void)descriptor; return nullptr; }
 ELECTROBUN_EXPORT void* wgpuCreateSurfaceForView(void* wgpuInstance, AbstractView* v)         { (void)wgpuInstance; (void)v; return nullptr; }
 ELECTROBUN_EXPORT void  wgpuSurfaceConfigureMainThread(void* surface, void* config)           { (void)surface; (void)config; }
+ELECTROBUN_EXPORT void  wgpuSurfaceCapabilitiesFreeMembersShim(void* capabilities)            { (void)capabilities; }
 ELECTROBUN_EXPORT void  wgpuSurfaceGetCurrentTextureMainThread(void* surface, void* surfaceTexture) { (void)surface; (void)surfaceTexture; }
 ELECTROBUN_EXPORT int32_t wgpuSurfacePresentMainThread(void* surface)                         { (void)surface; return 0; }
 
@@ -712,6 +749,7 @@ ELECTROBUN_EXPORT int32_t wgpuBufferReadbackStatusShim(void* jobPtr) { (void)job
 ELECTROBUN_EXPORT void    wgpuBufferReadbackFreeShim(void* jobPtr)   { (void)jobPtr; }
 
 ELECTROBUN_EXPORT void wgpuRunGPUTest(void* abstractView) { (void)abstractView; }
+ELECTROBUN_EXPORT void wgpuToggleGPUTestShader(void* abstractView) { (void)abstractView; }
 ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
     (void)instancePtr; (void)surfacePtr; (void)outAdapterDevice;
 }

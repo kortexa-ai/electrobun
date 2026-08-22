@@ -2660,6 +2660,9 @@ async function buildNative() {
 				const wpeLinkCmd = [
 					"g++",
 					"-std=c++20",
+					// Do not depend on the host Cottontail executable exporting GCC's
+					// out-of-line AArch64 atomic helpers.
+					...(ARCH === "arm64" ? ["-mno-outline-atomics"] : []),
 					// The compositor hot path (per-frame blit + rotation) lives
 					// here; -O0 measured 6.7ms/frame vs 2.0ms at -O2 on Pi 5.
 					"-O2",
