@@ -934,9 +934,13 @@ async function copyToDist() {
 			await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper_wpe.so`;
 
 			// Hutch packages the canonical wrapper name. On an embedded-only
-			// host, make the WPE wrapper available under that name too.
+			// host, make the WPE wrapper available under that name too. Schema 1
+			// also requires a CEF wrapper path even when this devkit cannot build
+			// GTK/CEF; use the same ABI-compatible wrapper so Hutch can validate
+			// the WPE-only devkit. Embedded projects keep bundleCEF disabled.
 			if (!hasGtkWrapper) {
 				await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper.so`;
+				await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper_cef.so`;
 			}
 		}
 
