@@ -1182,24 +1182,29 @@ private:
         // related-view is a WebKit construct property (no public C wrapper in
         // the WPE port — see g_object_class_find_property probe). Setting it
         // makes the new WebKitWebView reuse the related view's WPEWebProcess.
+        WebKitSettings* settings = webkit_settings_new();
+        webkit_settings_set_enable_developer_extras(settings, TRUE);
+        webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+        // Match the GTK backend's media capabilities. These settings must be
+        // present at WebView construction time; applying them afterwards is
+        // too late for WebKit to expose RTCPeerConnection to the page.
+        webkit_settings_set_enable_media_stream(settings, TRUE);
+        webkit_settings_set_enable_webrtc(settings, TRUE);
+        webkit_settings_set_enable_media(settings, TRUE);
         WebKitWebView* webView = nullptr;
         if (relatedView) {
             webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
                 "backend", webviewBackend,
                 "related-view", relatedView,
+                "settings", settings,
                 nullptr));
         } else {
-            webView = webkit_web_view_new(webviewBackend);
+            webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                "backend", webviewBackend,
+                "settings", settings,
+                nullptr));
         }
-        WebKitSettings* settings = webkit_web_view_get_settings(webView);
-        webkit_settings_set_enable_developer_extras(settings, TRUE);
-        webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
-        // Match the GTK backend's media capabilities. WPE WebKit ships these
-        // APIs disabled by preference, which otherwise removes
-        // RTCPeerConnection from the JavaScript global entirely.
-        webkit_settings_set_enable_media_stream(settings, TRUE);
-        webkit_settings_set_enable_webrtc(settings, TRUE);
-        webkit_settings_set_enable_media(settings, TRUE);
+        g_object_unref(settings);
 
         // Bridges: per-view user content manager → per-view callbacks. The
         // signal handlers cast user_data back to WpeWebViewImpl* so multi-
