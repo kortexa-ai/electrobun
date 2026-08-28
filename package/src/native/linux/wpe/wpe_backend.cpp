@@ -1192,6 +1192,7 @@ private:
             webView = webkit_web_view_new(webviewBackend);
         }
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
+        webkit_settings_set_enable_developer_extras(settings, TRUE);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
         // Match the GTK backend's media capabilities. WPE WebKit ships these
         // APIs disabled by preference, which otherwise removes
