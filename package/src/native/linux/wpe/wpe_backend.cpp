@@ -1191,6 +1191,10 @@ private:
         webkit_settings_set_enable_media_stream(settings, TRUE);
         webkit_settings_set_enable_webrtc(settings, TRUE);
         webkit_settings_set_enable_media(settings, TRUE);
+        // Embedded views have no browser chrome that can surface an autoplay
+        // prompt. Kiosk audio must therefore be allowed without a preceding
+        // user gesture, including after an unattended room reconnect.
+        webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
         WebKitWebView* webView = nullptr;
         if (relatedView) {
             webView = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
