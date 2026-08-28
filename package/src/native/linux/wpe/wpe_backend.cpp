@@ -1193,6 +1193,12 @@ private:
         }
         WebKitSettings* settings = webkit_web_view_get_settings(webView);
         webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+        // Match the GTK backend's media capabilities. WPE WebKit ships these
+        // APIs disabled by preference, which otherwise removes
+        // RTCPeerConnection from the JavaScript global entirely.
+        webkit_settings_set_enable_media_stream(settings, TRUE);
+        webkit_settings_set_enable_webrtc(settings, TRUE);
+        webkit_settings_set_enable_media(settings, TRUE);
 
         // Bridges: per-view user content manager → per-view callbacks. The
         // signal handlers cast user_data back to WpeWebViewImpl* so multi-
