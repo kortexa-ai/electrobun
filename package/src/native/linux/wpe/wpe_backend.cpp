@@ -552,6 +552,11 @@ public:
                 return TRUE;
             }
             lastNavigationWasBlocked_ = false;
+            auto* policies = webkit_website_policies_new_with_policies(
+                "autoplay", WEBKIT_AUTOPLAY_ALLOW, nullptr);
+            webkit_policy_decision_use_with_policies(decision, policies);
+            g_object_unref(policies);
+            return TRUE;
         }
         return FALSE;
     }
