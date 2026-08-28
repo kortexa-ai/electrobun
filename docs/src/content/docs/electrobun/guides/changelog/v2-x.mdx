@@ -17,9 +17,9 @@ large reconciliation of the 1.x issue and pull-request backlog.
   addition to the owned compatibility corpus.
 - Supports six main-process runtimes: Cottontail, Bun, Zig, Rust, Go, and Odin.
 
-Cottontail 0.2.3 is smaller than Bun 1.3.13 on every supported release target
-measured. These figures are extracted executable sizes, not compressed archive
-sizes.
+The original 2.0 size comparison used Cottontail 0.2.3 and Bun 1.3.13.
+Cottontail was smaller on every supported release target measured. These
+figures are extracted executable sizes, not compressed archive sizes.
 
 | Platform | Cottontail | Bun | Reduction |
 | --- | ---: | ---: | ---: |
@@ -30,22 +30,36 @@ sizes.
 
 ## Hutch build tooling
 
-- Hutch replaces Bun, npm, and the old project-vendored Electrobun CLI for
-  Electrobun project workflows.
-- Hutch installs packages, executes package binaries, runs lifecycle scripts,
-  bundles source, acquires pinned native toolchains, and creates signed release
-  artifacts.
-- Cottontail executes TypeScript and JavaScript lifecycle scripts while Hutch
-  owns build-time package management and orchestration.
+- Hutch replaces the old project-vendored Electrobun CLI for project scripts,
+  devkit synchronization, builds, native toolchains, and distribution.
+- Hutch's built-in npm-compatible resolver owns JavaScript dependencies and
+  `hutch.lock` by default. npm, pnpm, Yarn, or Bun may be selected explicitly;
+  Cargo and Go modules remain authoritative for their ecosystems.
+- `electrobun.version` is an optional exact override in `hutch.config.ts`.
+  Otherwise npm-launched commands use the package's paired release and direct
+  Hutch projects float on the release channel, remaining steady between
+  explicit syncs. Hutch verifies the resolved platform core archive in
+  `~/.hutch`, then copies its SDKs into the generated project `.hutch/devkit`
+  sysroot for builds and editor tooling.
 - Production and canary Hutch installations can coexist globally. Projects can
   pin Hutch and Cottontail independently with a first-line pragma.
 - `hutch electrobun init` now opens an interactive, keyboard-navigable template
   chooser followed by an editable project-name prompt. Template catalogs ship
   per Electrobun channel and are downloaded on demand instead of increasing the
   Hutch executable size.
-- `hutch x electrobun init`, `npx electrobun init`, and `bunx electrobun init`
-  converge on that same initializer. The npm entry point installs Hutch when it
-  is not already present rather than embedding another build CLI.
+- `npx electrobun init` and `bunx electrobun init` converge on that same
+  initializer. One dependency-free npm bootstrap shares the Electrobun release
+  version, downloads, verifies, and caches its paired Hutch archive from that
+  GitHub Release when needed, and forwards all arguments. It carries no
+  Electrobun core or SDK. Published templates pin the exact release they were
+  tested with; framework contributors run repository templates against the
+  freshly built local devkit.
+- Current Vite templates require Hutch 0.24 or later for catalog tool
+  checks and built-in `hutch pm exec`. A global Hutch 0.23 installation cannot
+  enforce that catalog declaration and must be advanced with its legacy
+  `hutch self update production` command before initializing a current template;
+  use `hutch upgrade` for later updates. The npm bootstrap supplies its paired
+  Hutch automatically.
 
 ## Cottontail runtime
 
@@ -54,7 +68,8 @@ sizes.
 - `electrobun/main` is the canonical, runtime-neutral main-process SDK
   namespace. `electrobun/bun` remains available as a deprecated alias.
 - Bun remains an explicit main-process option for applications that need to
-  retain the Bun runtime. Hutch still builds and packages those applications.
+  retain the Bun runtime. Electrobun 2.0 pins Bun 1.4.0 for those applications;
+  Hutch acquires and packages that exact runtime.
 
 ## Native main processes
 
@@ -125,7 +140,7 @@ Highlights from the 2.0 reconciliation include:
   archive extraction, launch dependency diagnostics, ABI checks, and an
   initial Flatpak output path.
 - Isolated Kitchen Sink matrix builds, remote release templates, R2-hosted
-  owned dependencies, and cross-platform production/canary packaging.
+  owned dependencies, and cross-platform stable/canary packaging.
 
 ## Platforms and channels
 
@@ -133,10 +148,8 @@ The release pipeline builds application bundles and distributable artifacts on
 macOS ARM64, Windows x64, Linux x64, and Linux ARM64. Apps can use the system
 webview or CEF on each supported operating system.
 
-Hutch's build environments are `dev`, `canary`, and `production`. `stable`
-remains supported as an alias for `production`; emitted metadata and artifacts
-use the canonical `production` name. Canary and production are independent
-release channels.
+Hutch's Electrobun build environments are `dev`, `canary`, and `stable`.
+Canary and stable are independent release channels.
 
 See [Migrate from Electrobun 1.x](/electrobun/guides/migrating-to-v2/) for the
 required project changes.

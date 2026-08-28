@@ -586,27 +586,37 @@ void userLogs;
 ```
 
 `userData`, `userCache`, and `userLogs` include the packaged app identifier and
-release channel (`<base>/<identifier>/<channel>`) — the same layout on every
-runtime. In a development run, malformed or missing package metadata can
-produce empty identifier/channel path components. The native SDKs resolve the
-same fields through their `Paths` type — see the tabbed examples on the
-[Paths page](/electrobun/apis/paths/).
+physical install-root name (`<base>/<identifier>/<install-root>`) — the same
+layout on every runtime. The install-root name normally matches the packaged
+release channel. An app updated from a supported Electrobun v1 release keeps
+its existing physical root; this preserves its data, browser profile, and
+update state in place. In a development run, malformed or missing package
+metadata can produce empty identifier/root path components. The native SDKs
+resolve the same fields through their `Paths` type — see the tabbed examples on
+the [Paths page](/electrobun/apis/paths/).
+
+For installer builds, these three app-scoped locations are the only user data
+included by Electrobun's `App and Data` uninstall action. It is limited to the
+current identifier and recorded physical install root; see
+[Uninstalling](/electrobun/guides/uninstalling/) for details and platform
+availability.
 
 ## Quitting
 
 ```ts
 import { Utils } from "electrobun/main";
 
-function finishShutdown() {
-  Utils.quit();
+function finishShutdown(exitCode = 0) {
+  Utils.quit(exitCode);
 }
 
 void finishShutdown;
 ```
 
-`quit()` emits the application `before-quit` event, honors a cancellation, and
-then performs native cleanup. Electrobun also routes `process.exit()` through
-that cleanup path while the native runtime is active.
+`quit(exitCode)` emits the application `before-quit` event, honors a
+cancellation, and then performs native cleanup before exiting with the requested
+status. The exit code defaults to `0`. Electrobun also routes `process.exit()`
+through that cleanup path while the native runtime is active.
 
 <Aside type="note">
 The `before-quit` emitter flow is TypeScript-only. Native SDKs shut down with

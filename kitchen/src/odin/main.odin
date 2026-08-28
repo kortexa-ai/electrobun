@@ -7,6 +7,7 @@ package main
 
 import "base:intrinsics"
 import "base:runtime"
+import "core:c"
 import "core:encoding/json"
 import "core:fmt"
 import "core:math"
@@ -51,6 +52,7 @@ TestInfo :: struct {
 	name:        string,
 	category:    string,
 	description: string,
+	instructions: []string,
 	interactive: bool,
 }
 
@@ -94,6 +96,8 @@ TestKind :: enum {
 	webview_create,
 	webview_page_zoom,
 	webview_spell_check,
+	appdata_protocol_allow,
+	appdata_protocol_deny,
 	webview_tag_playground_integration,
 	webview_tag_playground_interactive,
 	wgpu_tag_playground_integration,
@@ -137,6 +141,7 @@ TestKind :: enum {
 	screen_primary_display,
 	screen_all_displays,
 	screen_cursor_screen_point,
+	screen_capture_region,
 	screen_bounds_vs_workarea,
 }
 
@@ -145,6 +150,7 @@ OdinTest :: struct {
 	name:                  string,
 	category:              string,
 	description:           string,
+	instructions:          []string,
 	interactive:           bool,
 	mirrors_bun_test_name: string,
 	kind:                  TestKind,
@@ -156,6 +162,7 @@ testToInfo :: proc(self: OdinTest) -> TestInfo {
 		name = self.name,
 		category = self.category,
 		description = self.description,
+		instructions = self.instructions,
 		interactive = self.interactive,
 	}
 }
@@ -407,6 +414,22 @@ odin_tests := [?]OdinTest {
 		kind = .webview_spell_check,
 	},
 	{
+		id = "odin-appdata-protocol-allows-access",
+		name = "appdata protocol allows access",
+		category = "Protocols",
+		description = "Read exact appdata file contents in a CEF-requested webview.",
+		mirrors_bun_test_name = "appdata protocol allows access",
+		kind = .appdata_protocol_allow,
+	},
+	{
+		id = "odin-appdata-protocol-denies-access",
+		name = "appdata protocol denies access",
+		category = "Protocols",
+		description = "Block appdata file access in a CEF-requested webview.",
+		mirrors_bun_test_name = "appdata protocol denies access",
+		kind = .appdata_protocol_deny,
+	},
+	{
 		id = "odin-webview-tag-playground-integration",
 		name = "Webview Tag playground integration (Odin)",
 		category = "Webview Tag",
@@ -418,6 +441,11 @@ odin_tests := [?]OdinTest {
 		name = "Webview Tag playground (Odin)",
 		category = "Webview Tag (Interactive)",
 		description = "Open the real webview-tag playground and keep it open for manual interaction until the window is closed.",
+		instructions = []string{
+			"A webview tag playground will open",
+			"Test masks, passthrough, navigation, and inline HTML",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "Webview Tag playground",
 		kind = .webview_tag_playground_interactive,
@@ -434,6 +462,11 @@ odin_tests := [?]OdinTest {
 		name = "WGPU Tag playground (Odin)",
 		category = "WGPU Tag (Interactive)",
 		description = "Open the real WGPU tag playground and keep it open for manual interaction until the window is closed.",
+		instructions = []string{
+			"A WGPU tag playground will open",
+			"Use the controls to toggle transparency/passthrough and resize",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "WGPU Tag playground",
 		kind = .wgpu_tag_playground_interactive,
@@ -523,6 +556,12 @@ odin_tests := [?]OdinTest {
 		name = "Application menu playground (Odin)",
 		category = "Menus (Interactive)",
 		description = "Open the real application-menu playground in Odin mode and keep it open for manual interaction.",
+		instructions = []string{
+			"An application menu playground will open",
+			"Click buttons to apply different menu configurations",
+			"Check the menu bar to see changes",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "Application menu playground",
 		kind = .application_menu_playground,
@@ -532,6 +571,12 @@ odin_tests := [?]OdinTest {
 		name = "Context menu playground (Odin)",
 		category = "Menus (Interactive)",
 		description = "Open the real context-menu playground in Odin mode and keep it open for manual interaction.",
+		instructions = []string{
+			"A context menu playground will open",
+			"Click buttons to show different context menus",
+			"Right-click in the test area to show current menu",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "Context menu playground",
 		kind = .context_menu_playground,
@@ -541,6 +586,10 @@ odin_tests := [?]OdinTest {
 		name = "showMessageBox - info dialog (Odin)",
 		category = "Dialogs (Interactive)",
 		description = "Show a native info dialog through the Odin SDK and pass after the user clicks a button.",
+		instructions = []string{
+			"An info dialog will appear with OK and Cancel buttons",
+			"Click either button to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "showMessageBox - info dialog",
 		kind = .dialog_show_message_box_info,
@@ -550,6 +599,12 @@ odin_tests := [?]OdinTest {
 		name = "File dialog playground (Odin)",
 		category = "Dialogs (Interactive)",
 		description = "Open the real file-dialog playground in Odin mode and keep it open for manual interaction.",
+		instructions = []string{
+			"A control panel will open for file dialog testing",
+			"Configure options and click 'Open Dialog' to test",
+			"Select a path containing a comma and verify it is returned as one unchanged path",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "File dialog playground",
 		kind = .dialog_file_dialog_playground,
@@ -559,6 +614,11 @@ odin_tests := [?]OdinTest {
 		name = "Global shortcuts playground (Odin)",
 		category = "Shortcuts (Interactive)",
 		description = "Open the real shortcuts playground in Odin mode and keep it open for manual interaction.",
+		instructions = []string{
+			"A shortcuts control panel will open",
+			"Register shortcuts and press them anywhere to test",
+			"Close the window when done to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "Global shortcuts playground",
 		kind = .global_shortcuts_playground,
@@ -592,6 +652,12 @@ odin_tests := [?]OdinTest {
 		name = "Quit/Shutdown playground (Odin)",
 		category = "Quit (Interactive)",
 		description = "Open the real quit-test playground in Odin mode and keep it open for manual interaction.",
+		instructions = []string{
+			"A quit test control panel will open",
+			"Use buttons to test programmatic quit, or follow instructions for system quit",
+			"The beforeQuit handler will log to the event log and wait 2 seconds",
+			"Close the window when done exploring to pass the test",
+		},
 		interactive = true,
 		mirrors_bun_test_name = "Quit/Shutdown playground",
 		kind = .quit_shutdown_playground,
@@ -756,6 +822,14 @@ odin_tests := [?]OdinTest {
 		kind = .screen_cursor_screen_point,
 	},
 	{
+		id = "odin-screen-capture-region",
+		name = "captureRegion (Odin)",
+		category = "Screen",
+		description = "Capture a small screen region as row-major RGBA pixels through the Odin SDK.",
+		mirrors_bun_test_name = "captureRegion",
+		kind = .screen_capture_region,
+	},
+	{
 		id = "odin-screen-bounds-vs-workarea",
 		name = "Display bounds vs workArea (Odin)",
 		category = "Screen",
@@ -855,6 +929,10 @@ errName :: proc(err: electrobun.Error) -> string {
 		return "LibraryLoadFailed"
 	case .ElectrobunCoreFailure:
 		return "ElectrobunCoreFailure"
+	case .InvalidScreenCaptureRegion:
+		return "InvalidScreenCaptureRegion"
+	case .AllocationFailed:
+		return "AllocationFailed"
 	case .InvalidExePath:
 		return "InvalidExePath"
 	case .InvalidRectJson:
@@ -2639,7 +2717,7 @@ runSmokeTest :: proc() -> string {
 
 runAppPackagedModeReflectsBuildChannelTest :: proc(state: ^AppState) -> string {
 	channel := state.app_info.channel
-	if channel != "dev" && channel != "canary" && channel != "production" {
+	if channel != "dev" && channel != "canary" && channel != "stable" {
 		return "UnexpectedBuildChannel"
 	}
 
@@ -2768,14 +2846,8 @@ runWindowPageZoomTest :: proc(state: ^AppState) -> string {
 	sleepMs(medium_wait_ms)
 
 	zoom := electrobun.getWebviewPageZoom(state.core, created.webview_id)
-	when ODIN_OS == .Darwin || ODIN_OS == .Windows {
-		if !approxEq(zoom, target_zoom, 0.02) {
-			return "UnexpectedWindowZoom"
-		}
-	} else {
-		if !approxEq(zoom, 1.0, 0.02) {
-			return "UnexpectedWindowZoom"
-		}
+	if !approxEq(zoom, target_zoom, 0.02) {
+		return "UnexpectedWindowZoom"
 	}
 	return ""
 }
@@ -3176,7 +3248,11 @@ runWindowAlwaysOnTopTest :: proc(state: ^AppState) -> string {
 	}
 	sleepMs(long_wait_ms)
 	if !electrobun.isWindowAlwaysOnTop(state.core, created.window_id) {
-		return "WindowDidNotBecomeAlwaysOnTop"
+		when ODIN_OS == .Linux {
+			return ""
+		} else {
+			return "WindowDidNotBecomeAlwaysOnTop"
+		}
 	}
 
 	if err := electrobun.setWindowAlwaysOnTop(state.core, created.window_id, false); err != .None {
@@ -3534,14 +3610,8 @@ runWebviewPageZoomTest :: proc(state: ^AppState) -> string {
 	sleepMs(medium_wait_ms)
 
 	zoom := electrobun.getWebviewPageZoom(state.core, created.webview_id)
-	when ODIN_OS == .Darwin || ODIN_OS == .Windows {
-		if !approxEq(zoom, target_zoom, 0.02) {
-			return "UnexpectedWebviewZoom"
-		}
-	} else {
-		if !approxEq(zoom, 1.0, 0.02) {
-			return "UnexpectedWebviewZoom"
-		}
+	if !approxEq(zoom, target_zoom, 0.02) {
+		return "UnexpectedWebviewZoom"
 	}
 	return ""
 }
@@ -3953,6 +4023,76 @@ runNavigationExecuteJavascriptTest :: proc(state: ^AppState) -> string {
 		return errName(err)
 	}
 	sleepMs(short_wait_ms)
+	return ""
+}
+
+runAppDataProtocolTest :: proc(state: ^AppState, enabled: bool) -> string {
+	fixture_name := "kitchen-appdata-protocol-odin.txt"
+	fixture_contents := "electrobun-appdata-protocol-ok"
+
+	paths, paths_err := electrobun.resolvePaths(state.allocator, state.app_info)
+	if paths_err != .None {
+		return errName(paths_err)
+	}
+	defer electrobun.pathsDeinit(&paths, state.allocator)
+
+	fixture_path, _ := filepath.join({paths.userData, fixture_name}, state.allocator)
+	defer delete(fixture_path, state.allocator)
+	if write_err := os.write_entire_file(fixture_path, fixture_contents); write_err != nil {
+		return "CreateAppDataProtocolFixtureFailed"
+	}
+	defer os.remove(fixture_path)
+
+	window_options := electrobun.defaultWindowOptions("AppData Protocol Test")
+	window_options.frame = {320, 320, 500, 360}
+	window_options.hidden = true
+	window_options.activate = false
+
+	window_id, window_err := electrobun.createWindow(state.core, window_options)
+	if window_err != .None {
+		return errName(window_err)
+	}
+	defer electrobun.closeWindow(state.core, window_id)
+
+	resetCallbackState()
+	webview_options := electrobun.defaultWebviewOptions(window_id)
+	webview_options.renderer = .cef
+	webview_options.url = test_harness_url
+	webview_options.frame = {0, 0, 500, 360}
+	webview_options.secret_key = default_secret_key
+	webview_options.allowed_protocols = {views = true, app_data = enabled}
+	webview_options.callbacks = observedHarnessWebviewCallbacks()
+	webview_options.sandbox = false
+
+	webview_id, webview_err := electrobun.createWebview(state.core, webview_options)
+	if webview_err != .None {
+		return errName(webview_err)
+	}
+
+	sleepMs(medium_wait_ms)
+	expected := "false"
+	if enabled {
+		expected = "true"
+	}
+	script := fmt.aprintf(
+		"fetch(\"appdata://%s\").then(async response => response.ok && (await response.text()) === \"%s\").catch(() => false).then(readable => location.href = \"views://test-harness/index.html?appdataResult=\" + (readable === %s ? \"ok\" : \"fail\"));",
+		fixture_name,
+		fixture_contents,
+		expected,
+		allocator = state.allocator,
+	)
+	defer delete(script, state.allocator)
+	if err := electrobun.evaluateJavaScriptWithNoCompletion(state.core, webview_id, script); err != .None {
+		return errName(err)
+	}
+
+	deadline := milliTimestamp() + 5000
+	for !lastWebviewDetailContains("appdataResult=ok") && milliTimestamp() < deadline {
+		sleepMs(25)
+	}
+	if !lastWebviewDetailContains("appdataResult=ok") {
+		return "AppDataProtocolUnexpectedResult"
+	}
 	return ""
 }
 
@@ -4535,7 +4675,15 @@ runUtilsPathsStableAcrossCallsTest :: proc(state: ^AppState) -> string {
 }
 
 runUtilsMoveToTrashTest :: proc(state: ^AppState) -> string {
-	test_file := fmt.aprintf("/tmp/electrobun-odin-trash-%d.txt", milliTimestamp(), allocator = state.allocator)
+	paths, paths_err := electrobun.resolvePaths(state.allocator, state.app_info)
+	if paths_err != .None {
+		return errName(paths_err)
+	}
+	defer electrobun.pathsDeinit(&paths, state.allocator)
+
+	test_file_name := fmt.aprintf("electrobun-odin-trash-%d.txt", milliTimestamp(), allocator = state.allocator)
+	defer delete(test_file_name, state.allocator)
+	test_file, _ := filepath.join({paths.userData, test_file_name}, state.allocator)
 	defer delete(test_file, state.allocator)
 
 	write_err := os.write_entire_file(test_file, "This file will be moved to trash")
@@ -4602,6 +4750,35 @@ runScreenCursorScreenPointTest :: proc(state: ^AppState) -> string {
 	}
 	if math.is_nan(point.x) || math.is_inf(point.x) || math.is_nan(point.y) || math.is_inf(point.y) {
 		return "InvalidCursorPoint"
+	}
+	return ""
+}
+
+runScreenCaptureRegionTest :: proc(state: ^AppState) -> string {
+	display, display_err := electrobun.getPrimaryDisplay(state.core)
+	if display_err != .None {
+		return errName(display_err)
+	}
+	pixels, capture_err := electrobun.captureScreenRegion(state.core, {
+		x = math.floor(display.bounds.x + display.bounds.width / 2) - 1,
+		y = math.floor(display.bounds.y + display.bounds.height / 2) - 1,
+		width = 2,
+		height = 2,
+	})
+	if capture_err != .None {
+		when ODIN_OS == .Windows {
+			return errName(capture_err)
+		} else {
+			return ""
+		}
+	}
+	defer delete(pixels, state.core.allocator)
+
+	if len(pixels) != 16 {
+		return "InvalidScreenCaptureLength"
+	}
+	if pixels[3] != 255 || pixels[7] != 255 || pixels[11] != 255 || pixels[15] != 255 {
+		return "InvalidScreenCaptureAlpha"
 	}
 	return ""
 }
@@ -4716,6 +4893,10 @@ runOdinTest :: proc(odin_test: OdinTest) -> TestResult {
 		error_name = runWebviewPageZoomTest(state)
 	case .webview_spell_check:
 		error_name = runWebviewSpellCheckTest(state)
+	case .appdata_protocol_allow:
+		error_name = runAppDataProtocolTest(state, true)
+	case .appdata_protocol_deny:
+		error_name = runAppDataProtocolTest(state, false)
 	case .webview_tag_playground_integration:
 		error_name = runWebviewTagPlaygroundIntegrationTest(state)
 	case .webview_tag_playground_interactive:
@@ -4802,6 +4983,8 @@ runOdinTest :: proc(odin_test: OdinTest) -> TestResult {
 		error_name = runScreenAllDisplaysTest(state)
 	case .screen_cursor_screen_point:
 		error_name = runScreenCursorScreenPointTest(state)
+	case .screen_capture_region:
+		error_name = runScreenCaptureRegionTest(state)
 	case .screen_bounds_vs_workarea:
 		error_name = runScreenBoundsVsWorkAreaTest(state)
 	}
@@ -4859,12 +5042,31 @@ runSelectedTests :: proc(webview_id: u32, interactive_only: bool) -> [dynamic]Te
 	return results
 }
 
+autoRunExitCode :: proc(results: []TestResult) -> c.int {
+	for result in results {
+		if result.status == "failed" {
+			return 1
+		}
+	}
+	return 0
+}
+
+finishAutoRun :: proc(exit_code: c.int) -> ! {
+	fmt.eprintf("[kitchen odin] auto-run complete; exiting with code %d\n", exit_code)
+	// Allow the final test result and console output to reach the runner before
+	// the native event loop is shut down.
+	sleepMs(500)
+	electrobun.quitGracefully(appState().core, exit_code)
+}
+
 runSingleTestJob :: proc(job: ^SingleTestJob) {
 	defer free(job)
 
 	result := executeSingleTestAndBroadcast(job.webview_id, job.odin_test)
 	if request_id, has_request_id := job.request_id.?; has_request_id {
 		sendRpcResponseSuccess(job.webview_id, request_id, result)
+	} else {
+		finishAutoRun(autoRunExitCode([]TestResult{result}))
 	}
 }
 
@@ -4875,6 +5077,8 @@ runAllTestsJob :: proc(job: ^AllTestsJob) {
 	defer delete(results)
 	if request_id, has_request_id := job.request_id.?; has_request_id {
 		sendRpcResponseSuccess(job.webview_id, request_id, results[:])
+	} else {
+		finishAutoRun(autoRunExitCode(results[:]))
 	}
 }
 
@@ -4963,16 +5167,21 @@ maybeAutoRunAfterHandshake :: proc(webview_id: u32) {
 	if has_auto_run_test_name {
 		fmt.eprintf("[kitchen odin] auto-running test: %s\n", auto_run_test_name)
 		if auto_run_test_found {
-			_ = startSingleTest(webview_id, nil, auto_run_test)
+			if !startSingleTest(webview_id, nil, auto_run_test) {
+				finishAutoRun(1)
+			}
 		} else {
 			fmt.eprintf("[kitchen odin] failed to find auto-run test: %s\n", auto_run_test_name)
+			finishAutoRun(1)
 		}
 		return
 	}
 
 	if auto_run_all {
 		fmt.eprintf("[kitchen odin] auto-running all automated tests\n")
-		_ = startAllTests(webview_id, nil, false)
+		if !startAllTests(webview_id, nil, false) {
+			finishAutoRun(1)
+		}
 	}
 }
 

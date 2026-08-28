@@ -8,6 +8,7 @@
 # launcher/main.zig on every Pi build.
 **/*.o
 node_modules
+**/.hutch/
 build
 /package/vendors
 /package/src/extractor/.zig-cache

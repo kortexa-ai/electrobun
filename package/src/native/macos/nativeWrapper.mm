@@ -9,6 +9,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
@@ -56,6 +57,8 @@ static bool wgpuDebugEnabled() {
 #include <string>
 #include <vector>
 #include <list>
+#include <limits>
+#include <cmath>
 #include <cstdint>
 #include <chrono>
 #include <map>
@@ -728,6 +731,59 @@ static NSString* normalizeViewsRelativePath(NSString *urlString) {
     return [NSString stringWithUTF8String:relativePath.c_str()];
 }
 
+static NSString* normalizeAppDataRelativePath(NSString *urlString) {
+    if (!urlString || ![urlString hasPrefix:@"appdata://"]) {
+        return nil;
+    }
+
+    NSString *asViewsURL = [@"views://" stringByAppendingString:[urlString substringFromIndex:10]];
+    return normalizeViewsRelativePath(asViewsURL);
+}
+
+static NSString* canonicalContainedPath(NSString *root, NSString *relativePath) {
+    if (!root || !relativePath) return nil;
+
+    NSString *canonicalRoot = [[root stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    NSString *candidate = [[[root stringByAppendingPathComponent:relativePath]
+        stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    NSString *rootPrefix = [canonicalRoot stringByAppendingString:@"/"];
+    if (![candidate hasPrefix:rootPrefix]) {
+        return nil;
+    }
+    return candidate;
+}
+
+static NSString* appDataRootPath(void) {
+    NSString *appSupportPath = [NSSearchPathForDirectoriesInDomains(
+        NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+    if (!appSupportPath) return nil;
+
+    std::string root = electrobun::buildAppDataPath(
+        [appSupportPath UTF8String],
+        g_electrobunIdentifier,
+        g_electrobunChannel);
+    NSString *rootPath = [NSString stringWithUTF8String:root.c_str()];
+    [[NSFileManager defaultManager] createDirectoryAtPath:rootPath
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    return rootPath;
+}
+
+static NSData* readAppDataFile(const char* appDataUrl) {
+    if (!appDataUrl) return nil;
+    NSString *urlString = [NSString stringWithUTF8String:appDataUrl];
+    NSString *relativePath = normalizeAppDataRelativePath(urlString);
+    NSString *candidate = canonicalContainedPath(appDataRootPath(), relativePath);
+    if (!candidate) return nil;
+
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:candidate isDirectory:&isDirectory] || isDirectory) {
+        return nil;
+    }
+    return [NSData dataWithContentsOfFile:candidate];
+}
+
 NSData* readViewsFile(const char* viewsUrl) {
     if (!viewsUrl) return nil;
 
@@ -793,16 +849,8 @@ NSData* readViewsFileWithRoot(const char* viewsUrl, NSString *viewsRoot) {
         return nil;
     }
 
-    NSString *normalizedRoot = [viewsRoot stringByStandardizingPath];
-    NSString *candidatePath =
-        [[viewsRoot stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
-
-    if (![candidatePath isEqualToString:normalizedRoot] &&
-        ![candidatePath hasPrefix:[normalizedRoot stringByAppendingString:@"/"]]) {
-        NSLog(@"ERROR readViewsFileWithRoot: path escapes root %@ -> %@", normalizedRoot, candidatePath);
-        return nil;
-    }
-
+    NSString *candidatePath = canonicalContainedPath(viewsRoot, relativePath);
+    if (!candidatePath) return nil;
     return [NSData dataWithContentsOfFile:candidatePath];
 }
 
@@ -929,6 +977,8 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews = ni
 @interface MyURLSchemeHandler : NSObject <WKURLSchemeHandler>    
     @property (nonatomic, assign) uint32_t webviewId;
     @property (nonatomic, copy) NSString *viewsRoot;
+    @property (nonatomic, assign) BOOL allowViews;
+    @property (nonatomic, assign) BOOL allowAppData;
 @end
 
 @interface MyNavigationDelegate : NSObject <WKNavigationDelegate, WKDownloadDelegate>
@@ -980,7 +1030,9 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews = ni
                 customPreloadScript:(const char *)customPreloadScript
                 viewsRoot:(const char *)viewsRoot
                 transparent:(bool)transparent
-                sandbox:(bool)sandbox;
+                sandbox:(bool)sandbox
+                allowViewsProtocol:(bool)allowViewsProtocol
+                allowAppDataProtocol:(bool)allowAppDataProtocol;
 @end
 
 @interface WGPUViewImpl : AbstractView
@@ -2066,7 +2118,7 @@ static void schedulePendingResizeDrain() {
         
         NSString *urlString = url.absoluteString;
         
-        if ([urlString hasPrefix:@"views://"]) {
+        if ([urlString hasPrefix:@"views://"] && self.allowViews) {
             NSString *relativePath = normalizeViewsRelativePath(urlString);
 
             if ([relativePath isEqualToString:@"internal/index.html"]) {
@@ -2096,6 +2148,12 @@ static void schedulePendingResizeDrain() {
                     contentLength = data.length;
                 }
             } 
+        } else if ([urlString hasPrefix:@"appdata://"] && self.allowAppData) {
+            data = readAppDataFile(urlString.UTF8String);
+            if (data) {
+                contentPtr = (const char *)data.bytes;
+                contentLength = data.length;
+            }
         } else {
             NSLog(@"Unknown URL format: %@", urlString);
         }
@@ -2118,10 +2176,13 @@ static void schedulePendingResizeDrain() {
                 mimeType = rawMimeType;
             }
             
-            NSURLResponse *response = [[NSURLResponse alloc] initWithURL:url
-                                                    MIMEType:mimeType
-                                        expectedContentLength:contentLength
-                                            textEncodingName:encodingName];
+            NSDictionary *headers = @{
+                @"Content-Type": mimeType,
+                @"Access-Control-Allow-Origin": @"*",
+                @"X-Content-Type-Options": @"nosniff",
+            };
+            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+                initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:headers];
             [urlSchemeTask didReceiveResponse:response];
             [urlSchemeTask didReceiveData:data];
             [urlSchemeTask didFinish];
@@ -2131,8 +2192,8 @@ static void schedulePendingResizeDrain() {
                 free((void*)mimeTypePtr);
             }
         } else {
-            NSLog(@"============== ERROR ========== empty response for URL: %@", urlString);         
-            // Notify failure properly to prevent crashes
+            // Missing and rejected paths are normal URL failures. In particular,
+            // traversal tests intentionally reach this branch.
             NSError *error = [NSError errorWithDomain:@"MyURLSchemeHandler" 
                                                  code:404 
                                              userInfo:@{NSLocalizedDescriptionKey: @"Resource not found"}];
@@ -2594,6 +2655,8 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 viewsRoot:(const char *)viewsRoot
                 transparent:(bool)transparent
                 sandbox:(bool)sandbox
+                allowViewsProtocol:(bool)allowViewsProtocol
+                allowAppDataProtocol:(bool)allowAppDataProtocol
     {
         self = [super init];
         if (self) {
@@ -2622,7 +2685,10 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 // TODO: Consider storing views handler globally and not on each AbstractView                
                 assetSchemeHandler.webviewId = webviewId;
                 assetSchemeHandler.viewsRoot = viewsRootString;
+                assetSchemeHandler.allowViews = allowViewsProtocol;
+                assetSchemeHandler.allowAppData = allowAppDataProtocol;
                 [configuration setURLSchemeHandler:assetSchemeHandler forURLScheme:@"views"];
+                [configuration setURLSchemeHandler:assetSchemeHandler forURLScheme:@"appdata"];
                 
                 // create WKWebView
                 self.webView = [[WKWebView alloc] initWithFrame:frame configuration:configuration];
@@ -4047,6 +4113,13 @@ static bool ensureWgpuTestSymbols() {
     return true;
 }
 
+extern "C" void wgpuSurfaceCapabilitiesFreeMembersShim(void* capabilitiesPtr) {
+    if (!capabilitiesPtr || !ensureWgpuTestSymbols()) return;
+    WGPUSurfaceCapabilities* capabilities = (WGPUSurfaceCapabilities*)capabilitiesPtr;
+    p_wgpuSurfaceCapabilitiesFreeMembers(*capabilities);
+    *capabilities = {};
+}
+
 extern "C" void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
     if (!ensureWgpuTestSymbols()) return;
     runOnMainThreadSyncVoid(^{
@@ -4715,7 +4788,7 @@ public:
         
     }
     void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override {
-        command_line->AppendSwitchWithValue("custom-scheme", "views");
+        command_line->AppendSwitchWithValue("custom-scheme", "views,appdata");
 
         // macOS default flags — can be overridden via chromiumFlags in config
         static const std::vector<electrobun::DefaultFlag> defaults = {
@@ -4736,6 +4809,11 @@ public:
             CEF_SCHEME_OPTION_CORS_ENABLED |
             CEF_SCHEME_OPTION_SECURE | // treat it like https
             CEF_SCHEME_OPTION_CSP_BYPASSING | // allow things like crypto.subtle
+            CEF_SCHEME_OPTION_FETCH_ENABLED);
+        registrar->AddCustomScheme("appdata",
+            CEF_SCHEME_OPTION_STANDARD |
+            CEF_SCHEME_OPTION_CORS_ENABLED |
+            CEF_SCHEME_OPTION_SECURE |
             CEF_SCHEME_OPTION_FETCH_ENABLED);
             
     }
@@ -6099,7 +6177,9 @@ void RemoteDevToolsClosed(void* ctx, int target_id) {
                 customPreloadScript:(const char *)customPreloadScript
                 viewsRoot:(const char *)viewsRoot
                 transparent:(bool)transparent
-                sandbox:(bool)sandbox;
+                sandbox:(bool)sandbox
+                allowViewsProtocol:(bool)allowViewsProtocol
+                allowAppDataProtocol:(bool)allowAppDataProtocol;
 
 @end
 
@@ -6253,6 +6333,21 @@ bool initializeCEF() {
 }
 
 
+struct WebviewAllowedProtocols {
+    bool views;
+    bool appData;
+};
+static std::map<uint32_t, WebviewAllowedProtocols> webviewAllowedProtocols;
+static std::mutex webviewAllowedProtocolsMutex;
+
+static WebviewAllowedProtocols getWebviewAllowedProtocols(uint32_t webviewId) {
+    std::lock_guard<std::mutex> lock(webviewAllowedProtocolsMutex);
+    auto it = webviewAllowedProtocols.find(webviewId);
+    return it == webviewAllowedProtocols.end()
+        ? WebviewAllowedProtocols{true, false}
+        : it->second;
+}
+
 // The main scheme handler class
 class ElectrobunSchemeHandler : public CefResourceHandler {
 public:
@@ -6276,8 +6371,8 @@ public:
             hasResponse_ = false;
             offset_ = 0;
             
-            // If the URL starts with "views://"
-            if (urlStr.find("views://") == 0) {
+            WebviewAllowedProtocols allowed = getWebviewAllowedProtocols(webviewId_);
+            if (urlStr.find("views://") == 0 && allowed.views) {
                 NSLog(@"DEBUG CEF: Processing views:// URL: %s", urlStr.c_str());
                 NSString *normalizedPath = normalizeViewsRelativePath([NSString stringWithUTF8String:urlStr.c_str()]);
                 std::string relativePath = normalizedPath ? std::string([normalizedPath UTF8String]) : std::string();
@@ -6332,8 +6427,17 @@ public:
                         NSLog(@"DEBUG CEF: Failed to read views file: %s", urlStr.c_str());
                     }
                 }
-            }
-            else {
+            } else if (urlStr.find("appdata://") == 0 && allowed.appData) {
+                NSString *normalizedPath = normalizeAppDataRelativePath(
+                    [NSString stringWithUTF8String:urlStr.c_str()]);
+                NSData *data = normalizedPath ? readAppDataFile(urlStr.c_str()) : nil;
+                if (data) {
+                    mimeTypeBlock = getMimeTypeFromUrl(std::string([normalizedPath UTF8String]));
+                    responseDataBlock.assign((const char*)data.bytes,
+                                             (const char*)data.bytes + data.length);
+                    hasResponseBlock = true;
+                }
+            } else {
                 NSLog(@"Unknown URL format: %s", urlStr.c_str());
             }
         });
@@ -6408,6 +6512,10 @@ static void removeBrowserMappingsForWebview(uint32_t webviewId) {
         } else {
             ++it;
         }
+    }
+    {
+        std::lock_guard<std::mutex> permissionsLock(webviewAllowedProtocolsMutex);
+        webviewAllowedProtocols.erase(webviewId);
     }
 }
 
@@ -6509,11 +6617,17 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
             viewsRoot:(const char *)viewsRoot
             transparent:(bool)transparent
             sandbox:(bool)sandbox
+            allowViewsProtocol:(bool)allowViewsProtocol
+            allowAppDataProtocol:(bool)allowAppDataProtocol
     {
         self = [super init];
         if (self) {
             self.webviewId = webviewId;
             self.isSandboxed = sandbox;
+            {
+                std::lock_guard<std::mutex> lock(webviewAllowedProtocolsMutex);
+                webviewAllowedProtocols[webviewId] = {allowViewsProtocol, allowAppDataProtocol};
+            }
             BOOL windowWasVisible = [window isVisible];
 
             if (autoResize) {
@@ -7288,6 +7402,11 @@ static struct {
     bool startPassthrough;
 } g_nextWebviewFlags = {false, false};
 
+static struct {
+    bool views;
+    bool appData;
+} g_nextWebviewAllowedProtocols = {true, false};
+
 extern "C" void setNextWebviewFlags(bool startTransparent, bool startPassthrough) {
     g_nextWebviewFlags.startTransparent = startTransparent;
     g_nextWebviewFlags.startPassthrough = startPassthrough;
@@ -7301,6 +7420,11 @@ extern "C" void setNextWebviewTrust(const char* /*trust*/) {}
 // places NSWindows; the inner WKWebView fills its window, so the parent
 // BrowserWindow's frame x/y is a no-op here.
 extern "C" void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
+
+extern "C" void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
+    g_nextWebviewAllowedProtocols.views = allowViews;
+    g_nextWebviewAllowedProtocols.appData = allowAppData;
+}
 
 extern "C" AbstractView* initWebview(uint32_t webviewId,
                         NSWindow *window,
@@ -7325,6 +7449,9 @@ extern "C" AbstractView* initWebview(uint32_t webviewId,
     bool startTransparent = g_nextWebviewFlags.startTransparent;
     bool startPassthrough = g_nextWebviewFlags.startPassthrough;
     g_nextWebviewFlags = {false, false};
+    bool allowViewsProtocol = g_nextWebviewAllowedProtocols.views;
+    bool allowAppDataProtocol = g_nextWebviewAllowedProtocols.appData;
+    g_nextWebviewAllowedProtocols = {true, false};
 
     // Validate frame values - use defaults if NaN or invalid
     if (isnan(x) || isinf(x)) {
@@ -7366,7 +7493,9 @@ extern "C" AbstractView* initWebview(uint32_t webviewId,
                                                customPreloadScript:strdup(customPreloadScript)
                                                            viewsRoot:strdup(viewsRoot)
                                                         transparent:transparent
-                                                            sandbox:sandbox];
+                                                            sandbox:sandbox
+                                                 allowViewsProtocol:allowViewsProtocol
+                                               allowAppDataProtocol:allowAppDataProtocol];
 
         // Store initial state flags — applied later in each impl's deferred creation block
         // (nsView is nil at this point because view creation is async)
@@ -9256,6 +9385,8 @@ extern "C" const char* getPrimaryDisplay(void) {
 
 // Get current cursor position as JSON: {"x": 123, "y": 456}
 extern "C" const char* getCursorScreenPoint(void) {
+    static thread_local std::string resultStorage;
+
     @autoreleasepool {
         NSPoint mouseLocation = [NSEvent mouseLocation];
 
@@ -9271,11 +9402,123 @@ extern "C" const char* getCursorScreenPoint(void) {
         NSError *error = nil;
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:point options:0 error:&error];
         if (error) {
-            return strdup("{\"x\":0,\"y\":0}");
+            resultStorage = "{\"x\":0,\"y\":0}";
+        } else {
+            NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            const char *jsonCString = [jsonString UTF8String];
+            resultStorage = jsonCString ? jsonCString : "{\"x\":0,\"y\":0}";
+        }
+    }
+
+    return resultStorage.c_str();
+}
+
+// Capture a logical-point screen region as tightly packed, top-to-bottom RGBA.
+//
+// Screen's public coordinates use the same top-left global coordinate space as
+// CoreGraphics' window-server APIs (getCursorScreenPoint performs the Cocoa
+// bottom-left -> CoreGraphics top-left conversion above). Nominal resolution is
+// intentional: unlike a best-resolution capture, it produces one pixel for
+// each requested logical screen point even on Retina displays and across a
+// mixed-scale multi-display desktop.
+extern "C" bool captureScreenRegion(double x, double y, uint32_t width, uint32_t height,
+                                     uint8_t* out_rgba, uint64_t out_len) {
+    if (!out_rgba || width == 0 || height == 0 ||
+        !std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
+
+    const uint64_t width64 = (uint64_t)width;
+    const uint64_t height64 = (uint64_t)height;
+    const uint64_t maxLength = std::numeric_limits<uint64_t>::max();
+    if (height64 > maxLength / width64 ||
+        width64 * height64 > maxLength / 4) {
+        return false;
+    }
+
+    const uint64_t expectedLength = width64 * height64 * 4;
+    if (out_len != expectedLength) {
+        return false;
+    }
+
+    const double maxX = x + (double)width;
+    const double maxY = y + (double)height;
+    if (!std::isfinite(maxX) || !std::isfinite(maxY)) {
+        return false;
+    }
+
+    // Do not return a misleading wallpaper-only/blank capture when TCC has
+    // denied Screen Recording access.
+    if (!CGPreflightScreenCaptureAccess()) {
+        return false;
+    }
+
+    @autoreleasepool {
+        const CGRect screenBounds = CGRectMake((CGFloat)x, (CGFloat)y,
+                                               (CGFloat)width, (CGFloat)height);
+        const CGWindowImageOption imageOptions = (CGWindowImageOption)(
+            kCGWindowImageNominalResolution | kCGWindowImageShouldBeOpaque);
+        CGImageRef image = CGWindowListCreateImage(
+            screenBounds,
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+            imageOptions);
+        if (!image) {
+            return false;
         }
 
-        NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-        return strdup([jsonString UTF8String]);
+        // Nominal-resolution capture is the contract that makes the result one
+        // sample per logical coordinate. Refuse an unexpected result instead of
+        // silently stretching or cropping it into the caller's buffer.
+        if (CGImageGetWidth(image) != (size_t)width ||
+            CGImageGetHeight(image) != (size_t)height) {
+            CGImageRelease(image);
+            return false;
+        }
+
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if (!colorSpace) {
+            CGImageRelease(image);
+            return false;
+        }
+
+        const size_t bytesPerRow = (size_t)width * 4;
+        const CGBitmapInfo bitmapInfo = (CGBitmapInfo)(
+            kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
+        CGContextRef context = CGBitmapContextCreate(
+            out_rgba,
+            (size_t)width,
+            (size_t)height,
+            8,
+            bytesPerRow,
+            colorSpace,
+            bitmapInfo);
+        CGColorSpaceRelease(colorSpace);
+        if (!context) {
+            CGImageRelease(image);
+            return false;
+        }
+
+        CGContextSetBlendMode(context, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+
+        // Bitmap-context row zero is the lower edge in Quartz coordinates,
+        // while this ABI promises row zero is the top edge of the screen.
+        CGContextTranslateCTM(context, 0, (CGFloat)height);
+        CGContextScaleCTM(context, 1, -1);
+        CGContextDrawImage(context,
+                           CGRectMake(0, 0, (CGFloat)width, (CGFloat)height),
+                           image);
+
+        CGContextRelease(context);
+        CGImageRelease(image);
+
+        // The capture requests an opaque image, and the public ABI requires an
+        // opaque result. Make alpha deterministic without touching RGB.
+        for (uint64_t offset = 3; offset < expectedLength; offset += 4) {
+            out_rgba[offset] = 0xff;
+        }
+        return true;
     }
 }
 

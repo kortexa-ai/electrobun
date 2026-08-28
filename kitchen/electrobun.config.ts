@@ -20,7 +20,7 @@ export default {
 	app: {
 		name: appName,
 		identifier: appIdentifier,
-		version: "1.18.4-beta.19",
+		version: "2.0.2-beta.12",
 		urlSchemes: ["electrobun-playground"],
 	},
 	runtime: {
@@ -31,17 +31,15 @@ export default {
 		buildFolder: variantKey ? `build/matrix/${variantKey}` : "build",
 		artifactFolder: variantKey ? `artifacts/matrix/${variantKey}` : "artifacts",
 		// cefVersion: "144.0.12+g1a1008c+chromium-144.0.7559.110",
-		zig: {
-			entrypoint: "src/zig/main.zig",
-		},
 		bun: {
 			entrypoint: "src/bun/index.ts",
 		},
 		rust: {
-			entrypoint: "src/rust/main.rs",
+			manifest: "Cargo.toml",
+			binary: "main",
 		},
 		go: {
-			entrypoint: "src/go/main.go",
+			package: "./src/go",
 		},
 		odin: {
 			entrypoint: "src/odin/main.odin",

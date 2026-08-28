@@ -2,6 +2,39 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const allocator = std.heap.c_allocator;
+const install_root_name_environment_variable = "ELECTROBUN_INSTALL_ROOT_NAME";
+
+fn processEnviron() std.process.Environ {
+    return switch (builtin.os.tag) {
+        .windows => .{ .block = .global },
+        else => blk: {
+            const c_environ = std.c.environ;
+            var count: usize = 0;
+            while (c_environ[count] != null) : (count += 1) {}
+            break :blk .{ .block = .{ .slice = @ptrCast(c_environ[0..count :null]) } };
+        },
+    };
+}
+
+fn isSafeInstallRootName(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256 or
+        std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    for (value) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\') return false;
+    }
+    if (builtin.os.tag == .windows) {
+        if (value[value.len - 1] == ' ' or value[value.len - 1] == '.') return false;
+        if (std.mem.indexOfAny(u8, value, "\"%*:<>?|") != null) return false;
+    }
+    return true;
+}
+
+fn installRootNameOverride() ?[:0]u8 {
+    const value = processEnviron().getAlloc(allocator, install_root_name_environment_variable) catch return null;
+    defer allocator.free(value);
+    if (!isSafeInstallRootName(value)) return null;
+    return allocator.dupeZ(u8, value) catch null;
+}
 
 // Lazily-initialized event-loop-free Io implementation. The library keeps its
 // C-ABI surface unchanged, so `std.Io` is not threaded through call sites.
@@ -1569,6 +1602,15 @@ fn lookupNativeSymbol(comptime T: type, comptime name: [:0]const u8) ?T {
     return resolved;
 }
 
+// Platform-specific wrapper capabilities are optional so adding one does not
+// expand the common NativeWrapper ABI required from every operating system.
+fn lookupOptionalNativeSymbol(comptime T: type, comptime name: [:0]const u8) ?T {
+    if (!ensureNativeWrapperLoaded()) {
+        return null;
+    }
+    return native_wrapper_state.lib.lookup(T, name);
+}
+
 fn createNativeTrayForState(tray_id: u32, state: *TrayState) bool {
     const CreateNativeTrayFn = *const fn (
         u32,
@@ -2377,6 +2419,14 @@ fn windowCloseTrampoline(window_id: u32) callconv(.c) void {
     }
     window_registry_mutex.unlock(coreIo());
 
+    // Give JS mounts a chance to stop render loops and destroy their devices
+    // while child views and WebGPU surfaces are still valid. The global close
+    // event then removes JS-owned views; the collection below cleans up any
+    // native children that remain.
+    if (close_handler) |handler| {
+        handler(window_id);
+    }
+
     collectWebviewIdsForWindow(window_id, &child_webview_ids);
     for (child_webview_ids.items) |webview_id| {
         webviewRemove(webview_id);
@@ -2385,10 +2435,6 @@ fn windowCloseTrampoline(window_id: u32) callconv(.c) void {
     collectWgpuViewIdsForWindow(window_id, &child_wgpu_view_ids);
     for (child_wgpu_view_ids.items) |wgpu_view_id| {
         removeWGPUView(wgpu_view_id);
-    }
-
-    if (close_handler) |handler| {
-        handler(window_id);
     }
 
     if (exit_on_last_window_closed and !hasOpenWindows()) {
@@ -2458,9 +2504,26 @@ export fn electrobun_core_run_main_thread(
         return 1;
     }
 
-    native_wrapper_state.start_event_loop(identifier, name, channel);
+    const install_root_name = installRootNameOverride();
+    defer if (install_root_name) |value| allocator.free(value);
+    native_wrapper_state.start_event_loop(
+        identifier,
+        name,
+        if (install_root_name) |value| value.ptr else channel,
+    );
     native_wrapper_state.force_exit(exit_code);
     return 0;
+}
+
+test "native profile root override accepts only a safe root leaf" {
+    try std.testing.expect(isSafeInstallRootName("stable"));
+    try std.testing.expect(isSafeInstallRootName("Legacy App"));
+    const invalid = [_][]const u8{ "", ".", "..", "nested/root", "nested\\root", "line\nbreak" };
+    for (invalid) |value| try std.testing.expect(!isSafeInstallRootName(value));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(!isSafeInstallRootName("bad:name"));
+        try std.testing.expect(!isSafeInstallRootName("trailing."));
+    }
 }
 
 export fn runNativeEventLoopTick(timeout_ms: c_int) void {
@@ -2870,6 +2933,26 @@ export fn getWindowFrame(
     get_window_frame(window, x, y, width, height);
 }
 
+export fn getWindowContentOrigin(window_id: u32, x: *f64, y: *f64) void {
+    const GetWindowContentOriginFn = *const fn (WindowPtr, *f64, *f64) callconv(.c) void;
+    const window = requireWindowPtr(window_id) orelse return;
+    const get_window_content_origin = lookupOptionalNativeSymbol(
+        GetWindowContentOriginFn,
+        "getWindowContentOrigin",
+    );
+    if (get_window_content_origin) |get_origin| {
+        get_origin(window, x, y);
+        return;
+    }
+
+    // Wrappers without a distinct content-origin query fall back to their
+    // existing frame coordinates. Linux and Windows expose the native client
+    // origin because their public frame includes window-manager decorations.
+    var width: f64 = 0;
+    var height: f64 = 0;
+    getWindowFrame(window_id, x, y, &width, &height);
+}
+
 export fn beginWindowMove(window_id: u32) void {
     clearLastError();
     const StartWindowMoveFn = *const fn (WindowPtr) callconv(.c) void;
@@ -3071,6 +3154,16 @@ export fn createWebview(
     }
 
     return webview_id;
+}
+
+export fn setNextWebviewAllowedProtocols(allow_views: bool, allow_app_data: bool) void {
+    clearLastError();
+    const SetNextWebviewAllowedProtocolsFn = *const fn (bool, bool) callconv(.c) void;
+    const set_allowed_protocols = lookupNativeSymbol(
+        SetNextWebviewAllowedProtocolsFn,
+        "setNextWebviewAllowedProtocols",
+    ) orelse return;
+    set_allowed_protocols(allow_views, allow_app_data);
 }
 
 export fn getWebviewPointer(webview_id: u32) WebviewPtr {
@@ -3337,6 +3430,29 @@ export fn sendHostMessageToWebviewViaTransport(webview_id: u32, message_json: [*
     };
 
     return enqueueHostTransportSend(webview_id, socket_handle, 0x2, encrypted_packet);
+}
+
+export fn sendPreEncryptedHostMessageToWebviewViaTransport(
+    webview_id: u32,
+    encrypted_packet_json: [*:0]const u8,
+) bool {
+    clearLastError();
+
+    if (builtin.os.tag != .linux) {
+        return false;
+    }
+
+    const context = lookupWebviewTransportContext(webview_id) orelse return false;
+    if (!context.transport_ready) {
+        return false;
+    }
+    const socket_handle = context.socket_handle orelse return false;
+    const encrypted_packet = allocator.dupe(u8, std.mem.span(encrypted_packet_json)) catch |err| {
+        setLastError("Failed to allocate pre-encrypted host transport packet: {s}", .{@errorName(err)});
+        return false;
+    };
+
+    return enqueueHostTransportSend(webview_id, socket_handle, 0x1, encrypted_packet);
 }
 
 export fn sendInternalMessageToWebview(webview_id: u32, message_json: [*:0]const u8) bool {
@@ -3894,6 +4010,29 @@ export fn getCursorScreenPoint() ?[*:0]const u8 {
     return get_cursor_screen_point();
 }
 
+export fn captureScreenRegion(
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    out_rgba: ?[*]u8,
+    out_len: u64,
+) bool {
+    const CaptureScreenRegionFn = *const fn (
+        f64,
+        f64,
+        u32,
+        u32,
+        ?[*]u8,
+        u64,
+    ) callconv(.c) bool;
+    const capture_screen_region = lookupNativeSymbol(
+        CaptureScreenRegionFn,
+        "captureScreenRegion",
+    ) orelse return false;
+    return capture_screen_region(x, y, width, height, out_rgba, out_len);
+}
+
 export fn getMouseButtons() u64 {
     const GetMouseButtonsFn = *const fn () callconv(.c) u64;
     const get_mouse_buttons = lookupNativeSymbol(GetMouseButtonsFn, "getMouseButtons") orelse return 0;
@@ -4093,6 +4232,17 @@ export fn wgpuCreateSurfaceForView(instance: ?*anyopaque, view_ptr: ?*anyopaque)
     return wgpu_create_surface_for_view(instance, view_ptr);
 }
 
+export fn wgpuReleaseSurfaceForView(surface_ptr: ?*anyopaque) bool {
+    clearLastError();
+    const WgpuReleaseSurfaceForViewFn = *const fn (?*anyopaque) callconv(.c) void;
+    const wgpu_release_surface_for_view = lookupOptionalNativeSymbol(
+        WgpuReleaseSurfaceForViewFn,
+        "wgpuReleaseSurfaceForView",
+    ) orelse return false;
+    wgpu_release_surface_for_view(surface_ptr);
+    return true;
+}
+
 export fn wgpuCreateAdapterDeviceMainThread(
     instance_ptr: ?*anyopaque,
     surface_ptr: ?*anyopaque,
@@ -4115,6 +4265,16 @@ export fn wgpuSurfaceConfigureMainThread(surface_ptr: ?*anyopaque, config_ptr: ?
         "wgpuSurfaceConfigureMainThread",
     ) orelse return;
     wgpu_surface_configure_main_thread(surface_ptr, config_ptr);
+}
+
+export fn wgpuSurfaceCapabilitiesFreeMembersShim(capabilities_ptr: ?*anyopaque) void {
+    clearLastError();
+    const WgpuSurfaceCapabilitiesFreeMembersShimFn = *const fn (?*anyopaque) callconv(.c) void;
+    const wgpu_surface_capabilities_free_members = lookupNativeSymbol(
+        WgpuSurfaceCapabilitiesFreeMembersShimFn,
+        "wgpuSurfaceCapabilitiesFreeMembersShim",
+    ) orelse return;
+    wgpu_surface_capabilities_free_members(capabilities_ptr);
 }
 
 export fn wgpuSurfaceGetCurrentTextureMainThread(surface_ptr: ?*anyopaque, surface_texture_ptr: ?*anyopaque) void {

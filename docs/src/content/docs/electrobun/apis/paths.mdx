@@ -98,9 +98,19 @@ TypeScript: `home`, `appData`, `config`, `cache`, `temp`, `logs`,
 `documents`, `downloads`, `desktop`, `pictures`, `music`, `videos`,
 `userData`, `userCache`, and `userLogs` (snake_case in Rust, CamelCase in
 Go). On every runtime, `userData`, `userCache`, and `userLogs` resolve to
-`<base>/<identifier>/<channel>` using the packaged app identifier and
-release channel.
+`<base>/<identifier>/<install-root>` using the packaged app identifier and
+physical install-root name. That root normally matches the packaged release
+channel. Supported Electrobun v1 updates keep their existing physical root,
+including `stable` and older app-name roots, so app data stays in place.
 
 Packaged resources are read-only application content. Modifying a macOS app
 bundle invalidates its code signature. Use `Utils.paths.userData`,
 `Utils.paths.userCache`, or another writable system directory for mutable data.
+Webviews can read files beneath `userData` through the opt-in `appdata://`
+protocol; see [Local Webview Assets](/electrobun/apis/bundled-assets/#load-mutable-files-with-appdata).
+
+For installer builds, Electrobun's `App and Data` uninstall action removes the
+three app-scoped paths (`userData`, `userCache`, and `userLogs`) for only the
+current identifier and recorded physical install root. See
+[Uninstalling](/electrobun/guides/uninstalling/) for the exact behavior and
+platform availability.

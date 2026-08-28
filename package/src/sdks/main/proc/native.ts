@@ -95,6 +95,7 @@ import {
 	type Pointer,
 } from "bun:ffi";
 import { parseWebviewEventBridgeMessage } from "./eventBridge";
+import { ffiCStringToString } from "./ffiCString";
 
 function getElectrobunLibraryPathCandidates(fileName: string) {
 	const candidates = new Set<string>();
@@ -120,8 +121,23 @@ function tryDlopenCandidates<T extends Record<string, { args: FFIType[]; returns
 	throw lastError ?? new Error(`Failed to load ${fileName}`);
 }
 
+function normalizeFFIPointer(
+	value: Pointer | bigint | null | undefined,
+): Pointer | null {
+	if (value === null || value === undefined || value === 0 || value === 0n) {
+		return null;
+	}
+	if (typeof value !== "bigint") return value;
+
+	const numericPointer = Number(value);
+	if (!Number.isSafeInteger(numericPointer)) {
+		throw new RangeError("FFI pointer exceeds JavaScript's safe integer range");
+	}
+	return numericPointer as Pointer;
+}
+
 function getWindowPtr(winId: number) {
-	return core?.symbols.getWindowPointer(winId) || null;
+	return normalizeFFIPointer(core?.symbols.getWindowPointer(winId));
 }
 
 function getCoreLastError(): string | null {
@@ -155,6 +171,7 @@ function ensureWebviewRuntimeConfigured() {
 	webviewRuntimeConfigured = true;
 }
 
+let coreLoadError: unknown = null;
 const core = (() => {
 	try {
 		const coreFileName =
@@ -317,6 +334,10 @@ const core = (() => {
 				args: [FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr],
 				returns: FFIType.void,
 			},
+			getWindowContentOrigin: {
+				args: [FFIType.u32, FFIType.ptr, FFIType.ptr],
+				returns: FFIType.void,
+			},
 			configureWebviewRuntime: {
 				args: [
 					FFIType.u32,
@@ -353,6 +374,10 @@ const core = (() => {
 					FFIType.cstring,
 				],
 				returns: FFIType.u32,
+			},
+			setNextWebviewAllowedProtocols: {
+				args: [FFIType.bool, FFIType.bool],
+				returns: FFIType.void,
 			},
 			getWebviewPointer: {
 				args: [FFIType.u32],
@@ -442,6 +467,10 @@ const core = (() => {
 				returns: FFIType.void,
 			},
 			sendHostMessageToWebviewViaTransport: {
+				args: [FFIType.u32, FFIType.cstring],
+				returns: FFIType.bool,
+			},
+			sendPreEncryptedHostMessageToWebviewViaTransport: {
 				args: [FFIType.u32, FFIType.cstring],
 				returns: FFIType.bool,
 			},
@@ -546,6 +575,10 @@ const core = (() => {
 				args: [FFIType.u32],
 				returns: FFIType.void,
 			},
+			wgpuReleaseSurfaceForView: {
+				args: [FFIType.ptr],
+				returns: FFIType.bool,
+			},
 			createTray: {
 				args: [
 					FFIType.cstring,
@@ -630,6 +663,17 @@ const core = (() => {
 				args: [],
 				returns: FFIType.cstring,
 			},
+			captureScreenRegion: {
+				args: [
+					FFIType.f64,
+					FFIType.f64,
+					FFIType.u32,
+					FFIType.u32,
+					FFIType.ptr,
+					FFIType.u64,
+				],
+				returns: FFIType.bool,
+			},
 			getMouseButtons: {
 				args: [],
 				returns: FFIType.u64,
@@ -701,11 +745,13 @@ const core = (() => {
 				returns: FFIType.void,
 			},
 		});
-	} catch {
+	} catch (err) {
+		coreLoadError = err;
 		return null;
 	}
 })();
 
+let nativeWrapperLoadError: unknown = null;
 export const native = (() => {
 	try {
 		const nativeWrapperFileName = `libNativeWrapper.${suffix}`;
@@ -805,47 +851,64 @@ export const native = (() => {
 				returns: FFIType.void,
 			},
 
-			wgpuViewSetAlphaBlending: {
-				args: [FFIType.ptr, FFIType.bool],
-				returns: FFIType.void,
-			},
-
-			setWGPUPointerHandler: {
-				args: [FFIType.ptr],
-				returns: FFIType.void,
-			},
-
-			setWGPUKeyHandler: {
-				args: [FFIType.ptr],
-				returns: FFIType.void,
-			},
-
-			uiMeasureText: {
-				args: [
-					FFIType.cstring,
-					FFIType.cstring,
-					FFIType.f64,
-					FFIType.ptr,
-					FFIType.ptr,
-					FFIType.ptr,
-				],
-				returns: FFIType.void,
-			},
-			uiRasterizeText: {
-				args: [
-					FFIType.cstring,
-					FFIType.cstring,
-					FFIType.f64,
-					FFIType.f64,
-					FFIType.ptr,
-					FFIType.ptr,
-				],
-				returns: FFIType.ptr,
-			},
-			uiFreeTextBitmap: {
-				args: [FFIType.ptr],
-				returns: FFIType.void,
-			},
+			// These capabilities currently have implementations only in the macOS
+			// wrapper. bun:ffi resolves every descriptor eagerly, so including one
+			// unavailable symbol would reject the entire native wrapper on Linux and
+			// Windows.
+			...(process.platform === "darwin"
+				? {
+					wgpuViewSetAlphaBlending: {
+						args: [FFIType.ptr, FFIType.bool],
+						returns: FFIType.void,
+					},
+					setWGPUPointerHandler: {
+						args: [FFIType.ptr],
+						returns: FFIType.void,
+					},
+					setWGPUKeyHandler: {
+						args: [FFIType.ptr],
+						returns: FFIType.void,
+					},
+					uiMeasureText: {
+						args: [
+							FFIType.cstring,
+							FFIType.cstring,
+							FFIType.f64,
+							FFIType.ptr,
+							FFIType.ptr,
+							FFIType.ptr,
+						],
+						returns: FFIType.void,
+					},
+					uiRasterizeText: {
+						args: [
+							FFIType.cstring,
+							FFIType.cstring,
+							FFIType.f64,
+							FFIType.f64,
+							FFIType.ptr,
+							FFIType.ptr,
+						],
+						returns: FFIType.ptr,
+					},
+					uiFreeTextBitmap: {
+						args: [FFIType.ptr],
+						returns: FFIType.void,
+					},
+				}
+				: {}),
+			...(process.platform === "win32"
+				? {
+					getWindowContentSize: {
+						args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+						returns: FFIType.void,
+					},
+					setWindowTextHandler: {
+						args: [FFIType.ptr],
+						returns: FFIType.void,
+					},
+				}
+				: {}),
 
 			loadURLInWebView: {
 				args: [FFIType.ptr, FFIType.cstring],
@@ -977,6 +1040,10 @@ export const native = (() => {
 			},
 			wgpuSurfaceConfigureMainThread: {
 				args: [FFIType.ptr, FFIType.ptr],
+				returns: FFIType.void,
+			},
+			wgpuSurfaceCapabilitiesFreeMembersShim: {
+				args: [FFIType.ptr],
 				returns: FFIType.void,
 			},
 			wgpuSurfaceGetCurrentTextureMainThread: {
@@ -1130,6 +1197,7 @@ export const native = (() => {
 			// },
 		});
 	} catch (err) {
+		nativeWrapperLoadError = err;
 		// FFI not available — running as a carrot inside Bunny Ears or in a build-only context.
 		console.error("[electrobun] native FFI dlopen failed:", err);
 		return null;
@@ -1220,8 +1288,18 @@ function createFfiRequestProxy(ffiRequest: Record<string, Function>): Record<str
 			if (typeof method !== "string") return target[method];
 			return (params?: unknown) => {
 				if (!bridge) {
+					const loadFailures = [
+						["ElectrobunCore", coreLoadError],
+						["NativeWrapper", nativeWrapperLoadError],
+					]
+						.filter((entry) => entry[1] !== null)
+						.map(([library, error]) =>
+							`${library}: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					const loadFailureDetail =
+						loadFailures.length > 0 ? ` (${loadFailures.join("; ")})` : "";
 					throw new Error(
-						`Electrobun FFI is unavailable and no host bridge exists for request ${method}`,
+						`Electrobun FFI is unavailable and no host bridge exists for request ${method}${loadFailureDetail}`,
 					);
 				}
 				return bridge.requestHost(method, params);
@@ -1239,16 +1317,58 @@ function createFfiRequestProxy(ffiRequest: Record<string, Function>): Record<str
 // Non-null accessor for use inside _ffiImpl — these methods are only called when hasFFI is true.
 const core_ = core!;
 const native_ = native!;
+
+type DarwinNativeWrapperSymbols = {
+	wgpuViewSetAlphaBlending: (view: Pointer, enabled: boolean) => void;
+	setWGPUPointerHandler: (handler: Pointer | null) => void;
+	setWGPUKeyHandler: (handler: Pointer | null) => void;
+	uiMeasureText: (
+		text: CString,
+		fontName: CString,
+		size: number,
+		width: Pointer,
+		height: Pointer,
+		ascent: Pointer,
+	) => void;
+	uiRasterizeText: (
+		text: CString,
+		fontName: CString,
+		size: number,
+		scale: number,
+		width: Pointer,
+		height: Pointer,
+	) => Pointer | null;
+	uiFreeTextBitmap: (pixels: Pointer) => void;
+};
+
+type WindowsNativeWrapperSymbols = {
+	getWindowContentSize: (
+		window: Pointer,
+		width: Pointer,
+		height: Pointer,
+	) => void;
+	setWindowTextHandler: (handler: Pointer | null) => void;
+};
+
+// Conditional descriptor spreads become optional zero-argument functions in
+// Bun's mapped FFI types. Restore the callable shape while keeping absence
+// explicit on platforms that do not register these symbols.
+function getDarwinNativeWrapperSymbols(): Partial<DarwinNativeWrapperSymbols> {
+	return native_.symbols as unknown as Partial<DarwinNativeWrapperSymbols>;
+}
+
+function getWindowsNativeWrapperSymbols(): Partial<WindowsNativeWrapperSymbols> {
+	return native_.symbols as unknown as Partial<WindowsNativeWrapperSymbols>;
+}
+
 core?.symbols.setRuntimeCallbacksAsync(true);
 const queuedHostMessageWebviewIdBuf = new Uint32Array(1);
 
-const readOwnedRuntimeCallbackPayload = (messagePointer: number): string => {
+const readOwnedRuntimeCallbackPayload = (messagePointer: Pointer): string => {
 	try {
-		return new CString(messagePointer as unknown as Pointer).toString();
+		return new CString(messagePointer).toString();
 	} finally {
-		core_.symbols.releaseRuntimeCallbackPayload(
-			messagePointer as unknown as Pointer,
-		);
+		core_.symbols.releaseRuntimeCallbackPayload(messagePointer);
 	}
 };
 
@@ -1774,6 +1894,51 @@ const _ffiImpl = {
 				height: heightBuf[0]!,
 			};
 		},
+		getWindowContentOrigin: (params: {
+			winId: number;
+		}): { x: number; y: number } => {
+			const { winId } = params;
+			const windowPtr = getWindowPtr(winId);
+
+			if (!windowPtr) {
+				return { x: 0, y: 0 };
+			}
+
+			const xBuf = new Float64Array(1);
+			const yBuf = new Float64Array(1);
+			core_.symbols.getWindowContentOrigin(winId, ptr(xBuf), ptr(yBuf));
+
+			return { x: xBuf[0]!, y: yBuf[0]! };
+		},
+		getWindowContentSize: (params: {
+			winId: number;
+		}): { width: number; height: number } => {
+			const { winId } = params;
+			const windowPtr = getWindowPtr(winId);
+			if (!windowPtr) return { width: 0, height: 0 };
+
+			const getContentSize =
+				getWindowsNativeWrapperSymbols().getWindowContentSize;
+			if (process.platform !== "win32" || typeof getContentSize !== "function") {
+				const xBuf = new Float64Array(1);
+				const yBuf = new Float64Array(1);
+				const widthBuf = new Float64Array(1);
+				const heightBuf = new Float64Array(1);
+				core_.symbols.getWindowFrame(
+					winId,
+					ptr(xBuf),
+					ptr(yBuf),
+					ptr(widthBuf),
+					ptr(heightBuf),
+				);
+				return { width: widthBuf[0]!, height: heightBuf[0]! };
+			}
+
+			const widthBuf = new Float64Array(1);
+			const heightBuf = new Float64Array(1);
+			getContentSize(windowPtr, ptr(widthBuf), ptr(heightBuf));
+			return { width: widthBuf[0]!, height: heightBuf[0]! };
+		},
 		createWebview: (params: {
 			windowId: number;
 			hostWebviewId: number | null;
@@ -1783,6 +1948,7 @@ const _ffiImpl = {
 			partition: string | null;
 			preload: string | null;
 			viewsRoot: string | null;
+			allowedProtocols: { views: boolean; appData: boolean };
 			frame: {
 				x: number;
 				y: number;
@@ -1806,6 +1972,7 @@ const _ffiImpl = {
 				partition,
 				preload,
 				viewsRoot,
+				allowedProtocols,
 				frame: { x, y, width, height },
 				autoResize,
 				sandbox,
@@ -1815,6 +1982,10 @@ const _ffiImpl = {
 				trust,
 			} = params;
 			ensureWebviewRuntimeConfigured();
+			core_.symbols.setNextWebviewAllowedProtocols(
+				allowedProtocols.views,
+				allowedProtocols.appData,
+			);
 
 			const webviewId = core_.symbols.createWebview(
 				windowId,
@@ -1853,7 +2024,7 @@ const _ffiImpl = {
 			return webviewId;
 		},
 		getWebviewPointer: (params: { id: number }): Pointer | null => {
-			return core_.symbols.getWebviewPointer(params.id) || null;
+			return normalizeFFIPointer(core_.symbols.getWebviewPointer(params.id));
 		},
 		resizeWebview: (params: {
 			id: number;
@@ -1974,7 +2145,7 @@ const _ffiImpl = {
 			return viewId;
 		},
 		getWGPUViewPointer: (params: { id: number }): Pointer | null => {
-			return core_.symbols.getWGPUViewPointer(params.id) || null;
+			return normalizeFFIPointer(core_.symbols.getWGPUViewPointer(params.id));
 		},
 
 		wgpuViewSetFrame: (params: {
@@ -1992,15 +2163,35 @@ const _ffiImpl = {
 				params.height,
 			);
 		},
+		resizeWGPUView: (params: {
+			id: number;
+			frame: { x: number; y: number; width: number; height: number };
+			masks?: string;
+		}) => {
+			const { id, frame: { x, y, width, height }, masks = "[]" } = params;
+			core_.symbols.resizeWGPUView(
+				id,
+				x,
+				y,
+				width,
+				height,
+				toCString(masks),
+			);
+		},
 
 		wgpuViewSetTransparent: (params: { id: number; transparent: boolean }) => {
 			core_.symbols.setWGPUViewTransparent(params.id, params.transparent);
 		},
 
 		wgpuViewSetAlphaBlending: (params: { id: number; enabled: boolean }) => {
-			const ptr = core_.symbols.getWGPUViewPointer(params.id);
-			if (!ptr) return;
-			native_.symbols.wgpuViewSetAlphaBlending(ptr, params.enabled);
+			const setAlphaBlending =
+				getDarwinNativeWrapperSymbols().wgpuViewSetAlphaBlending;
+			if (typeof setAlphaBlending !== "function") return;
+			const viewPointer = normalizeFFIPointer(
+				core_.symbols.getWGPUViewPointer(params.id),
+			);
+			if (!viewPointer) return;
+			setAlphaBlending(viewPointer, params.enabled);
 		},
 
 		wgpuViewSetPassthrough: (params: {
@@ -2018,7 +2209,9 @@ const _ffiImpl = {
 			core_.symbols.removeWGPUView(params.id);
 		},
 		wgpuViewGetNativeHandle: (params: { id: number }): Pointer | null => {
-			return core_.symbols.getWGPUViewNativeHandle(params.id) || null;
+			return normalizeFFIPointer(
+				core_.symbols.getWGPUViewNativeHandle(params.id),
+			);
 		},
 		runWGPUViewTest: (params: { id: number }) => {
 			core_.symbols.runWGPUViewTest(params.id);
@@ -2040,6 +2233,15 @@ const _ffiImpl = {
 			return core_.symbols.sendHostMessageToWebviewViaTransport(
 				params.id,
 				toCString(params.messageJson),
+			);
+		},
+		sendPreEncryptedHostMessageToWebviewViaTransport: (params: {
+			id: number;
+			encryptedPacketJson: string;
+		}): boolean => {
+			return core_.symbols.sendPreEncryptedHostMessageToWebviewViaTransport(
+				params.id,
+				toCString(params.encryptedPacketJson),
 			);
 		},
 		clearWebviewHostTransport: (params: { id: number }) => {
@@ -2317,6 +2519,10 @@ export const WGPUBridge = {
 			surfacePtr as any,
 			configPtr as any,
 		),
+	surfaceCapabilitiesFreeMembers: (capabilitiesPtr: Pointer) =>
+		native_.symbols.wgpuSurfaceCapabilitiesFreeMembersShim(
+			capabilitiesPtr as any,
+		),
 	surfaceGetCurrentTexture: (surfacePtr: Pointer, surfaceTexturePtr: Pointer) =>
 		native_.symbols.wgpuSurfaceGetCurrentTextureMainThread(
 			surfacePtr as any,
@@ -2427,6 +2633,8 @@ export const WGPUBridge = {
 		if (!native?.symbols?.wgpuCreateSurfaceForView) return null;
 		return native_.symbols.wgpuCreateSurfaceForView(instancePtr as any, viewPtr as any) as Pointer;
 	},
+	releaseSurfaceForView: (surfacePtr: Pointer): boolean =>
+		!!core_.symbols.wgpuReleaseSurfaceForView(surfacePtr as any),
 };
 
 
@@ -2610,7 +2818,7 @@ const wgpuPointerCallback = new JSCallback(
 // Key events from WGPU views carrying the layout-produced characters.
 const wgpuKeyCallback = new JSCallback(
 	(viewId, keyCode, modifiers, isDown, isRepeat, charsPtr) => {
-		const chars = charsPtr ? new CString(charsPtr).toString() : "";
+		const chars = ffiCStringToString(charsPtr);
 		electrobunEventEmitter.emit(`wgpu-key-${viewId}`, {
 			keyCode,
 			modifiers,
@@ -2626,22 +2834,42 @@ const wgpuKeyCallback = new JSCallback(
 	},
 );
 
+function getNativeTextSymbols() {
+	if (!hasFFI) return null;
+
+	const {
+		uiMeasureText: measureText,
+		uiRasterizeText: rasterizeText,
+		uiFreeTextBitmap: freeTextBitmap,
+	} = getDarwinNativeWrapperSymbols();
+	if (
+		typeof measureText !== "function" ||
+		typeof rasterizeText !== "function" ||
+		typeof freeTextBitmap !== "function"
+	) {
+		return null;
+	}
+
+	return { measureText, rasterizeText, freeTextBitmap };
+}
+
 // CoreText-backed text for the UI runtime (macOS native wrapper).
 export const nativeText = {
 	available(): boolean {
-		return Boolean(
-			hasFFI && typeof native_.symbols.uiMeasureText === "function",
-		);
+		return getNativeTextSymbols() !== null;
 	},
 	measure(
 		text: string,
 		fontName: string,
 		size: number,
 	): { w: number; h: number; ascent: number } {
+		const symbols = getNativeTextSymbols();
+		if (!symbols) throw new Error("Native text is unavailable");
+
 		const w = new Float64Array(1);
 		const h = new Float64Array(1);
 		const ascent = new Float64Array(1);
-		native_.symbols.uiMeasureText(
+		symbols.measureText(
 			toCString(text),
 			toCString(fontName),
 			size,
@@ -2657,8 +2885,11 @@ export const nativeText = {
 		size: number,
 		scale: number,
 	): { width: number; height: number; data: Uint8Array } | null {
+		const symbols = getNativeTextSymbols();
+		if (!symbols) return null;
+
 		const dims = new Int32Array(2);
-		const pixelsPtr = native_.symbols.uiRasterizeText(
+		const pixelsPtr = symbols.rasterizeText(
 			toCString(text),
 			toCString(fontName),
 			size,
@@ -2669,11 +2900,16 @@ export const nativeText = {
 		if (!pixelsPtr) return null;
 		const width = dims[0]!;
 		const height = dims[1]!;
-		const data = new Uint8Array(
-			toArrayBuffer(pixelsPtr as Pointer, 0, width * height * 4).slice(0),
-		);
-		native_.symbols.uiFreeTextBitmap(pixelsPtr);
-		return { width, height, data };
+		try {
+			// Copy before releasing the native bitmap. Bun 1.4's worker-side FFI
+			// buffer does not consistently expose ArrayBuffer.prototype.slice.
+			const pixels = new Uint8Array(
+				toArrayBuffer(pixelsPtr as Pointer, 0, width * height * 4),
+			);
+			return { width, height, data: new Uint8Array(pixels) };
+		} finally {
+			symbols.freeTextBitmap(pixelsPtr);
+		}
 	},
 };
 
@@ -2683,11 +2919,44 @@ export function enableWGPUKeyEvents(): boolean {
 	if (wgpuKeyEventsEnabled) return true;
 	if (!hasFFI) return false;
 	try {
-		if (typeof native_.symbols.setWGPUKeyHandler !== "function") {
+		const setKeyHandler = getDarwinNativeWrapperSymbols().setWGPUKeyHandler;
+		if (typeof setKeyHandler !== "function") {
 			return false;
 		}
-		native_.symbols.setWGPUKeyHandler(wgpuKeyCallback.ptr);
+		setKeyHandler(wgpuKeyCallback.ptr);
 		wgpuKeyEventsEnabled = true;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Win32's WM_CHAR stream contains the text produced by the active keyboard
+// layout (including composed/dead-key and IME output). It is deliberately
+// separate from keyDown, which remains the source of editing/navigation keys.
+const windowTextCallback = new JSCallback(
+	(windowId, codePoint) => {
+		electrobunEventEmitter.emit(`window-text-${windowId}`, {
+			text: String.fromCodePoint(codePoint),
+		});
+	},
+	{
+		args: ["u32", "u32"],
+		returns: "void",
+		threadsafe: true,
+	},
+);
+
+let windowTextEventsEnabled = false;
+export function enableWindowTextEvents(): boolean {
+	if (windowTextEventsEnabled) return true;
+	if (process.platform !== "win32" || !hasFFI) return false;
+	try {
+		const setHandler =
+			getWindowsNativeWrapperSymbols().setWindowTextHandler;
+		if (typeof setHandler !== "function") return false;
+		setHandler(windowTextCallback.ptr);
+		windowTextEventsEnabled = true;
 		return true;
 	} catch {
 		return false;
@@ -2704,10 +2973,12 @@ export function enableWGPUPointerEvents(): boolean {
 	if (wgpuPointerEventsEnabled) return true;
 	if (!hasFFI) return false;
 	try {
-		if (typeof native_.symbols.setWGPUPointerHandler !== "function") {
+		const setPointerHandler =
+			getDarwinNativeWrapperSymbols().setWGPUPointerHandler;
+		if (typeof setPointerHandler !== "function") {
 			return false;
 		}
-		native_.symbols.setWGPUPointerHandler(wgpuPointerCallback.ptr);
+		setPointerHandler(wgpuPointerCallback.ptr);
 		wgpuPointerEventsEnabled = true;
 		return true;
 	} catch {
@@ -2739,7 +3010,7 @@ const windowKeyCallback = new JSCallback(
 
 const getMimeType = new JSCallback(
 	(filePath) => {
-		const _filePath = new CString(filePath).toString();
+		const _filePath = ffiCStringToString(filePath);
 		const mimeType = Bun.file(_filePath).type; // || "application/octet-stream";
 
 		// For this usecase we generally don't want the charset included in the mimetype
@@ -2777,7 +3048,7 @@ const globalShortcutHandlers = new Map<string, () => void>();
 if (native) {
 	const urlOpenCallback = new JSCallback(
 		(urlPtr) => {
-			const url = new CString(urlPtr).toString();
+			const url = ffiCStringToString(urlPtr);
 			const handler = electrobunEventEmitter.events.app.openUrl;
 			const event = handler({ url });
 			electrobunEventEmitter.emitEvent(event);
@@ -2814,7 +3085,7 @@ if (native) {
 
 	const globalShortcutCallback = new JSCallback(
 		(acceleratorPtr) => {
-			const accelerator = new CString(acceleratorPtr).toString();
+			const accelerator = ffiCStringToString(acceleratorPtr);
 			const handler = globalShortcutHandlers.get(accelerator);
 			if (handler) handler();
 		},
@@ -2933,6 +3204,51 @@ export const Screen = {
 			return JSON.parse(jsonStr.toString());
 		} catch {
 			return { x: 0, y: 0 };
+		}
+	},
+
+	/**
+	 * Capture a rectangular region of the desktop as row-major RGBA pixels.
+	 * Coordinates and dimensions use Electrobun's logical screen coordinate
+	 * system; fractional origins are aligned down to the logical pixel grid.
+	 * On Wayland, the first call starts the desktop's monitor-sharing portal and
+	 * returns null until the user approves a monitor and its first frame arrives.
+	 * Returns null when capture is unavailable or the rectangle is invalid.
+	 */
+	captureRegion: (rectangle: Rectangle): Uint8Array | null => {
+		const { x, y, width, height } = rectangle;
+		if (
+			!hasFFI ||
+			!Number.isFinite(x) ||
+			!Number.isFinite(y) ||
+			!Number.isSafeInteger(width) ||
+			!Number.isSafeInteger(height) ||
+			width <= 0 ||
+			height <= 0 ||
+			width > 0xffffffff ||
+			height > 0xffffffff
+		) {
+			return null;
+		}
+
+		const byteLength = width * height * 4;
+		if (!Number.isSafeInteger(byteLength)) return null;
+		const originX = Math.floor(x);
+		const originY = Math.floor(y);
+
+		try {
+			const pixels = new Uint8Array(byteLength);
+			const captured = core_.symbols.captureScreenRegion(
+				originX,
+				originY,
+				width,
+				height,
+				ptr(pixels),
+				BigInt(byteLength),
+			);
+			return captured ? pixels : null;
+		} catch {
+			return null;
 		}
 	},
 
@@ -3229,9 +3545,8 @@ const webviewEventJSCallback = new JSCallback(
 		let detail = "";
 
 		try {
-			// Convert cstring pointers to actual strings
-			eventName = new CString(_eventName).toString();
-			detail = new CString(_detail).toString();
+			eventName = ffiCStringToString(_eventName);
+			detail = ffiCStringToString(_detail);
 		} catch (err) {
 			console.error("[webviewEventJSCallback] Error converting strings:", err);
 			console.error("[webviewEventJSCallback] Raw values:", {
@@ -3253,12 +3568,7 @@ const webviewEventJSCallback = new JSCallback(
 const hostBridgePostmessageHandler = new JSCallback(
 	(id, msg) => {
 		try {
-			const msgStr = new CString(msg);
-
-			if (!msgStr.length) {
-				return;
-			}
-			const rawMessage = msgStr.toString().trim();
+			const rawMessage = ffiCStringToString(msg).trim();
 			if (!rawMessage || (rawMessage[0] !== "{" && rawMessage[0] !== "[")) {
 				return;
 			}
@@ -3289,8 +3599,9 @@ const hostBridgePostmessageHandler = new JSCallback(
 // This is available on ALL webviews including sandboxed ones.
 // It cannot process RPC requests - only event emission.
 const eventBridgeHandler = new JSCallback(
-	(id: number, msg: number) => {
+	(id: number, msg: Pointer | null) => {
 		try {
+			if (!msg) return;
 			const rawMessage = readOwnedRuntimeCallbackPayload(msg).trim();
 			const event = parseWebviewEventBridgeMessage(id, rawMessage);
 			if (event) {
@@ -3301,7 +3612,8 @@ const eventBridgeHandler = new JSCallback(
 		}
 	},
 	{
-		args: [FFIType.u32, FFIType.cstring],
+		// Keep the owned allocation as a pointer so it can be released after use.
+		args: [FFIType.u32, FFIType.ptr],
 		returns: FFIType.void,
 		threadsafe: true,
 	},
@@ -3310,8 +3622,9 @@ const eventBridgeHandler = new JSCallback(
 // internalBridgeHandler: handles internal RPC (webview tags, drag regions, etc.)
 // This is only available on trusted (non-sandboxed) webviews.
 const internalBridgeHandler = new JSCallback(
-	(id: number, msg: number) => {
+	(id: number, msg: Pointer | null) => {
 		try {
+			if (!msg) return;
 			const rawMessage = readOwnedRuntimeCallbackPayload(msg);
 			const event = parseWebviewEventBridgeMessage(id, rawMessage.trim());
 			if (event) {
@@ -3364,7 +3677,8 @@ const internalBridgeHandler = new JSCallback(
 		}
 	},
 	{
-		args: [FFIType.u32, FFIType.cstring],
+		// Keep the owned allocation as a pointer so it can be released after use.
+		args: [FFIType.u32, FFIType.ptr],
 		returns: FFIType.void,
 		threadsafe: true,
 	},
@@ -3372,22 +3686,32 @@ const internalBridgeHandler = new JSCallback(
 
 const trayItemHandler = new JSCallback(
 	(id, action) => {
-		// Note: Some invisible character that doesn't appear in .length
-		// is causing issues
-		const actionString = (new CString(action).toString() || "").trim();
+		// Never let this throw. A raised exception unwinds through the native
+		// FFI trampoline (statusItemClicked: in nativeWrapper.mm), which leaves
+		// the tray wedged: the click does no work at all and the window keeps
+		// presenting its previous frame. The bridge handlers above take the
+		// same precaution.
+		try {
+			// Note: Some invisible character that doesn't appear in .length
+			// is causing issues
+			const actionString = ffiCStringToString(action).trim();
 
-		// Use shared deserialization method
-		const { action: actualAction, data } = deserializeMenuAction(actionString);
+			// Use shared deserialization method
+			const { action: actualAction, data } = deserializeMenuAction(actionString);
 
-		const event = electrobunEventEmitter.events.tray.trayClicked({
-			id,
-			action: actualAction,
-			data, // Always include data property (undefined if no data)
-		});
+			const event = electrobunEventEmitter.events.tray.trayClicked({
+				id,
+				action: actualAction,
+				data, // Always include data property (undefined if no data)
+			});
 
-		// global event
-		electrobunEventEmitter.emitEvent(event);
-		electrobunEventEmitter.emitEvent(event, id);
+			// Per-tray listeners first: a throwing global listener must not
+			// starve the handler the application registered via Tray.on().
+			electrobunEventEmitter.emitEvent(event, id);
+			electrobunEventEmitter.emitEvent(event);
+		} catch (err) {
+			console.error("error in trayItemHandler: ", err);
+		}
 	},
 	{
 		args: [FFIType.u32, FFIType.cstring],
@@ -3398,7 +3722,7 @@ const trayItemHandler = new JSCallback(
 
 const applicationMenuHandler = new JSCallback(
 	(id, action) => {
-		const actionString = new CString(action).toString();
+		const actionString = ffiCStringToString(action);
 
 		// Use shared deserialization method
 		const { action: actualAction, data } = deserializeMenuAction(actionString);
@@ -3421,7 +3745,7 @@ const applicationMenuHandler = new JSCallback(
 
 const contextMenuHandler = new JSCallback(
 	(_id, action) => {
-		const actionString = new CString(action).toString();
+		const actionString = ffiCStringToString(action);
 
 		// Use shared deserialization method
 		const { action: actualAction, data } = deserializeMenuAction(actionString);

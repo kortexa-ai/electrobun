@@ -10,9 +10,10 @@ main processes (Zig, Rust, Go, Odin) currently ship without an update API —
 see [Native main process](/electrobun/guides/native-main-process/).
 </Aside>
 
-Hutch production and canary builds create update metadata, compressed full
-bundles, and optional delta patches. Publish the artifact directory to a static
-host and configure its public base URL:
+Hutch stable and canary builds create update metadata plus a compressed full
+bundle. When a previous release is available, Hutch also creates a delta patch.
+Publish the artifact directory
+to a static host and configure its public base URL:
 
 ```ts
 import type { ElectrobunConfig } from "electrobun";
@@ -25,7 +26,6 @@ export default {
   },
   release: {
     baseUrl: "https://downloads.example.com/my-app",
-    generatePatch: true,
   },
 } satisfies ElectrobunConfig;
 ```
@@ -48,12 +48,21 @@ if (update.updateAvailable) {
 }
 ```
 
-`applyUpdate()` quits the current process, replaces the installed app, and
-launches the new version. It does nothing until a download is ready.
+`applyUpdate()` first asks the normal `before-quit` handlers for permission. If
+they allow the quit, a native post-exit helper validates the downloaded bundle,
+replaces the installed app transactionally, refreshes platform integration,
+and launches the new version. A failed replacement restores the previous app.
+It does nothing until a prepared download is ready.
+
+`downloadUpdate()` starts with the retained local archive and requests the
+patch named after its current hash. After each successful patch it reads the
+next hash from the resulting tar and continues until it reaches the latest hash
+from `update.json`. If any patch is missing or fails, the updater discards the
+attempted chain and downloads the latest full archive instead.
 
 <Aside type="note">
 The `dev` channel never reports an available update. Exercise updater behavior
-with a packaged canary or production build.
+with a packaged canary or stable build.
 </Aside>
 
 ## Local and update metadata
@@ -85,7 +94,8 @@ void identifier;
 
 Convenience methods under `Updater.localInfo` return the current `version`,
 `hash`, `channel`, and `baseUrl`. `channelBucketUrl()` returns the base URL, and
-`appDataFolder()` returns the channel-specific update workspace.
+`appDataFolder()` returns the physical installed update workspace. Stable
+Electrobun v1.18.1+ and 2.0 apps use the same `stable` root.
 
 ## Status reporting
 
@@ -103,7 +113,7 @@ Updater.onStatusChange(null);
 void history;
 ```
 
-Statuses cover checking, patch discovery and application, full-bundle fallback,
-download progress, extraction, replacement, relaunch, completion, and errors.
+Statuses cover checking, patch-chain attempts and fallback, full-bundle
+download progress, preparation, handoff, relaunch, completion, and errors.
 `UpdateStatusEntry` contains `status`, `message`, `timestamp`, and optional
 structured `details`.

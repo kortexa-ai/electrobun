@@ -27,12 +27,25 @@ type QueuedWebviewMessage = {
 
 const HOST_MESSAGE_SEND_BATCH_SIZE = 32;
 const HOST_MESSAGE_SOCKET_AVAILABLE = process.platform !== "win32";
+const HOST_MESSAGE_RESPONSE_PRIORITY = process.platform === "linux";
+
+function isRpcResponsePacket(message: unknown): boolean {
+	return (
+		typeof message === "object" &&
+		message !== null &&
+		(message as { type?: unknown }).type === "response"
+	);
+}
 
 export type BrowserViewOptions<T = undefined> = {
 	url: string | null;
 	html: string | null;
 	preload: string | null;
 	viewsRoot: string | null;
+	allowedProtocols: {
+		views?: boolean;
+		appData?: boolean;
+	};
 	renderer: "native" | "cef";
 	partition: string | null;
 	frame: {
@@ -73,6 +86,7 @@ const defaultOptions: Partial<BrowserViewOptions> = {
 	html: null,
 	preload: null,
 	viewsRoot: null,
+	allowedProtocols: { views: true, appData: false },
 	renderer: buildConfig.defaultRenderer,
 	frame: {
 		x: 0,
@@ -90,6 +104,10 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	html: string | null = null;
 	preload: string | null = null;
 	viewsRoot: string | null = null;
+	allowedProtocols: { views: boolean; appData: boolean } = {
+		views: true,
+		appData: false,
+	};
 	partition: string | null = null;
 	autoResize: boolean = true;
 	frame: {
@@ -107,6 +125,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	rpc?: T;
 	rpcHandler?: (msg: unknown) => void;
 	hostMessageSendQueue: QueuedWebviewMessage[] = [];
+	hostResponseSendQueue: QueuedWebviewMessage[] = [];
 	flushingHostMessageSendQueue: boolean = false;
 	navigationRules: string | null = null;
 	// Sandbox mode disables RPC and only allows event emission (for untrusted content)
@@ -131,6 +150,10 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.html = options.html || defaultOptions.html || null;
 		this.preload = options.preload || defaultOptions.preload || null;
 		this.viewsRoot = options.viewsRoot || defaultOptions.viewsRoot || null;
+		this.allowedProtocols = {
+			views: options.allowedProtocols?.views ?? true,
+			appData: options.allowedProtocols?.appData ?? false,
+		};
 		this.frame = {
 			x: options.frame?.x ?? defaultOptions.frame!.x,
 			y: options.frame?.y ?? defaultOptions.frame!.y,
@@ -176,6 +199,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			url: this.html ? null : this.url,
 			preload: this.preload,
 			viewsRoot: this.viewsRoot,
+			allowedProtocols: this.allowedProtocols,
 			frame: {
 				width: this.frame.width,
 				height: this.frame.height,
@@ -370,9 +394,28 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 				return;
 			}
 
-			this.hostMessageSendQueue.push({ message, markSent });
+			const queue =
+				HOST_MESSAGE_RESPONSE_PRIORITY && isRpcResponsePacket(message)
+					? this.hostResponseSendQueue
+					: this.hostMessageSendQueue;
+			queue.push({ message, markSent });
 			this.scheduleHostMessageFlush();
 		});
+	}
+
+	private hasQueuedHostMessages() {
+		return (
+			this.hostResponseSendQueue.length > 0 ||
+			this.hostMessageSendQueue.length > 0
+		);
+	}
+
+	private takeQueuedHostMessageBatch() {
+		const queue =
+			this.hostResponseSendQueue.length > 0
+				? this.hostResponseSendQueue
+				: this.hostMessageSendQueue;
+		return queue.splice(0, HOST_MESSAGE_SEND_BATCH_SIZE);
 	}
 
 	private scheduleHostMessageFlush() {
@@ -389,7 +432,11 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			for (const queuedMessage of queuedMessages) {
 				try {
 					if (
-						!sendMessageToWebviewViaSocket(this.id, queuedMessage.message)
+						!sendMessageToWebviewViaSocket(
+							this.id,
+							queuedMessage.message,
+							this.secretKey,
+						)
 					) {
 						this.sendHostMessageToWebviewViaExecute(queuedMessage.message);
 					}
@@ -432,14 +479,11 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 
 	async flushHostMessageSendQueue() {
 		try {
-			while (this.hostMessageSendQueue.length > 0 && !this.isRemoved) {
-				const batch = this.hostMessageSendQueue.splice(
-					0,
-					HOST_MESSAGE_SEND_BATCH_SIZE,
-				);
+			while (this.hasQueuedHostMessages() && !this.isRemoved) {
+				const batch = this.takeQueuedHostMessageBatch();
 				this.sendQueuedHostMessageBatch(batch);
 
-				if (this.hostMessageSendQueue.length > 0) {
+				if (this.hasQueuedHostMessages()) {
 					await new Promise((resolve) => setTimeout(resolve, 0));
 				}
 			}
@@ -447,13 +491,16 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			this.flushingHostMessageSendQueue = false;
 			if (this.isRemoved) {
 				this.resolveQueuedHostMessages();
-			} else if (this.hostMessageSendQueue.length > 0) {
+			} else if (this.hasQueuedHostMessages()) {
 				this.scheduleHostMessageFlush();
 			}
 		}
 	}
 
 	private resolveQueuedHostMessages() {
+		while (this.hostResponseSendQueue.length > 0) {
+			this.hostResponseSendQueue.shift()!.markSent();
+		}
 		while (this.hostMessageSendQueue.length > 0) {
 			this.hostMessageSendQueue.shift()!.markSent();
 		}

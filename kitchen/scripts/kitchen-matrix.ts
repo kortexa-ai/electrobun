@@ -6,7 +6,6 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
-	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -36,13 +35,25 @@ export type KitchenMatrixOptions = {
 	selectedVariants: KitchenVariant[] | null;
 };
 
-const activeChildren = new Set<ChildProcess>();
+const activeChildren = new Map<ChildProcess, boolean>();
 const workspaceExcludedEntries = new Set([
+	".hutch",
 	".cottontail-tmp",
 	"artifacts",
 	"build",
 ]);
 const workspaceSharedDirectoryEntries = new Set(["node_modules", "vendors"]);
+
+export function kitchenWorkspaceCopyOptions(
+	platform = process.platform,
+): Parameters<typeof cpSync>[2] {
+	// Older Cottontail releases used rounded NTFS directory IDs in the
+	// dereferencing fallback. Shared link-bearing entries are handled separately,
+	// so retain native tree copying here and avoid false ELOOP failures.
+	return platform === "win32"
+		? { recursive: true }
+		: { recursive: true, dereference: true };
+}
 
 export type KitchenVariantWorkspace = {
 	root: string;
@@ -72,7 +83,7 @@ function mirrorWorkspaceEntry(
 				process.platform === "win32" ? "junction" : "dir",
 			);
 		} else {
-			cpSync(source, destination, { recursive: true, dereference: true });
+			cpSync(source, destination, kitchenWorkspaceCopyOptions());
 		}
 		return;
 	}
@@ -267,22 +278,23 @@ function pipePrefixed(stream: Readable, prefix: string, target: NodeJS.WriteStre
 function runHutchForVariant(
 	hutchBinary: string,
 	workingRoot: string,
-	electrobunPackageRoot: string,
 	variant: KitchenVariant,
 	command: "build" | "run",
 ): Promise<void> {
 	const key = kitchenVariantKey(variant);
 	return new Promise((resolvePromise, rejectPromise) => {
+		const isolatedProcessGroup =
+			command === "build" && process.platform !== "win32";
 		const child = spawn(hutchBinary, ["electrobun", command], {
 			cwd: workingRoot,
-			env: {
-				...kitchenVariantEnvironment(process.env, variant),
-				COTTONTAIL_ELECTROBUN_PACKAGE: electrobunPackageRoot,
-			},
+			env: kitchenVariantEnvironment(process.env, variant),
 			stdio: ["ignore", "pipe", "pipe"],
+			// Interactive runs must stay in the terminal's foreground process group
+			// so Ctrl+C reaches the app even if an outer Hutch runner exits first.
+			detached: isolatedProcessGroup,
 			windowsHide: false,
 		});
-		activeChildren.add(child);
+		activeChildren.set(child, isolatedProcessGroup);
 		if (child.stdout) pipePrefixed(child.stdout, `[${key}] `, process.stdout);
 		if (child.stderr) pipePrefixed(child.stderr, `[${key}] `, process.stderr);
 
@@ -342,8 +354,40 @@ async function runBuildPool(
 	}
 }
 
-function stopChildren(): void {
-	for (const child of activeChildren) child.kill();
+type KillableChildProcess = Pick<
+	ChildProcess,
+	"pid" | "exitCode" | "signalCode" | "kill"
+>;
+
+export function stopChildProcessTree(
+	child: KillableChildProcess,
+	isolatedProcessGroup: boolean,
+	signal: NodeJS.Signals = "SIGTERM",
+	platform = process.platform,
+	killProcess: typeof process.kill = process.kill,
+): void {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	if (isolatedProcessGroup && platform !== "win32" && child.pid) {
+		try {
+			killProcess(-child.pid, signal);
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+		}
+	}
+	child.kill(platform === "win32" ? undefined : signal);
+}
+
+function stopChildren(signal: NodeJS.Signals = "SIGTERM"): void {
+	for (const [child, isolatedProcessGroup] of activeChildren) {
+		stopChildProcessTree(child, isolatedProcessGroup, signal);
+	}
+}
+
+function interruptedExitStatus(signal: NodeJS.Signals): number {
+	if (signal === "SIGINT") return 130;
+	if (signal === "SIGTERM") return 143;
+	return 1;
 }
 
 export async function runKitchenMatrix(args: string[]): Promise<void> {
@@ -365,12 +409,18 @@ export async function runKitchenMatrix(args: string[]): Promise<void> {
 
 	const kitchenRoot = resolve(import.meta.dirname, "..");
 	const hutchBinary = process.env["HUTCH_BINARY"] || "hutch";
-	const electrobunPackageRoot = realpathSync(
-		join(kitchenRoot, "node_modules", "electrobun"),
-	);
-	const interrupt = () => stopChildren();
-	process.once("SIGINT", interrupt);
-	process.once("SIGTERM", interrupt);
+	let interruptedBy: NodeJS.Signals | null = null;
+	const interrupt = (signal: NodeJS.Signals) => {
+		if (interruptedBy) return;
+		interruptedBy = signal;
+		// App runtimes use SIGTERM for their graceful quit path. Preserve the
+		// original signal only for the matrix runner's eventual exit status.
+		stopChildren("SIGTERM");
+	};
+	const onSigint = () => interrupt("SIGINT");
+	const onSigterm = () => interrupt("SIGTERM");
+	process.on("SIGINT", onSigint);
+	process.on("SIGTERM", onSigterm);
 	let matrixRunRoot: string | null = null;
 
 	try {
@@ -391,7 +441,6 @@ export async function runKitchenMatrix(args: string[]): Promise<void> {
 				await runHutchForVariant(
 					hutchBinary,
 					workspace.root,
-					electrobunPackageRoot,
 					variant,
 					"build",
 				);
@@ -410,7 +459,6 @@ export async function runKitchenMatrix(args: string[]): Promise<void> {
 					await runHutchForVariant(
 						hutchBinary,
 						kitchenRoot,
-						electrobunPackageRoot,
 						variant,
 						"run",
 					);
@@ -425,17 +473,29 @@ export async function runKitchenMatrix(args: string[]): Promise<void> {
 			throw new Error(failures.map((failure) => failure.message).join("\n"));
 		}
 		console.log("All kitchen variants closed successfully.");
+	} catch (error) {
+		if (!interruptedBy) throw error;
 	} finally {
-		process.off("SIGINT", interrupt);
-		process.off("SIGTERM", interrupt);
+		process.off("SIGINT", onSigint);
+		process.off("SIGTERM", onSigterm);
 		stopChildren();
 		if (matrixRunRoot) rmSync(matrixRunRoot, { recursive: true, force: true });
+	}
+
+	if (interruptedBy) {
+		const interruption = new Error(
+			`Kitchen matrix interrupted by ${interruptedBy}`,
+		) as Error & { status?: number };
+		interruption.status = interruptedExitStatus(interruptedBy);
+		throw interruption;
 	}
 }
 
 if (import.meta.main) {
 	runKitchenMatrix(process.argv.slice(2)).catch((error) => {
 		console.error(error instanceof Error ? error.message : String(error));
-		process.exitCode = 1;
+		const status = (error as { status?: number | null })?.status;
+		process.exitCode =
+			typeof status === "number" && Number.isInteger(status) ? status : 1;
 	});
 }

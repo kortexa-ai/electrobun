@@ -1,6 +1,45 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const install_root_name_environment_variable = "ELECTROBUN_INSTALL_ROOT_NAME";
+
+// Zig 0.16's std.DynLib does not support Windows. Keep the SDK's loader
+// surface consistent there by using the equivalent Win32 APIs directly.
+const WindowsDynamicLibrary = struct {
+    const win = std.os.windows;
+
+    extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?win.HMODULE;
+    extern "kernel32" fn FreeLibrary(hModule: win.HMODULE) callconv(.winapi) win.BOOL;
+    extern "kernel32" fn GetProcAddress(hModule: win.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?win.FARPROC;
+
+    module: win.HMODULE,
+
+    fn open(allocator: std.mem.Allocator, path: []const u8) !WindowsDynamicLibrary {
+        const path_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, path);
+        defer allocator.free(path_w);
+        const module = LoadLibraryW(path_w.ptr) orelse return error.FileNotFound;
+        return .{ .module = module };
+    }
+
+    fn close(self: *WindowsDynamicLibrary) void {
+        _ = FreeLibrary(self.module);
+    }
+
+    fn lookup(self: *WindowsDynamicLibrary, comptime T: type, name: [:0]const u8) ?T {
+        const address = GetProcAddress(self.module, name.ptr) orelse return null;
+        return @ptrCast(@alignCast(address));
+    }
+};
+
+const DynamicLibrary = if (builtin.os.tag == .windows) WindowsDynamicLibrary else std.DynLib;
+
+fn openDynamicLibrary(allocator: std.mem.Allocator, path: []const u8) !DynamicLibrary {
+    if (builtin.os.tag == .windows) {
+        return DynamicLibrary.open(allocator, path);
+    }
+    return DynamicLibrary.open(path);
+}
+
 // The SDK owns a lazily-initialized event-loop-free Io implementation so its
 // allocator-based public API keeps working without threading `std.Io` through
 // every call site. Apps with their own `Io` can keep using it side by side.
@@ -45,6 +84,27 @@ fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
     return processEnviron().getAlloc(allocator, key);
 }
 
+fn isSafeInstallRootName(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256 or
+        std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    for (value) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\') return false;
+    }
+    if (builtin.os.tag == .windows) {
+        if (value[value.len - 1] == ' ' or value[value.len - 1] == '.') return false;
+        if (std.mem.indexOfAny(u8, value, "\"%*:<>?|") != null) return false;
+    }
+    return true;
+}
+
+fn effectiveInstallRootNameOwned(allocator: std.mem.Allocator, fallback: []const u8) ![]u8 {
+    const candidate = getEnvVarOwned(allocator, install_root_name_environment_variable) catch
+        return allocator.dupe(u8, fallback);
+    if (isSafeInstallRootName(candidate)) return candidate;
+    allocator.free(candidate);
+    return allocator.dupe(u8, fallback);
+}
+
 pub const WindowCloseHandler = *const fn (u32) callconv(.c) void;
 pub const WindowShouldCloseHandler = *const fn (u32) callconv(.c) void;
 pub const WindowMoveHandler = *const fn (u32, f64, f64) callconv(.c) void;
@@ -61,6 +121,29 @@ pub const QuitRequestedHandler = *const fn () callconv(.c) void;
 pub const URLOpenHandler = *const fn ([*:0]const u8) callconv(.c) void;
 pub const AppReopenHandler = *const fn () callconv(.c) void;
 
+// Quit-requested plumbing.
+//
+// The core invokes its quit-requested handler when the last window closes (see
+// `setExitOnLastWindowClosed`, on by default), when the app is asked to
+// terminate (Cmd+Q), and on SIGINT/SIGTERM. The JS SDK always registers a
+// handler, which is why closing the last window quits a Bun app. Zig apps used
+// to leave the handler unset, so the process kept running headless after the
+// last window closed. `Core.load` now installs the trampoline below so every
+// Zig app gets the same default: stop the event loop, which lets
+// `runMainThread` return and `main` unwind normally.
+var quit_requested_stop_event_loop: ?*const fn () callconv(.c) void = null;
+var quit_requested_user_handler: ?QuitRequestedHandler = null;
+
+fn quitRequestedTrampoline() callconv(.c) void {
+    if (quit_requested_user_handler) |handler| {
+        handler();
+        return;
+    }
+    if (quit_requested_stop_event_loop) |stop_event_loop| {
+        stop_event_loop();
+    }
+}
+
 pub const Renderer = enum {
     native,
     cef,
@@ -71,9 +154,10 @@ pub const AppInfo = struct {
     name: []const u8,
     channel: []const u8,
 
-    /// False for dev builds; true for nonempty release channels.
+    /// True only for the canonical stable and canary release channels.
     pub fn isPackaged(self: AppInfo) bool {
-        return self.channel.len > 0 and !std.mem.eql(u8, self.channel, "dev");
+        return std.mem.eql(u8, self.channel, "stable") or
+            std.mem.eql(u8, self.channel, "canary");
     }
 };
 
@@ -83,7 +167,8 @@ test "AppInfo packaged mode reflects build channel" {
     try std.testing.expect(!base.isPackaged());
     try std.testing.expect(!(AppInfo{ .identifier = base.identifier, .name = base.name, .channel = "dev" }).isPackaged());
     try std.testing.expect((AppInfo{ .identifier = base.identifier, .name = base.name, .channel = "canary" }).isPackaged());
-    try std.testing.expect((AppInfo{ .identifier = base.identifier, .name = base.name, .channel = "production" }).isPackaged());
+    try std.testing.expect((AppInfo{ .identifier = base.identifier, .name = base.name, .channel = "stable" }).isPackaged());
+    try std.testing.expect(!(AppInfo{ .identifier = base.identifier, .name = base.name, .channel = "production" }).isPackaged());
 }
 
 pub const OwnedAppInfo = struct {
@@ -112,6 +197,56 @@ pub const Rect = struct {
     width: f64 = 800,
     height: f64 = 600,
 };
+
+const ScreenCaptureLayout = struct {
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    byte_len_u64: u64,
+};
+
+fn screenCaptureLayout(rectangle: Rect) !ScreenCaptureLayout {
+    if (!std.math.isFinite(rectangle.x) or
+        !std.math.isFinite(rectangle.y) or
+        !std.math.isFinite(rectangle.width) or
+        !std.math.isFinite(rectangle.height))
+    {
+        return error.InvalidScreenCaptureRegion;
+    }
+
+    const max_dimension: f64 = @floatFromInt(std.math.maxInt(u32));
+    if (rectangle.width <= 0 or
+        rectangle.height <= 0 or
+        rectangle.width != @floor(rectangle.width) or
+        rectangle.height != @floor(rectangle.height) or
+        rectangle.width > max_dimension or
+        rectangle.height > max_dimension)
+    {
+        return error.InvalidScreenCaptureRegion;
+    }
+
+    const width: u32 = @intFromFloat(rectangle.width);
+    const height: u32 = @intFromFloat(rectangle.height);
+    const pixel_count = @as(u64, width) * @as(u64, height);
+    if (pixel_count > std.math.maxInt(u64) / 4) {
+        return error.InvalidScreenCaptureRegion;
+    }
+    const byte_len_u64 = pixel_count * 4;
+    if (byte_len_u64 > std.math.maxInt(usize)) {
+        return error.InvalidScreenCaptureRegion;
+    }
+
+    return .{
+        .x = @floor(rectangle.x),
+        .y = @floor(rectangle.y),
+        .width = width,
+        .height = height,
+        .byte_len = @intCast(byte_len_u64),
+        .byte_len_u64 = byte_len_u64,
+    };
+}
 
 pub const TrafficLightOffset = struct {
     x: f64 = 0,
@@ -165,6 +300,11 @@ pub const WebviewCallbacks = struct {
     internal_bridge: ?WebviewPostMessageHandler = null,
 };
 
+pub const AllowedProtocols = struct {
+    views: bool = true,
+    app_data: bool = false,
+};
+
 pub const WebviewOptions = struct {
     window_id: u32,
     host_webview_id: u32 = 0,
@@ -177,6 +317,7 @@ pub const WebviewOptions = struct {
     secret_key: []const u8 = "",
     preload: []const u8 = "",
     views_root: []const u8 = "",
+    allowed_protocols: AllowedProtocols = .{},
     sandbox: bool = true,
     start_transparent: bool = false,
     start_passthrough: bool = false,
@@ -450,7 +591,7 @@ pub const WgpuAdapterDevice = struct {
 };
 
 pub const WgpuNative = struct {
-    lib: std.DynLib,
+    lib: DynamicLibrary,
     symbols: Symbols,
 
     const CreateInstanceFn = *const fn (?*const anyopaque) callconv(.c) ?*anyopaque;
@@ -473,7 +614,8 @@ pub const WgpuNative = struct {
         const lib_path = try std.fs.path.join(allocator, &.{ bundle_paths.exe_dir, lib_name });
         defer allocator.free(lib_path);
 
-        var lib = try std.DynLib.open(lib_path);
+        var lib = try openDynamicLibrary(allocator, lib_path);
+        errdefer lib.close();
         return .{
             .lib = lib,
             .symbols = .{
@@ -485,6 +627,10 @@ pub const WgpuNative = struct {
 
     pub fn close(self: *WgpuNative) void {
         self.lib.close();
+    }
+
+    pub fn lookup(self: *WgpuNative, comptime T: type, name: [:0]const u8) ?T {
+        return self.lib.lookup(T, name);
     }
 
     pub fn createInstance(self: *WgpuNative) ?*anyopaque {
@@ -625,9 +771,43 @@ pub fn resolveAppInfoFromBundle(allocator: std.mem.Allocator, bundle_paths: *con
     };
 }
 
+/// Reads `runtime.exitOnLastWindowClosed` out of the bundled
+/// Resources/build.json, the same value the JS SDK reads through BuildConfig.
+/// Anything missing or malformed falls back to the documented default: quit
+/// when the last window closes.
+pub fn exitOnLastWindowClosedFromBuildConfig(
+    allocator: std.mem.Allocator,
+    bundle_paths: *const BundlePaths,
+) bool {
+    const build_json_path = std.fs.path.join(
+        allocator,
+        &.{ bundle_paths.resources_dir, "build.json" },
+    ) catch return true;
+    defer allocator.free(build_json_path);
+
+    const build_json = readFileAlloc(allocator, build_json_path) catch return true;
+    defer allocator.free(build_json);
+
+    return exitOnLastWindowClosedFromJson(allocator, build_json);
+}
+
+pub fn exitOnLastWindowClosedFromJson(allocator: std.mem.Allocator, build_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, build_json, .{}) catch return true;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return true;
+    const runtime_value = parsed.value.object.get("runtime") orelse return true;
+    if (runtime_value != .object) return true;
+    const enabled = runtime_value.object.get("exitOnLastWindowClosed") orelse return true;
+    return switch (enabled) {
+        .bool => |value| value,
+        else => true,
+    };
+}
+
 pub const Core = struct {
     allocator: std.mem.Allocator,
-    lib: std.DynLib,
+    lib: DynamicLibrary,
     symbols: Symbols,
 
     const LastErrorFn = *const fn () callconv(.c) [*:0]const u8;
@@ -636,6 +816,7 @@ pub const Core = struct {
     const GetWindowStyleFn = *const fn (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) callconv(.c) u32;
     const CreateWindowFn = *const fn (f64, f64, f64, f64, u32, [*:0]const u8, bool, [*:0]const u8, bool, bool, bool, f64, f64, ?WindowCloseHandler, ?WindowMoveHandler, ?WindowResizeHandler, ?WindowFocusHandler, ?WindowBlurHandler, ?WindowKeyHandler, ?WindowShouldCloseHandler) callconv(.c) u32;
     const CreateWebviewFn = *const fn (u32, u32, [*:0]const u8, [*:0]const u8, f64, f64, f64, f64, bool, [*:0]const u8, ?DecideNavigationHandler, ?WebviewEventHandler, ?WebviewPostMessageHandler, ?WebviewPostMessageHandler, ?WebviewPostMessageHandler, [*:0]const u8, [*:0]const u8, [*:0]const u8, bool, bool, bool, bool) callconv(.c) u32;
+    const SetNextWebviewAllowedProtocolsFn = *const fn (bool, bool) callconv(.c) void;
     const CreateWGPUViewFn = *const fn (u32, f64, f64, f64, f64, bool, bool, bool) callconv(.c) u32;
     const SetWindowTitleFn = *const fn (u32, [*:0]const u8) callconv(.c) void;
     const MinimizeWindowFn = *const fn (u32) callconv(.c) void;
@@ -712,6 +893,7 @@ pub const Core = struct {
     const GetPrimaryDisplayFn = *const fn () callconv(.c) ?[*:0]const u8;
     const GetAllDisplaysFn = *const fn () callconv(.c) ?[*:0]const u8;
     const GetCursorScreenPointFn = *const fn () callconv(.c) ?[*:0]const u8;
+    const CaptureScreenRegionFn = *const fn (f64, f64, u32, u32, [*]u8, u64) callconv(.c) bool;
     const MoveToTrashFn = *const fn ([*:0]const u8) callconv(.c) bool;
     const ShowItemInFolderFn = *const fn ([*:0]const u8) callconv(.c) void;
     const OpenExternalFn = *const fn ([*:0]const u8) callconv(.c) bool;
@@ -738,6 +920,7 @@ pub const Core = struct {
     const SetURLOpenHandlerFn = *const fn (?URLOpenHandler) callconv(.c) void;
     const SetAppReopenHandlerFn = *const fn (?AppReopenHandler) callconv(.c) void;
     const SetQuitRequestedHandlerFn = *const fn (?QuitRequestedHandler) callconv(.c) void;
+    const SetExitOnLastWindowClosedFn = *const fn (bool) callconv(.c) void;
     const StopEventLoopFn = *const fn () callconv(.c) void;
     const WaitForShutdownCompleteFn = *const fn (c_int) callconv(.c) void;
     const ForceExitFn = *const fn (c_int) callconv(.c) void;
@@ -754,6 +937,7 @@ pub const Core = struct {
         get_window_style: GetWindowStyleFn,
         create_window: CreateWindowFn,
         create_webview: CreateWebviewFn,
+        set_next_webview_allowed_protocols: SetNextWebviewAllowedProtocolsFn,
         create_wgpu_view: CreateWGPUViewFn,
         set_window_title: SetWindowTitleFn,
         minimize_window: MinimizeWindowFn,
@@ -830,6 +1014,7 @@ pub const Core = struct {
         get_primary_display: GetPrimaryDisplayFn,
         get_all_displays: GetAllDisplaysFn,
         get_cursor_screen_point: GetCursorScreenPointFn,
+        capture_screen_region: CaptureScreenRegionFn,
         move_to_trash: MoveToTrashFn,
         show_item_in_folder: ShowItemInFolderFn,
         open_external: OpenExternalFn,
@@ -856,6 +1041,7 @@ pub const Core = struct {
         set_url_open_handler: SetURLOpenHandlerFn,
         set_app_reopen_handler: SetAppReopenHandlerFn,
         set_quit_requested_handler: SetQuitRequestedHandlerFn,
+        set_exit_on_last_window_closed: SetExitOnLastWindowClosedFn,
         stop_event_loop: StopEventLoopFn,
         wait_for_shutdown_complete: WaitForShutdownCompleteFn,
         force_exit: ForceExitFn,
@@ -878,9 +1064,10 @@ pub const Core = struct {
         const lib_path = try std.fs.path.join(allocator, &.{ bundle_paths.exe_dir, lib_name });
         defer allocator.free(lib_path);
 
-        var lib = try std.DynLib.open(lib_path);
+        var lib = try openDynamicLibrary(allocator, lib_path);
+        errdefer lib.close();
 
-        return .{
+        var core: Core = .{
             .allocator = allocator,
             .lib = lib,
             .symbols = .{
@@ -890,6 +1077,7 @@ pub const Core = struct {
                 .get_window_style = lib.lookup(GetWindowStyleFn, "getWindowStyle") orelse return error.MissingCoreSymbol,
                 .create_window = lib.lookup(CreateWindowFn, "createWindow") orelse return error.MissingCoreSymbol,
                 .create_webview = lib.lookup(CreateWebviewFn, "createWebview") orelse return error.MissingCoreSymbol,
+                .set_next_webview_allowed_protocols = lib.lookup(SetNextWebviewAllowedProtocolsFn, "setNextWebviewAllowedProtocols") orelse return error.MissingCoreSymbol,
                 .create_wgpu_view = lib.lookup(CreateWGPUViewFn, "createWGPUView") orelse return error.MissingCoreSymbol,
                 .set_window_title = lib.lookup(SetWindowTitleFn, "setWindowTitle") orelse return error.MissingCoreSymbol,
                 .minimize_window = lib.lookup(MinimizeWindowFn, "minimizeWindow") orelse return error.MissingCoreSymbol,
@@ -966,6 +1154,7 @@ pub const Core = struct {
                 .get_primary_display = lib.lookup(GetPrimaryDisplayFn, "getPrimaryDisplay") orelse return error.MissingCoreSymbol,
                 .get_all_displays = lib.lookup(GetAllDisplaysFn, "getAllDisplays") orelse return error.MissingCoreSymbol,
                 .get_cursor_screen_point = lib.lookup(GetCursorScreenPointFn, "getCursorScreenPoint") orelse return error.MissingCoreSymbol,
+                .capture_screen_region = lib.lookup(CaptureScreenRegionFn, "captureScreenRegion") orelse return error.MissingCoreSymbol,
                 .move_to_trash = lib.lookup(MoveToTrashFn, "moveToTrash") orelse return error.MissingCoreSymbol,
                 .show_item_in_folder = lib.lookup(ShowItemInFolderFn, "showItemInFolder") orelse return error.MissingCoreSymbol,
                 .open_external = lib.lookup(OpenExternalFn, "openExternal") orelse return error.MissingCoreSymbol,
@@ -992,6 +1181,7 @@ pub const Core = struct {
                 .set_url_open_handler = lib.lookup(SetURLOpenHandlerFn, "setURLOpenHandler") orelse return error.MissingCoreSymbol,
                 .set_app_reopen_handler = lib.lookup(SetAppReopenHandlerFn, "setAppReopenHandler") orelse return error.MissingCoreSymbol,
                 .set_quit_requested_handler = lib.lookup(SetQuitRequestedHandlerFn, "setQuitRequestedHandler") orelse return error.MissingCoreSymbol,
+                .set_exit_on_last_window_closed = lib.lookup(SetExitOnLastWindowClosedFn, "setExitOnLastWindowClosed") orelse return error.MissingCoreSymbol,
                 .stop_event_loop = lib.lookup(StopEventLoopFn, "stopEventLoop") orelse return error.MissingCoreSymbol,
                 .wait_for_shutdown_complete = lib.lookup(WaitForShutdownCompleteFn, "waitForShutdownComplete") orelse return error.MissingCoreSymbol,
                 .force_exit = lib.lookup(ForceExitFn, "forceExit") orelse return error.MissingCoreSymbol,
@@ -1002,9 +1192,26 @@ pub const Core = struct {
                 .wgpu_surface_present_main_thread = lib.lookup(WgpuSurfacePresentMainThreadFn, "wgpuSurfacePresentMainThread") orelse return error.MissingCoreSymbol,
             },
         };
+
+        // Honour the app's `runtime.exitOnLastWindowClosed` setting, which the
+        // JS SDK applies at startup too. The core only acts on it when a
+        // quit-requested handler is registered, so install one as well.
+        core.symbols.set_exit_on_last_window_closed(
+            exitOnLastWindowClosedFromBuildConfig(allocator, &bundle_paths),
+        );
+        quit_requested_stop_event_loop = core.symbols.stop_event_loop;
+        quit_requested_user_handler = null;
+        core.symbols.set_quit_requested_handler(quitRequestedTrampoline);
+
+        return core;
     }
 
     pub fn close(self: *Core) void {
+        // Drop the core's pointer to our trampoline before unloading the
+        // library so a late quit request can't jump into freed code.
+        self.symbols.set_quit_requested_handler(null);
+        quit_requested_stop_event_loop = null;
+        quit_requested_user_handler = null;
         self.lib.close();
     }
 
@@ -1260,6 +1467,11 @@ pub const Core = struct {
         defer self.allocator.free(preload_z);
         const views_root_z = try self.dupeZ(options.views_root);
         defer self.allocator.free(views_root_z);
+
+        self.symbols.set_next_webview_allowed_protocols(
+            options.allowed_protocols.views,
+            options.allowed_protocols.app_data,
+        );
 
         const webview_id = self.symbols.create_webview(
             options.window_id,
@@ -1660,6 +1872,27 @@ pub const Core = struct {
         return try parseJsonOwned(self.allocator, Point, std.mem.span(json));
     }
 
+    /// Captures a logical desktop rectangle as tightly packed, row-major RGBA
+    /// pixels. Fractional origins are aligned down to the logical pixel grid.
+    /// The returned slice uses `self.allocator`; the caller owns and must free it.
+    pub fn captureScreenRegion(self: *Core, rectangle: Rect) ![]u8 {
+        const layout = try screenCaptureLayout(rectangle);
+        const pixels = try self.allocator.alloc(u8, layout.byte_len);
+        errdefer self.allocator.free(pixels);
+
+        if (!self.symbols.capture_screen_region(
+            layout.x,
+            layout.y,
+            layout.width,
+            layout.height,
+            pixels.ptr,
+            layout.byte_len_u64,
+        )) {
+            return error.ElectrobunCoreFailure;
+        }
+        return pixels;
+    }
+
     pub fn moveToTrash(self: *Core, path: []const u8) !bool {
         const path_z = try self.dupeZ(path);
         defer self.allocator.free(path_z);
@@ -1854,8 +2087,17 @@ pub const Core = struct {
         try self.ensureLastCallSucceeded();
     }
 
+    /// Override the default quit behaviour. Pass `null` to restore the SDK
+    /// default (stop the event loop so `runMainThread` returns).
     pub fn setQuitRequestedHandler(self: *Core, handler: ?QuitRequestedHandler) !void {
-        self.symbols.set_quit_requested_handler(handler);
+        quit_requested_user_handler = handler;
+        self.symbols.set_quit_requested_handler(quitRequestedTrampoline);
+        try self.ensureLastCallSucceeded();
+    }
+
+    /// When enabled (the default), closing the last window quits the app.
+    pub fn setExitOnLastWindowClosed(self: *Core, enabled: bool) !void {
+        self.symbols.set_exit_on_last_window_closed(enabled);
         try self.ensureLastCallSucceeded();
     }
 
@@ -2059,7 +2301,16 @@ fn buildAppScopedDir(allocator: std.mem.Allocator, base: []const u8, app_info: A
     if (app_info.identifier.len == 0 or app_info.channel.len == 0) {
         return allocator.dupe(u8, base);
     }
-    return std.fs.path.join(allocator, &.{ base, app_info.identifier, app_info.channel });
+    const install_root_name = try effectiveInstallRootNameOwned(allocator, app_info.channel);
+    defer allocator.free(install_root_name);
+    return std.fs.path.join(allocator, &.{ base, app_info.identifier, install_root_name });
+}
+
+test "native paths validate the launcher install root override" {
+    try std.testing.expect(isSafeInstallRootName("stable"));
+    try std.testing.expect(isSafeInstallRootName("Legacy App"));
+    const invalid = [_][]const u8{ "", ".", "..", "nested/root", "nested\\root", "line\nbreak" };
+    for (invalid) |value| try std.testing.expect(!isSafeInstallRootName(value));
 }
 
 fn readFileZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
@@ -2169,4 +2420,71 @@ test "dialog path JSON preserves commas and escaped characters" {
     try std.testing.expectEqualStrings("/tmp/report,final.txt", paths[0]);
     try std.testing.expectEqualStrings("C:\\Temp\\quoted\"file.txt", paths[1]);
     try std.testing.expectEqualStrings("line\nbreak", paths[2]);
+}
+
+test "screen capture layout floors origins and computes RGBA size" {
+    const layout = try screenCaptureLayout(.{
+        .x = 12.75,
+        .y = -3.125,
+        .width = 2,
+        .height = 3,
+    });
+
+    try std.testing.expectEqual(@as(f64, 12), layout.x);
+    try std.testing.expectEqual(@as(f64, -4), layout.y);
+    try std.testing.expectEqual(@as(u32, 2), layout.width);
+    try std.testing.expectEqual(@as(u32, 3), layout.height);
+    try std.testing.expectEqual(@as(usize, 24), layout.byte_len);
+    try std.testing.expectEqual(@as(u64, 24), layout.byte_len_u64);
+}
+
+test "screen capture layout rejects invalid and overflowing dimensions" {
+    try std.testing.expectError(
+        error.InvalidScreenCaptureRegion,
+        screenCaptureLayout(.{ .width = 0, .height = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidScreenCaptureRegion,
+        screenCaptureLayout(.{ .width = 1.5, .height = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidScreenCaptureRegion,
+        screenCaptureLayout(.{ .width = 4294967296, .height = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidScreenCaptureRegion,
+        screenCaptureLayout(.{ .width = 4294967295, .height = 4294967295 }),
+    );
+    try std.testing.expectError(
+        error.InvalidScreenCaptureRegion,
+        screenCaptureLayout(.{ .x = std.math.inf(f64), .width = 1, .height = 1 }),
+    );
+}
+
+test "build config controls quitting on last window close" {
+    const allocator = std.testing.allocator;
+
+    // Documented default when the app says nothing.
+    try std.testing.expect(exitOnLastWindowClosedFromJson(allocator, "{}"));
+    try std.testing.expect(exitOnLastWindowClosedFromJson(
+        allocator,
+        "{\"runtime\":{\"other\":1}}",
+    ));
+    try std.testing.expect(exitOnLastWindowClosedFromJson(
+        allocator,
+        "{\"runtime\":{\"exitOnLastWindowClosed\":true}}",
+    ));
+
+    // Tray-style apps opt out and must keep running with no windows.
+    try std.testing.expect(!exitOnLastWindowClosedFromJson(
+        allocator,
+        "{\"runtime\":{\"exitOnLastWindowClosed\":false}}",
+    ));
+
+    // Malformed or unexpected shapes fall back to the default.
+    try std.testing.expect(exitOnLastWindowClosedFromJson(allocator, "not json"));
+    try std.testing.expect(exitOnLastWindowClosedFromJson(
+        allocator,
+        "{\"runtime\":{\"exitOnLastWindowClosed\":\"false\"}}",
+    ));
 }

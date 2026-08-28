@@ -14,10 +14,13 @@ import "core:c"
 import "core:dynlib"
 import "core:encoding/json"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:path/filepath"
 import "core:reflect"
 import "core:strings"
+
+INSTALL_ROOT_NAME_ENVIRONMENT_VARIABLE :: "ELECTROBUN_INSTALL_ROOT_NAME"
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -33,6 +36,8 @@ Error :: enum {
 	InvalidJson,
 	FileReadFailed,
 	EnvVarNotFound,
+	InvalidScreenCaptureRegion,
+	AllocationFailed,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +59,33 @@ GlobalShortcutHandler :: proc "c" (cstring)
 QuitRequestedHandler :: proc "c" ()
 URLOpenHandler :: proc "c" (cstring)
 AppReopenHandler :: proc "c" ()
+
+// Quit-requested plumbing.
+//
+// The core invokes its quit-requested handler when the last window closes (see
+// setExitOnLastWindowClosed, on by default), when the app is asked to terminate
+// (Cmd+Q), and on SIGINT/SIGTERM. The JS SDK always registers a handler, which
+// is why closing the last window quits a Bun app. Odin apps used to leave the
+// handler unset, so the process kept running headless after the last window
+// closed. `load` now installs the trampoline below so every Odin app gets the
+// same default: stop the event loop, which lets runMainThread return and main
+// unwind normally.
+@(private = "file")
+g_quit_requested_stop_event_loop: VoidFn
+
+@(private = "file")
+g_quit_requested_user_handler: QuitRequestedHandler
+
+@(private = "file")
+quit_requested_trampoline :: proc "c" () {
+	if g_quit_requested_user_handler != nil {
+		g_quit_requested_user_handler()
+		return
+	}
+	if g_quit_requested_stop_event_loop != nil {
+		g_quit_requested_stop_event_loop()
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -96,9 +128,9 @@ borrowed :: proc(self: OwnedAppInfo) -> AppInfo {
 	return {identifier = self.identifier, name = self.name, channel = self.channel}
 }
 
-// False for dev builds; true for nonempty release channels.
+// True only for the canonical stable and canary release channels.
 appInfoIsPackaged :: proc(app_info: AppInfo) -> bool {
-	return len(app_info.channel) > 0 && app_info.channel != "dev"
+	return app_info.channel == "stable" || app_info.channel == "canary"
 }
 
 Rect :: struct {
@@ -106,6 +138,51 @@ Rect :: struct {
 	y:      f64,
 	width:  f64,
 	height: f64,
+}
+
+@(private = "file")
+ScreenCaptureLayout :: struct {
+	x:            f64,
+	y:            f64,
+	width:        u32,
+	height:       u32,
+	byte_len:     int,
+	byte_len_u64: u64,
+}
+
+@(private = "file")
+screen_capture_layout :: proc(rectangle: Rect) -> (layout: ScreenCaptureLayout, err: Error) {
+	if math.is_nan(rectangle.x) || math.is_inf(rectangle.x) ||
+	   math.is_nan(rectangle.y) || math.is_inf(rectangle.y) ||
+	   math.is_nan(rectangle.width) || math.is_inf(rectangle.width) ||
+	   math.is_nan(rectangle.height) || math.is_inf(rectangle.height) {
+		return {}, .InvalidScreenCaptureRegion
+	}
+
+	max_dimension := f64(max(u32))
+	if rectangle.width <= 0 || rectangle.height <= 0 ||
+	   rectangle.width != math.floor(rectangle.width) ||
+	   rectangle.height != math.floor(rectangle.height) ||
+	   rectangle.width > max_dimension || rectangle.height > max_dimension {
+		return {}, .InvalidScreenCaptureRegion
+	}
+
+	width := u32(rectangle.width)
+	height := u32(rectangle.height)
+	pixel_count := u64(width) * u64(height)
+	if pixel_count > u64(max(int)) / 4 {
+		return {}, .InvalidScreenCaptureRegion
+	}
+	byte_len_u64 := pixel_count * 4
+
+	return ScreenCaptureLayout{
+		x = math.floor(rectangle.x),
+		y = math.floor(rectangle.y),
+		width = width,
+		height = height,
+		byte_len = int(byte_len_u64),
+		byte_len_u64 = byte_len_u64,
+	}, .None
 }
 
 DEFAULT_RECT :: Rect{0, 0, 800, 600}
@@ -181,6 +258,11 @@ WebviewCallbacks :: struct {
 	internal_bridge:   WebviewPostMessageHandler,
 }
 
+AllowedProtocols :: struct {
+	views:    bool,
+	app_data: bool,
+}
+
 WebviewOptions :: struct {
 	window_id:         u32,
 	host_webview_id:   u32,
@@ -193,6 +275,7 @@ WebviewOptions :: struct {
 	secret_key:        string,
 	preload:           string,
 	views_root:        string,
+	allowed_protocols: AllowedProtocols,
 	sandbox:           bool,
 	start_transparent: bool,
 	start_passthrough: bool,
@@ -208,6 +291,7 @@ defaultWebviewOptions :: proc(window_id: u32) -> WebviewOptions {
 		frame = DEFAULT_RECT,
 		auto_resize = true,
 		partition = "persist:default",
+		allowed_protocols = {views = true},
 		sandbox = true,
 	}
 }
@@ -465,6 +549,52 @@ resolveAppInfoFromBundle :: proc(
 	return app_info, .None
 }
 
+// Reads runtime.exitOnLastWindowClosed out of the bundled Resources/build.json,
+// the same value the JS SDK reads through BuildConfig. Anything missing or
+// malformed falls back to the documented default: quit when the last window
+// closes.
+exitOnLastWindowClosedFromBuildConfig :: proc(
+	allocator: runtime.Allocator,
+	bundle_paths: ^BundlePaths,
+) -> bool {
+	build_json_path := join_path(allocator, {bundle_paths.resources_dir, "build.json"})
+	defer delete(build_json_path, allocator)
+
+	build_json, read_err := os.read_entire_file(build_json_path, allocator)
+	if read_err != nil {
+		return true
+	}
+	defer delete(build_json, allocator)
+
+	value, parse_err := json.parse(build_json, json.DEFAULT_SPECIFICATION, true, allocator)
+	if parse_err != .None {
+		return true
+	}
+	defer json.destroy_value(value, allocator)
+
+	root, root_is_object := value.(json.Object)
+	if !root_is_object {
+		return true
+	}
+	runtime_value, has_runtime := root["runtime"]
+	if !has_runtime {
+		return true
+	}
+	runtime_object, runtime_is_object := runtime_value.(json.Object)
+	if !runtime_is_object {
+		return true
+	}
+	enabled_value, has_enabled := runtime_object["exitOnLastWindowClosed"]
+	if !has_enabled {
+		return true
+	}
+	enabled, is_bool := enabled_value.(json.Boolean)
+	if !is_bool {
+		return true
+	}
+	return bool(enabled)
+}
+
 // ---------------------------------------------------------------------------
 // Window registry
 // ---------------------------------------------------------------------------
@@ -708,6 +838,7 @@ ConfigureWebviewRuntimeFn :: proc "c" (u32, cstring, cstring) -> bool
 GetWindowStyleFn :: proc "c" (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) -> u32
 CreateWindowFn :: proc "c" (f64, f64, f64, f64, u32, cstring, bool, cstring, bool, bool, bool, f64, f64, WindowCloseHandler, WindowMoveHandler, WindowResizeHandler, WindowFocusHandler, WindowBlurHandler, WindowKeyHandler, WindowShouldCloseHandler) -> u32
 CreateWebviewFn :: proc "c" (u32, u32, cstring, cstring, f64, f64, f64, f64, bool, cstring, DecideNavigationHandler, WebviewEventHandler, WebviewPostMessageHandler, WebviewPostMessageHandler, WebviewPostMessageHandler, cstring, cstring, cstring, bool, bool, bool, bool) -> u32
+SetNextWebviewAllowedProtocolsFn :: proc "c" (bool, bool)
 CreateWGPUViewFn :: proc "c" (u32, f64, f64, f64, f64, bool, bool, bool) -> u32
 SetWindowTitleFn :: proc "c" (u32, cstring)
 WindowIdFn :: proc "c" (u32)
@@ -733,6 +864,7 @@ GetTrayBoundsFn :: proc "c" (u32) -> cstring
 SetBoolFn :: proc "c" (bool)
 GetBoolFn :: proc "c" () -> bool
 GetCstringFn :: proc "c" () -> cstring
+CaptureScreenRegionFn :: proc "c" (f64, f64, u32, u32, rawptr, u64) -> bool
 CstringToBoolFn :: proc "c" (cstring) -> bool
 CstringVoidFn :: proc "c" (cstring)
 ShowNotificationFn :: proc "c" (cstring, cstring, cstring, bool)
@@ -761,6 +893,7 @@ Symbols :: struct {
 	getWindowStyle:                         GetWindowStyleFn,
 	createWindow:                           CreateWindowFn,
 	createWebview:                          CreateWebviewFn,
+	setNextWebviewAllowedProtocols:         SetNextWebviewAllowedProtocolsFn,
 	createWGPUView:                         CreateWGPUViewFn,
 	setWindowTitle:                         SetWindowTitleFn,
 	minimizeWindow:                         WindowIdFn,
@@ -837,6 +970,7 @@ Symbols :: struct {
 	getPrimaryDisplay:                      GetCstringFn,
 	getAllDisplays:                         GetCstringFn,
 	getCursorScreenPoint:                   GetCstringFn,
+	captureScreenRegion:                    CaptureScreenRegionFn,
 	moveToTrash:                            CstringToBoolFn,
 	showItemInFolder:                       CstringVoidFn,
 	openExternal:                           CstringToBoolFn,
@@ -863,6 +997,7 @@ Symbols :: struct {
 	setURLOpenHandler:                      SetURLOpenHandlerFn,
 	setAppReopenHandler:                    SetAppReopenHandlerFn,
 	setQuitRequestedHandler:                SetQuitRequestedHandlerFn,
+	setExitOnLastWindowClosed:              SetBoolFn,
 	stopEventLoop:                          VoidFn,
 	waitForShutdownComplete:                IntVoidFn,
 	forceExit:                              IntVoidFn,
@@ -902,10 +1037,28 @@ coreLoad :: proc(allocator := context.allocator) -> (core: Core, err: Error) {
 		dynlib.unload_library(core.symbols.__handle)
 		return {}, .MissingCoreSymbol
 	}
+
+	// Honour the app's runtime.exitOnLastWindowClosed setting, which the JS SDK
+	// applies at startup too. The core only acts on it when a quit-requested
+	// handler is registered, so install one as well.
+	core.symbols.setExitOnLastWindowClosed(
+		exitOnLastWindowClosedFromBuildConfig(allocator, &bundle_paths),
+	)
+	g_quit_requested_stop_event_loop = core.symbols.stopEventLoop
+	g_quit_requested_user_handler = nil
+	core.symbols.setQuitRequestedHandler(quit_requested_trampoline)
+
 	return core, .None
 }
 
 coreClose :: proc(self: ^Core) {
+	// Drop the core's pointer to our trampoline before unloading the library so
+	// a late quit request can't jump into freed code.
+	if self.symbols.setQuitRequestedHandler != nil {
+		self.symbols.setQuitRequestedHandler(nil)
+	}
+	g_quit_requested_stop_event_loop = nil
+	g_quit_requested_user_handler = nil
 	dynlib.unload_library(self.symbols.__handle)
 	self.symbols.__handle = nil
 }
@@ -1152,6 +1305,11 @@ createWebview :: proc(self: ^Core, options: WebviewOptions) -> (webview_id: u32,
 	if host_bridge == nil {
 		host_bridge = options.callbacks.bun_bridge
 	}
+
+	self.symbols.setNextWebviewAllowedProtocols(
+		options.allowed_protocols.views,
+		options.allowed_protocols.app_data,
+	)
 
 	webview_id = self.symbols.createWebview(
 		options.window_id,
@@ -1545,6 +1703,31 @@ getCursorScreenPoint :: proc(self: ^Core) -> (point: Point, err: Error) {
 	return parse_point_json(self.allocator, string(json_text))
 }
 
+// Captures a logical desktop rectangle as tightly packed, row-major RGBA
+// pixels. Fractional origins are aligned down to the logical pixel grid.
+// The returned slice uses core.allocator; the caller owns it and must call
+// delete(pixels, core.allocator).
+captureScreenRegion :: proc(self: ^Core, rectangle: Rect) -> (pixels: []u8, err: Error) {
+	layout := screen_capture_layout(rectangle) or_return
+	result, allocator_err := make([]u8, layout.byte_len, self.allocator)
+	if allocator_err != nil {
+		return nil, .AllocationFailed
+	}
+
+	if !self.symbols.captureScreenRegion(
+		layout.x,
+		layout.y,
+		layout.width,
+		layout.height,
+		raw_data(result),
+		layout.byte_len_u64,
+	) {
+		delete(result, self.allocator)
+		return nil, .ElectrobunCoreFailure
+	}
+	return result, .None
+}
+
 moveToTrash :: proc(self: ^Core, path: string) -> bool {
 	path_z := dupe_cstring(self, path)
 	defer delete(path_z, self.allocator)
@@ -1763,8 +1946,17 @@ setAppReopenHandler :: proc(self: ^Core, handler: AppReopenHandler) -> Error {
 	return ensure_last_call_succeeded(self)
 }
 
+// Override the default quit behaviour. Pass nil to restore the SDK default
+// (stop the event loop so runMainThread returns).
 setQuitRequestedHandler :: proc(self: ^Core, handler: QuitRequestedHandler) -> Error {
-	self.symbols.setQuitRequestedHandler(handler)
+	g_quit_requested_user_handler = handler
+	self.symbols.setQuitRequestedHandler(quit_requested_trampoline)
+	return ensure_last_call_succeeded(self)
+}
+
+// When enabled (the default), closing the last window quits the app.
+setExitOnLastWindowClosed :: proc(self: ^Core, enabled: bool) -> Error {
+	self.symbols.setExitOnLastWindowClosed(enabled)
 	return ensure_last_call_succeeded(self)
 }
 
@@ -2439,5 +2631,41 @@ build_app_scoped_dir :: proc(allocator: runtime.Allocator, base: string, app_inf
 	if len(app_info.identifier) == 0 || len(app_info.channel) == 0 {
 		return clone_string(base, allocator)
 	}
-	return join_path(allocator, {base, app_info.identifier, app_info.channel})
+	install_root_name := effective_install_root_name(allocator, app_info.channel)
+	defer delete(install_root_name, allocator)
+	return join_path(allocator, {base, app_info.identifier, install_root_name})
+}
+
+@(private = "file")
+is_safe_install_root_name :: proc(value: string) -> bool {
+	if len(value) == 0 || len(value) > 256 || value == "." || value == ".." {
+		return false
+	}
+	for byte in value {
+		if byte < 0x20 || byte == 0x7f || byte == '/' || byte == '\\' {
+			return false
+		}
+	}
+	when ODIN_OS == .Windows {
+		if value[len(value) - 1] == ' ' || value[len(value) - 1] == '.' {
+			return false
+		}
+		for invalid in "\"%*:<>?|" {
+			if strings.index_byte(value, u8(invalid)) >= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+@(private = "file")
+effective_install_root_name :: proc(allocator: runtime.Allocator, fallback: string) -> string {
+	if candidate, found := os.lookup_env(INSTALL_ROOT_NAME_ENVIRONMENT_VARIABLE, allocator); found {
+		if is_safe_install_root_name(candidate) {
+			return candidate
+		}
+		delete(candidate, allocator)
+	}
+	return clone_string(fallback, allocator)
 }

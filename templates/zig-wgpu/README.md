@@ -6,7 +6,9 @@ An Electrobun template with a Zig main process and an `<electrobun-wgpu>` overla
 hutch run dev
 ```
 
-`hutch run dev` installs dependencies on the first run, builds the app, launches
-it, and rebuilds when source files change.
+`hutch run dev` builds the app, launches it, and rebuilds when source files
+change. This native template has no npm dependencies.
 
-The main process lives in `src/zig/main.zig`; the webview lives in `src/mainview`.
+The root `build.zig` owns the Zig build graph and produces the `main` executable;
+its source currently lives in `src/zig/main.zig`. The webview lives in
+`src/mainview`.

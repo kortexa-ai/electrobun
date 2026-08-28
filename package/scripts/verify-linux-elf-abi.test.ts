@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -161,7 +162,55 @@ function makeElf({
 	return buffer;
 }
 
-describe("Linux ELF ABI verification", () => {
+describe("Release build and Linux ELF ABI verification", () => {
+	test("builds only the release extractor with ReleaseFast", () => {
+		const buildSource = readFileSync(
+			new URL("../build.ts", import.meta.url),
+			"utf8",
+		);
+		const zigBuildStart = buildSource.indexOf("async function runZigBuild(");
+		const zigBuildEnd = buildSource.indexOf(
+			"function findWindowsExecutable(",
+			zigBuildStart,
+		);
+		const extractorStart = buildSource.indexOf(
+			"async function buildSelfExtractor()",
+		);
+		const extractorEnd = buildSource.indexOf(
+			"async function buildPreload()",
+			extractorStart,
+		);
+
+		expect(zigBuildStart).toBeGreaterThan(-1);
+		expect(zigBuildEnd).toBeGreaterThan(zigBuildStart);
+		expect(extractorStart).toBeGreaterThan(-1);
+		expect(extractorEnd).toBeGreaterThan(extractorStart);
+
+		const zigBuildSource = buildSource.slice(zigBuildStart, zigBuildEnd);
+		const extractorSource = buildSource.slice(extractorStart, extractorEnd);
+		expect(zigBuildSource).toContain(
+			'releaseOptimize: "ReleaseFast" | "ReleaseSmall" = "ReleaseSmall"',
+		);
+		expect(zigBuildSource).toContain("`-Doptimize=${releaseOptimize}`");
+		expect(extractorSource).toContain(
+			'runZigBuild("extractor", zigArgs, "ReleaseFast")',
+		);
+	});
+
+	test("builds the Linux ARM64 extractor for the generic baseline CPU", () => {
+		const buildSource = readFileSync(
+			new URL("../build.ts", import.meta.url),
+			"utf8",
+		);
+		const start = buildSource.indexOf("async function buildSelfExtractor()");
+		const end = buildSource.indexOf("async function buildPreload()", start);
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		expect(buildSource.slice(start, end)).toMatch(
+			/OS === "linux" && ARCH === "arm64"\s*\? \["-Dtarget=aarch64-linux-gnu", "-Dcpu=baseline"\]/,
+		);
+	});
+
 	test("compares every numeric ABI version component", () => {
 		expect(compareAbiVersions("2.35", "2.34.9")).toBeGreaterThan(0);
 		expect(compareAbiVersions("3.4.30", "3.4.30.0")).toBe(0);

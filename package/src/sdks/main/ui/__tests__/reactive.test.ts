@@ -10,6 +10,7 @@ import {
 	isLive,
 	live,
 	memo,
+	readMaybe,
 	setDevMode,
 	signal,
 	store,
@@ -174,6 +175,26 @@ describe("scopes", () => {
 		expect(events).toEqual([]);
 		setCount(1);
 		expect(events).toEqual(["cleanup 0"]);
+	});
+
+	test("a throwing child cleanup cannot skip sibling root teardown", () => {
+		const calls: string[] = [];
+		const cleanupError = new Error("child cleanup failed");
+		let dispose = () => {};
+		createRoot((disposeRoot) => {
+			dispose = disposeRoot;
+			cleanup(() => calls.push("root cleanup"));
+			effect(() => {
+				cleanup(() => {
+					calls.push("child cleanup");
+					throw cleanupError;
+				});
+			});
+		});
+
+		expect(() => dispose()).toThrow(cleanupError);
+		expect(calls).toEqual(["child cleanup", "root cleanup"]);
+		expect(() => dispose()).not.toThrow();
 	});
 
 	test("nested scopes dispose with their parent", () => {
@@ -384,14 +405,53 @@ describe("dev warnings", () => {
 		expect(warnings.some((w) => w.includes("no scope"))).toBe(true);
 	});
 
-	test("live() with zero dependencies warns", () => {
+	test("live() with zero dependencies warns once per call site, with source", () => {
 		setDevMode(true);
+		const staticLive = () => 42; // static expression, defensive over-wrap
 		const { warnings } = withWarnings(() => {
 			createRoot(() => {
-				live(() => 42); // static expression, defensive over-wrap
+				live(staticLive);
+				live(staticLive); // same site again: deduped
 			});
 		});
-		expect(warnings.some((w) => w.includes("zero dependencies"))).toBe(true);
+		const zeroDep = warnings.filter((w) => w.includes("zero dependencies"));
+		expect(zeroDep.length).toBe(1);
+		expect(zeroDep[0]).toContain("42");
+	});
+
+	test("readMaybe() marks a static read as deliberate and stays reactive for accessors", () => {
+		setDevMode(true);
+		const [count, setCount] = signal(1);
+		const seen: number[] = [];
+		const { warnings } = withWarnings(() => {
+			createRoot(() => {
+				live(() => {
+					seen.push(readMaybe<number>(5)); // static value: no warning
+				});
+				live(() => {
+					seen.push(readMaybe(count)); // accessor: tracked as usual
+				});
+			});
+			setCount(2);
+		});
+		expect(seen).toEqual([5, 1, 2]);
+		expect(warnings.some((w) => w.includes("zero dependencies"))).toBe(false);
+	});
+
+	test("live() wrapping an inert body is the deferred-run-once idiom and stays silent", () => {
+		setDevMode(true);
+		let ran = 0;
+		const { warnings } = withWarnings(() => {
+			createRoot(() => {
+				live(() => {
+					inert(() => {
+						ran++;
+					});
+				});
+			});
+		});
+		expect(ran).toBe(1);
+		expect(warnings.some((w) => w.includes("zero dependencies"))).toBe(false);
 	});
 
 	test("nested live() warns and stays transparent", () => {

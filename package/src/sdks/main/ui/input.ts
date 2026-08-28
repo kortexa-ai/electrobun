@@ -6,9 +6,17 @@
 //
 // Keyboard arrives via native window key events in both paths.
 
-import { enableWGPUKeyEvents, enableWGPUPointerEvents, ffi, Screen } from "../proc/native";
+import {
+	enableWGPUKeyEvents,
+	enableWGPUPointerEvents,
+	enableWindowTextEvents,
+	ffi,
+	Screen,
+} from "../proc/native";
 import electrobunEventEmitter from "../events/eventEmitter";
 import type { KeyEventInfo } from "./ui";
+import { normalizeEditKeyCode } from "./keymap";
+import { pointerToViewLocal } from "./nativeLayerGeometry";
 
 export interface InputSink {
 	/** Hittable chain under the point, innermost first. */
@@ -21,6 +29,8 @@ export interface InputSink {
 	): void;
 	dispatchWheel(x: number, y: number, dx: number, dy: number): void;
 	dispatchKey(e: KeyEventInfo): void;
+	/** Committed text from the platform layout/IME. */
+	dispatchText(text: string): void;
 	/** True when pressing this node should drag the host window. */
 	isDragHandle(id: number): boolean;
 }
@@ -120,6 +130,7 @@ export function attachInput(
 	// Prefer view-level key events (they carry the layout's characters);
 	// fall back to window key events otherwise.
 	const hasNativeKeys = enableWGPUKeyEvents();
+	const hasWindowText = !hasNativeKeys && enableWindowTextEvents();
 	const onViewKey = (e: any) => {
 		if (!e?.isDown) return;
 		sink.dispatchKey({
@@ -132,21 +143,44 @@ export function attachInput(
 	const onKeyDown = (event: any) => {
 		const data = event?.data ?? {};
 		sink.dispatchKey({
-			keyCode: data.keyCode ?? 0,
+			keyCode: normalizeEditKeyCode(
+				data.keyCode ?? 0,
+				process.platform,
+			),
 			modifiers: data.modifiers ?? 0,
 			isRepeat: Boolean(data.isRepeat),
+			// An explicit empty string says this keyDown produced no text. Its
+			// corresponding WM_CHAR event is dispatched separately below.
+			chars: hasWindowText ? "" : undefined,
 		});
+	};
+	const onWindowText = (event: any) => {
+		const text = event?.text;
+		if (typeof text !== "string" || text.length === 0) return;
+		sink.dispatchText(text);
 	};
 	if (hasNativeKeys) {
 		electrobunEventEmitter.on(`wgpu-key-${viewId}`, onViewKey);
 	} else {
 		electrobunEventEmitter.on(`keyDown-${windowId}`, onKeyDown);
+		if (hasWindowText) {
+			electrobunEventEmitter.on(
+				`window-text-${windowId}`,
+				onWindowText,
+			);
+		}
 	}
 	const disposeKeys = () => {
 		if (hasNativeKeys) {
 			electrobunEventEmitter.off(`wgpu-key-${viewId}`, onViewKey);
 		} else {
 			electrobunEventEmitter.off(`keyDown-${windowId}`, onKeyDown);
+			if (hasWindowText) {
+				electrobunEventEmitter.off(
+					`window-text-${windowId}`,
+					onWindowText,
+				);
+			}
 		}
 	};
 
@@ -228,11 +262,15 @@ export function attachInput(
 
 	return {
 		poll() {
-			const frame = ffi.request.getWindowFrame({ winId: windowId });
+			// GTK and Win32 report decorated frame coordinates from getWindowFrame(),
+			// while the WGPU view starts at the client area's origin. Use the native
+			// client origin so titlebar/border extents do not skew hit testing.
+			const windowOrigin = process.platform === "linux" || process.platform === "win32"
+				? ffi.request.getWindowContentOrigin({ winId: windowId })
+				: ffi.request.getWindowFrame({ winId: windowId });
 			const offset = viewOffset();
 			const point = Screen.getCursorScreenPoint();
-			const x = point.x - frame.x - offset.x;
-			const y = point.y - frame.y - offset.y;
+			const { x, y } = pointerToViewLocal(point, windowOrigin, offset);
 
 			if (drag) {
 				const stillDown =

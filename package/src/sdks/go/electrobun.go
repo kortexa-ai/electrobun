@@ -128,6 +128,9 @@ static bool eb_call_u32_bool_bool_ret(void* fn, uint32_t value, bool flag) { ret
 typedef void (*eb_bool_fn)(bool);
 static void eb_call_bool(void* fn, bool flag) { ((eb_bool_fn)fn)(flag); }
 
+typedef void (*eb_bool_bool_fn)(bool, bool);
+static void eb_call_bool_bool(void* fn, bool first, bool second) { ((eb_bool_bool_fn)fn)(first, second); }
+
 typedef bool (*eb_bool_ret_fn)(void);
 static bool eb_call_bool_ret(void* fn) { return ((eb_bool_ret_fn)fn)(); }
 
@@ -177,6 +180,11 @@ static bool eb_call_show_tray(void* fn, uint32_t tray_id) { return ((eb_show_tra
 
 typedef char* (*eb_string_ret_fn)(void);
 static char* eb_call_string_ret(void* fn) { return ((eb_string_ret_fn)fn)(); }
+
+typedef bool (*eb_capture_screen_region_fn)(double, double, uint32_t, uint32_t, uint8_t*, uint64_t);
+static bool eb_call_capture_screen_region(void* fn, double x, double y, uint32_t width, uint32_t height, uint8_t* out_rgba, uint64_t out_len) {
+	return ((eb_capture_screen_region_fn)fn)(x, y, width, height, out_rgba, out_len);
+}
 
 typedef const char* (*eb_u32_const_string_ret_fn)(uint32_t);
 static const char* eb_call_u32_const_string_ret(void* fn, uint32_t value) { return ((eb_u32_const_string_ret_fn)fn)(value); }
@@ -257,6 +265,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -277,9 +286,9 @@ type AppInfo struct {
 	Channel    string
 }
 
-// IsPackaged returns false for dev builds and true for nonempty release channels.
+// IsPackaged returns true only for the canonical stable and canary release channels.
 func (a AppInfo) IsPackaged() bool {
-	return a.Channel != "" && a.Channel != "dev"
+	return a.Channel == "stable" || a.Channel == "canary"
 }
 
 type Rect struct {
@@ -377,6 +386,11 @@ type WebviewCallbacks struct {
 	InternalBridge   WebviewPostMessageHandler
 }
 
+type AllowedProtocols struct {
+	Views   bool
+	AppData bool
+}
+
 type WebviewOptions struct {
 	WindowID         uint32
 	HostWebviewID    uint32
@@ -388,6 +402,7 @@ type WebviewOptions struct {
 	SecretKey        string
 	Preload          string
 	ViewsRoot        string
+	AllowedProtocols AllowedProtocols
 	Sandbox          bool
 	StartTransparent bool
 	StartPassthrough bool
@@ -398,11 +413,12 @@ type WebviewOptions struct {
 
 func NewWebviewOptions(windowID uint32, url string, frame Rect) WebviewOptions {
 	return WebviewOptions{
-		WindowID:   windowID,
-		Renderer:   RendererNative,
-		URL:        url,
-		Frame:      frame,
-		AutoResize: true,
+		WindowID:         windowID,
+		Renderer:         RendererNative,
+		URL:              url,
+		Frame:            frame,
+		AutoResize:       true,
+		AllowedProtocols: AllowedProtocols{Views: true},
 	}
 }
 
@@ -621,7 +637,43 @@ func LoadCore() (*Core, error) {
 		}
 		core.symbols[name] = symbol
 	}
+
+	// Honour the app's runtime.exitOnLastWindowClosed setting, which the JS SDK
+	// applies at startup too. The core only acts on it when a quit-requested
+	// handler is registered, so install one as well.
+	if err := core.SetExitOnLastWindowClosed(
+		ExitOnLastWindowClosedFromBuildConfig(bundlePaths),
+	); err != nil {
+		return nil, err
+	}
+	if err := core.SetQuitRequestedHandler(nil); err != nil {
+		return nil, err
+	}
 	return core, nil
+}
+
+// ExitOnLastWindowClosedFromBuildConfig reads runtime.exitOnLastWindowClosed out
+// of the bundled Resources/build.json, the same value the JS SDK reads through
+// BuildConfig. Anything missing or malformed falls back to the documented
+// default: quit when the last window closes.
+func ExitOnLastWindowClosedFromBuildConfig(bundlePaths BundlePaths) bool {
+	contents, err := os.ReadFile(filepath.Join(bundlePaths.ResourcesDir, "build.json"))
+	if err != nil {
+		return true
+	}
+
+	var config struct {
+		Runtime struct {
+			ExitOnLastWindowClosed *bool `json:"exitOnLastWindowClosed"`
+		} `json:"runtime"`
+	}
+	if json.Unmarshal(contents, &config) != nil {
+		return true
+	}
+	if config.Runtime.ExitOnLastWindowClosed == nil {
+		return true
+	}
+	return *config.Runtime.ExitOnLastWindowClosed
 }
 
 var requiredSymbols = []string{
@@ -631,6 +683,7 @@ var requiredSymbols = []string{
 	"getWindowStyle",
 	"createWindow",
 	"createWebview",
+	"setNextWebviewAllowedProtocols",
 	"createWGPUView",
 	"setWindowTitle",
 	"minimizeWindow",
@@ -706,6 +759,7 @@ var requiredSymbols = []string{
 	"getPrimaryDisplay",
 	"getAllDisplays",
 	"getCursorScreenPoint",
+	"captureScreenRegion",
 	"moveToTrash",
 	"showItemInFolder",
 	"openExternal",
@@ -732,6 +786,7 @@ var requiredSymbols = []string{
 	"setURLOpenHandler",
 	"setAppReopenHandler",
 	"setQuitRequestedHandler",
+	"setExitOnLastWindowClosed",
 	"stopEventLoop",
 	"waitForShutdownComplete",
 	"forceExit",
@@ -1009,6 +1064,11 @@ func (c *Core) CreateWebview(options WebviewOptions) (uint32, error) {
 	if hostBridge == nil {
 		hostBridge = options.Callbacks.BunBridge
 	}
+	C.eb_call_bool_bool(
+		c.symbol("setNextWebviewAllowedProtocols"),
+		cbool(options.AllowedProtocols.Views),
+		cbool(options.AllowedProtocols.AppData),
+	)
 	webviewID := C.eb_call_create_webview(
 		c.symbol("createWebview"),
 		C.uint32_t(options.WindowID),
@@ -1411,6 +1471,86 @@ func (c *Core) GetCursorScreenPoint() (Point, error) {
 	return point, nil
 }
 
+// CaptureScreenRegion captures a logical screen rectangle as tightly packed,
+// row-major RGBA pixels. Fractional origins are aligned down to the logical
+// pixel grid. The returned slice is exactly rect.Width * rect.Height * 4 bytes.
+func (c *Core) CaptureScreenRegion(rect Rect) ([]byte, error) {
+	return captureScreenRegionWith(rect, func(
+		originX, originY float64,
+		width, height uint32,
+		pixels []byte,
+	) bool {
+		return bool(C.eb_call_capture_screen_region(
+			c.symbol("captureScreenRegion"),
+			C.double(originX),
+			C.double(originY),
+			C.uint32_t(width),
+			C.uint32_t(height),
+			(*C.uint8_t)(unsafe.Pointer(&pixels[0])),
+			C.uint64_t(len(pixels)),
+		))
+	})
+}
+
+func captureScreenRegionWith(
+	rect Rect,
+	capture func(float64, float64, uint32, uint32, []byte) bool,
+) ([]byte, error) {
+	originX, originY, width, height, byteLength, err := screenCaptureRegionArgs(rect)
+	if err != nil {
+		return nil, err
+	}
+
+	pixels, err := allocateScreenCaptureBuffer(byteLength)
+	if err != nil {
+		return nil, err
+	}
+
+	if !capture(originX, originY, width, height, pixels) {
+		return nil, errors.New("failed to capture screen region")
+	}
+	return pixels, nil
+}
+
+func screenCaptureRegionArgs(rect Rect) (float64, float64, uint32, uint32, uint64, error) {
+	if math.IsNaN(rect.X) || math.IsInf(rect.X, 0) ||
+		math.IsNaN(rect.Y) || math.IsInf(rect.Y, 0) {
+		return 0, 0, 0, 0, 0, errors.New("screen capture origin must be finite")
+	}
+
+	maxUint32 := float64(^uint32(0))
+	if math.IsNaN(rect.Width) || math.IsInf(rect.Width, 0) ||
+		math.IsNaN(rect.Height) || math.IsInf(rect.Height, 0) ||
+		rect.Width <= 0 || rect.Height <= 0 ||
+		math.Trunc(rect.Width) != rect.Width || math.Trunc(rect.Height) != rect.Height ||
+		rect.Width > maxUint32 || rect.Height > maxUint32 {
+		return 0, 0, 0, 0, 0, errors.New("screen capture dimensions must be positive uint32 integers")
+	}
+
+	width := uint32(rect.Width)
+	height := uint32(rect.Height)
+	pixelCount := uint64(width) * uint64(height)
+	if pixelCount > ^uint64(0)/4 {
+		return 0, 0, 0, 0, 0, errors.New("screen capture RGBA byte length overflows uint64")
+	}
+	byteLength := pixelCount * 4
+	if byteLength > uint64(^uint(0)>>1) {
+		return 0, 0, 0, 0, 0, errors.New("screen capture RGBA byte length exceeds Go's maximum slice length")
+	}
+
+	return math.Floor(rect.X), math.Floor(rect.Y), width, height, byteLength, nil
+}
+
+func allocateScreenCaptureBuffer(byteLength uint64) (pixels []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			pixels = nil
+			err = fmt.Errorf("failed to allocate screen capture RGBA buffer: %v", recovered)
+		}
+	}()
+	return make([]byte, int(byteLength)), nil
+}
+
 func (c *Core) MoveToTrash(path string) (bool, error) {
 	pathCString, freePath, err := cString(path, "path")
 	if err != nil {
@@ -1710,9 +1850,24 @@ func (c *Core) SetAppReopenHandler(handler func()) error {
 	return c.ensureLastCallSucceeded()
 }
 
+// SetQuitRequestedHandler overrides the default quit behaviour. The core calls
+// the quit-requested handler when the last window closes (see
+// SetExitOnLastWindowClosed, on by default), when the app is asked to terminate
+// (Cmd+Q), and on SIGINT/SIGTERM. Pass nil to restore the SDK default, which
+// stops the event loop so RunMainThread returns and main unwinds normally.
 func (c *Core) SetQuitRequestedHandler(handler func()) error {
+	if handler == nil {
+		handler = func() { _ = c.StopEventLoop() }
+	}
 	setQuitRequestedHandler(handler)
-	C.eb_call_set_quit_requested_handler(c.symbol("setQuitRequestedHandler"), cbool(handler != nil))
+	C.eb_call_set_quit_requested_handler(c.symbol("setQuitRequestedHandler"), cbool(true))
+	return c.ensureLastCallSucceeded()
+}
+
+// SetExitOnLastWindowClosed controls whether closing the last window quits the
+// app. Enabled by default.
+func (c *Core) SetExitOnLastWindowClosed(enabled bool) error {
+	C.eb_call_bool(c.symbol("setExitOnLastWindowClosed"), cbool(enabled))
 	return c.ensureLastCallSucceeded()
 }
 
@@ -1844,10 +1999,6 @@ func ResolvePaths(appInfo AppInfo) (Paths, error) {
 	config := configDir(home)
 	cache := cacheDir(home)
 	logs := logsDir(home)
-	scoped := appInfo.Identifier
-	if scoped == "" {
-		scoped = appInfo.Name
-	}
 	return Paths{
 		Home:      home,
 		AppData:   appData,
@@ -1861,10 +2012,17 @@ func ResolvePaths(appInfo AppInfo) (Paths, error) {
 		Pictures:  filepath.Join(home, "Pictures"),
 		Music:     filepath.Join(home, "Music"),
 		Videos:    filepath.Join(home, "Videos"),
-		UserData:  filepath.Join(appData, scoped),
-		UserCache: filepath.Join(cache, scoped),
-		UserLogs:  filepath.Join(logs, scoped),
+		UserData:  appScopedDir(appData, appInfo),
+		UserCache: appScopedDir(cache, appInfo),
+		UserLogs:  appScopedDir(logs, appInfo),
 	}, nil
+}
+
+func appScopedDir(base string, appInfo AppInfo) string {
+	if appInfo.Identifier == "" || appInfo.Channel == "" {
+		return base
+	}
+	return filepath.Join(base, appInfo.Identifier, effectiveInstallRootName(appInfo.Channel))
 }
 
 func AllowAllNavigation(_ uint32, _ string) uint32 {
@@ -2026,10 +2184,10 @@ func appDataDir(home string) string {
 	case "darwin":
 		return filepath.Join(home, "Library", "Application Support")
 	case "windows":
-		if value := os.Getenv("APPDATA"); value != "" {
+		if value := os.Getenv("LOCALAPPDATA"); value != "" {
 			return value
 		}
-		return filepath.Join(home, "AppData", "Roaming")
+		return filepath.Join(home, "AppData", "Local")
 	default:
 		if value := os.Getenv("XDG_DATA_HOME"); value != "" {
 			return value

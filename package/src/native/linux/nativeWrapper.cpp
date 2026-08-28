@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <webkit2/webkit2.h>
+#include <libsoup/soup.h>
 #include <jsc/jsc.h>
 #ifndef NO_APPINDICATOR
 #include <libayatana-appindicator/app-indicator.h>
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <atomic>
@@ -38,6 +40,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <fstream>
+#include <filesystem>
 #include <set>
 #include <cstdarg>
 #include <sys/socket.h>
@@ -72,6 +75,7 @@
 #include "../shared/cef_find_session.h"
 #include "../shared/linux_dpi.h"
 #include "../shared/linux_x11_geometry.h"
+#include "wayland_screen_capture.h"
 
 using namespace electrobun;
 
@@ -228,7 +232,7 @@ static std::string deriveLinuxWindowClass(
     if (result.empty()) {
         result = "Electrobun";
     }
-    if (!channel.empty() && channel != "production" && channel != "stable") {
+    if (!channel.empty() && channel != "stable") {
         result += "-";
         result += channel;
     }
@@ -414,11 +418,54 @@ static std::atomic<bool> g_cefInitialized{false};
 static std::atomic<bool> g_useCEF{false};
 static std::atomic<bool> g_checkedForCEF{false};
 
-// Global webview storage to keep shared_ptr alive
+// Browser views and WGPU views have independent ID allocators. Keep their
+// ownership registries separate so equal IDs cannot replace one another.
 static std::map<uint32_t, std::shared_ptr<AbstractView>> g_webviewMap;
 static std::mutex g_webviewMapMutex;
+static std::map<uint32_t, std::shared_ptr<AbstractView>> g_wgpuViewMap;
+static std::mutex g_wgpuViewMapMutex;
 static std::map<uint32_t, std::string> g_webviewViewsRoot;
 static std::mutex g_webviewViewsRootMutex;
+static constexpr const char* kWebviewIdDataKey = "electrobun-webview-id";
+struct AllowedProtocols { bool views = true; bool appData = false; };
+static std::map<uint32_t, AllowedProtocols> g_allowedProtocols;
+static std::mutex g_allowedProtocolsMutex;
+
+static bool protocolAllowed(uint32_t webviewId, bool appData) {
+    std::lock_guard<std::mutex> lock(g_allowedProtocolsMutex);
+    auto it = g_allowedProtocols.find(webviewId);
+    return it != g_allowedProtocols.end() && (appData ? it->second.appData : it->second.views);
+}
+
+static std::filesystem::path appDataRoot() {
+    const char* xdg = g_getenv("XDG_DATA_HOME");
+    std::string base;
+    if (xdg && *xdg) base = xdg;
+    else if (const char* home = g_get_home_dir()) base = std::string(home) + "/.local/share";
+    return buildAppDataPath(base, g_electrobunIdentifier, g_electrobunChannel);
+}
+
+static bool readContainedFile(const std::filesystem::path& rootPath,
+                              const std::string& relative,
+                              std::string& data) {
+    if (relative.empty()) return false;
+    std::error_code ec;
+    const auto root = std::filesystem::weakly_canonical(rootPath, ec);
+    if (ec) return false;
+    const auto target = std::filesystem::weakly_canonical(root / relative, ec);
+    if (ec) return false;
+    auto rootIt = root.begin(), targetIt = target.begin();
+    for (; rootIt != root.end(); ++rootIt, ++targetIt) {
+        if (targetIt == target.end() || *rootIt != *targetIt) return false;
+    }
+    if (!std::filesystem::is_regular_file(target, ec) || ec) return false;
+    std::ifstream stream(target, std::ios::binary);
+    if (!stream) return false;
+    data.assign(
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>());
+    return true;
+}
 
 // CefShutdown requires every browser to have completed OnBeforeClose first.
 // Track browsers independently of g_webviewMap because a removed view can keep
@@ -629,9 +676,23 @@ public:
     
     bool Open(CefRefPtr<CefRequest> request, bool& handle_request, CefRefPtr<CefCallback> callback) override {
         std::string url = request->GetURL();
+        const bool appData = url.rfind("appdata://", 0) == 0;
+        if (!protocolAllowed(webviewId_, appData)) {
+            handle_request = false;
+            return false;
+        }
         
         // Parse the URI to get everything after views://
         std::string fullPath = normalizeViewsRelativePath(url);
+        if (appData) {
+            if (!readContainedFile(appDataRoot(), fullPath, data_)) {
+                handle_request = false;
+                return false;
+            }
+            mimeType_ = getMimeTypeFromUrl(fullPath);
+            handle_request = true;
+            return true;
+        }
         
         // Check if this is the internal HTML request
         if (fullPath == "internal/index.html") {
@@ -663,17 +724,7 @@ public:
         
         // If viewsRoot is set, try to read from that directory first
         if (!viewsRootPath.empty()) {
-            gchar* filePath = g_build_filename(viewsRootPath.c_str(), fullPath.c_str(), nullptr);
-            
-            if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
-                GError* error = nullptr;
-                gchar* fileContents = nullptr;
-                gsize fileSize = 0;
-                
-                if (g_file_get_contents(filePath, &fileContents, &fileSize, &error)) {
-                    data_ = std::string(fileContents, fileSize);
-                    g_free(fileContents);
-                    
+            if (readContainedFile(viewsRootPath, fullPath, data_)) {
                     // Determine MIME type
                     std::string mimeType = "application/octet-stream";
                     if (fullPath.find(".html") != std::string::npos) mimeType = "text/html";
@@ -688,17 +739,9 @@ public:
                     else if (fullPath.find(".ttf") != std::string::npos) mimeType = "font/ttf";
                     mimeType_ = mimeType;
                     
-                    g_free(filePath);
                     handle_request = true;
                     return true;
-                }
-                
-                if (error) {
-                    g_error_free(error);
-                }
             }
-            
-            g_free(filePath);
         }
 
         // Build paths relative to current directory (bin)
@@ -767,40 +810,16 @@ public:
 
         // Fallback: Read from flat file system (for non-ASAR builds or missing files)
         gchar* viewsDir = g_build_filename(resourcesDir, "app", "views", nullptr);
-        gchar* filePath = g_build_filename(viewsDir, fullPath.c_str(), nullptr);
-
-
-        // Check if file exists and read it
-        if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
-            gsize fileSize;
-            gchar* fileContent;
-            GError* error = nullptr;
-
-            if (g_file_get_contents(filePath, &fileContent, &fileSize, &error)) {
-                data_ = std::string(fileContent, fileSize);
-                g_free(fileContent);
-                
-                // Determine MIME type using shared function
+        if (readContainedFile(viewsDir, fullPath, data_)) {
                 mimeType_ = getMimeTypeFromUrl(fullPath);
-                
-                
                 g_free(cwd);
                 g_free(viewsDir);
-                g_free(filePath);
-                
                 handle_request = true;
                 return true;
-            } else {
-                printf("CEF views:// failed to read file: %s\n", error ? error->message : "unknown error");
-                if (error) g_error_free(error);
-            }
-        } else {
-            printf("CEF views:// file not found: %s\n", filePath);
         }
         
         g_free(cwd);
         g_free(viewsDir);
-        g_free(filePath);
         
         handle_request = false;
         return false;
@@ -810,6 +829,10 @@ public:
         response->SetStatus(200);
         response->SetMimeType(mimeType_);
         response->SetStatusText("OK");
+        CefResponse::HeaderMap headers;
+        headers.emplace("Access-Control-Allow-Origin", "*");
+        headers.emplace("X-Content-Type-Options", "nosniff");
+        response->SetHeaderMap(headers);
         response_length = data_.length();
     }
     
@@ -900,7 +923,7 @@ public:
     ElectrobunApp() {}
     
     void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override {
-        command_line->AppendSwitchWithValue("custom-scheme", "views");
+        command_line->AppendSwitchWithValue("custom-scheme", "views,appdata");
 
         // Linux default flags — can be overridden via chromiumFlags in config
         // GPU acceleration disabled by default for VM compatibility;
@@ -933,6 +956,9 @@ public:
             CEF_SCHEME_OPTION_SECURE |
             CEF_SCHEME_OPTION_CSP_BYPASSING |
             CEF_SCHEME_OPTION_FETCH_ENABLED);
+        registrar->AddCustomScheme("appdata",
+            CEF_SCHEME_OPTION_STANDARD | CEF_SCHEME_OPTION_CORS_ENABLED |
+            CEF_SCHEME_OPTION_SECURE | CEF_SCHEME_OPTION_FETCH_ENABLED);
     }
     
     CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override {
@@ -947,6 +973,7 @@ public:
     
     void OnContextInitialized() override {
         CefRegisterSchemeHandlerFactory("views", "", new ViewsSchemeHandlerFactory());
+        CefRegisterSchemeHandlerFactory("appdata", "", new ViewsSchemeHandlerFactory());
     }
     
     // Render process handler methods
@@ -2871,6 +2898,15 @@ public:
         webkit_settings_set_javascript_can_open_windows_automatically(settings, TRUE);
         webkit_settings_set_enable_back_forward_navigation_gestures(settings, TRUE);
         webkit_settings_set_enable_smooth_scrolling(settings, TRUE);
+
+        // WebKitGTK's accelerated backing store disappears when a positioned
+        // view is partially outside its toplevel. Software compositing keeps
+        // the full view allocation while its GTK ancestors clip it correctly.
+        if (!autoResize) {
+            webkit_settings_set_hardware_acceleration_policy(
+                settings,
+                WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        }
         
         // Enable media stream and WebRTC for camera/microphone access
         webkit_settings_set_enable_media_stream(settings, TRUE);
@@ -2895,6 +2931,10 @@ public:
             fprintf(stderr, "ERROR: Failed to create WebKit webview\n");
             throw std::runtime_error("Failed to create WebKit webview");
         }
+        g_object_set_data(
+            G_OBJECT(webview),
+            kWebviewIdDataKey,
+            GUINT_TO_POINTER(webviewId));
 
         // Connect the session only after the controlled target exists. This
         // prevents WebKitWebDriver from requesting a browsing context during
@@ -3230,11 +3270,6 @@ public:
             }
 
             if (wrapper) {
-
-                // TODO: this only sort of works, the webview ends up half height
-                // and other overlay stuff is just janky and gross
-                // so people should probably use CEF if they want OOPIFs on linux
-
                 // For negative positions (scrolled out of view), we need to use
                 // gtk_widget_set_margin_* with clamped values and offset the webview inside
                 int clampedX = MAX(0, frame.x);
@@ -3246,10 +3281,11 @@ public:
                 gtk_widget_set_margin_start(wrapper, clampedX);
                 gtk_widget_set_margin_top(wrapper, clampedY);
 
-                // Position webview within wrapper with offset to handle negative positions
-                // Note: /2 division appears necessary for GTK coordinate system
-                gtk_fixed_move(GTK_FIXED(wrapper), webview, offsetX / 2, offsetY / 2);
-               
+                // Position the webview by the full clipped distance. GtkFixed
+                // coordinates are already in logical pixels, just like the DOM
+                // bounds used to construct frame.
+                gtk_fixed_move(GTK_FIXED(wrapper), webview, offsetX, offsetY);
+
                 // OOPIF positioned with coordinate adjustment
             } else if (!fullSize) {
                 // For host webview, position directly with margins (can't be negative)
@@ -3497,6 +3533,7 @@ public:
                     break;
                 case WEBKIT_LOAD_COMMITTED:
                     impl->eventHandler(impl->webviewId, "load-committed", uri);
+                    impl->eventHandler(impl->webviewId, "did-commit-navigation", uri);
                     break;
                 case WEBKIT_LOAD_FINISHED:
                     impl->eventHandler(impl->webviewId, "load-finished", uri);
@@ -5354,8 +5391,6 @@ static void removeCEFViewsForParentWindow(Window parent_window) {
     }
 }
 
-
-
 // Container for managing multiple webviews
 class ContainerView {
 public:
@@ -5456,6 +5491,8 @@ public:
                 // For OOPIFs, wrap in a fixed container to enforce size constraints
                 GtkWidget* wrapper = gtk_fixed_new();
                 gtk_widget_set_size_request(wrapper, 1, 1); // Don't affect overlay size
+                gtk_widget_set_halign(wrapper, GTK_ALIGN_START);
+                gtk_widget_set_valign(wrapper, GTK_ALIGN_START);
 
                 // Make wrapper receive no events (pass through to widgets below)
                 gtk_widget_set_events(wrapper, 0);
@@ -5465,7 +5502,23 @@ public:
                 gtk_fixed_put(GTK_FIXED(wrapper), view->widget, 0, 0);
                 g_object_set_data(G_OBJECT(view->widget), "wrapper", wrapper);
 
-                // Now that widget is anchored, realize it for rendering
+                // Add wrapper as overlay layer
+                gtk_overlay_add_overlay(GTK_OVERLAY(overlay), wrapper);
+
+                // The wrapper is exactly the positioned webview's allocation.
+                // It must remain an input target; the WGPU layer's XShape hole
+                // handles pass-through outside this rectangle.
+                gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), wrapper, FALSE);
+
+                // Position wrapper using margins (will be updated in resize)
+                gtk_widget_set_margin_start(wrapper, (int)x);
+                gtk_widget_set_margin_top(wrapper, (int)y);
+
+                gtk_widget_show(wrapper);
+
+                // Realize only after the wrapper is attached to the toplevel.
+                // Realizing while the GtkFixed is still unanchored is rejected
+                // by GTK and can leave positioned WebKit views without a surface.
                 gtk_widget_realize(view->widget);
 
                 // Apply pending transparency/passthrough flags now that widget is realized
@@ -5477,18 +5530,6 @@ public:
                     view->setPassthrough(true);
                     view->pendingStartPassthrough = false;
                 }
-
-                // Add wrapper as overlay layer
-                gtk_overlay_add_overlay(GTK_OVERLAY(overlay), wrapper);
-
-                // Make the wrapper pass-through for events outside the webview
-                gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), wrapper, TRUE);
-
-                // Position wrapper using margins (will be updated in resize)
-                gtk_widget_set_margin_start(wrapper, (int)x);
-                gtk_widget_set_margin_top(wrapper, (int)y);
-
-                gtk_widget_show(wrapper);
             }
             
             if (auto* webKitView = dynamic_cast<WebKitWebViewImpl*>(view.get())) {
@@ -5528,8 +5569,23 @@ public:
             }
             
             if (view->fullSize) {
+                // GTK emits configure-event for window moves as well as resizes.
+                // A pure move must not reconfigure a full-size WGPU child: doing
+                // so with an empty mask removes native-layer holes even though
+                // their view-local geometry has not changed.
+                const GdkRectangle currentBounds = view->visualBounds;
+                if (currentBounds.x == 0 &&
+                    currentBounds.y == 0 &&
+                    currentBounds.width == width &&
+                    currentBounds.height == height) {
+                    continue;
+                }
+
                 // Auto-resize webviews should fill the entire window
-                view->resize(frame, "");
+                // Preserve any native-layer masks while the SDK computes and
+                // applies updated anchor geometry for the new client size.
+                const std::string masks = view->maskJSON;
+                view->resize(frame, masks.c_str());
             }
             // OOPIFs (fullSize=false) keep their positioning and don't auto-resize
             // The JavaScript ResizeObserver will handle repositioning them
@@ -5734,6 +5790,39 @@ static std::map<Window, uint32_t> g_x11_window_to_id;
 static std::map<Window, uint32_t> g_x11_child_window_to_parent_id;
 static std::mutex g_x11WindowsMutex;
 
+static void removeWGPUViewsForParentWindow(Window parent_window) {
+    std::vector<std::shared_ptr<WGPUViewImpl>> views_to_remove;
+    {
+        std::lock_guard<std::mutex> lock(g_wgpuViewMapMutex);
+        for (auto it = g_wgpuViewMap.begin(); it != g_wgpuViewMap.end();) {
+            auto wgpu_view = std::dynamic_pointer_cast<WGPUViewImpl>(it->second);
+            if (wgpu_view && wgpu_view->parentXWindow == parent_window &&
+                !wgpu_view->isRemoved) {
+                views_to_remove.push_back(wgpu_view);
+                it = g_wgpuViewMap.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // The resize queue and X11 child routing table both store non-owning view
+    // state, so detach them before releasing the registry's shared_ptr.
+    for (const auto& view : views_to_remove) {
+        g_pendingResizeQueue.remove(view.get());
+
+        if (view->xWindow) {
+            std::lock_guard<std::mutex> lock(g_x11WindowsMutex);
+            g_x11_child_window_to_parent_id.erase(view->xWindow);
+            if (view->inputXWindow) {
+                g_x11_child_window_to_parent_id.erase(view->inputXWindow);
+            }
+        }
+
+        view->remove();
+    }
+}
+
 static uint32_t modifiersFromX11State(unsigned int state) {
     uint32_t modifiers = 0;
     if (state & ShiftMask) modifiers |= 1u << 0;
@@ -5918,8 +6007,70 @@ void applyApplicationMenuToX11Window(X11Window* x11win) {
     fflush(stdout);
 }
 
+static uint32_t webviewIdForSchemeRequest(WebKitURISchemeRequest* request) {
+    WebKitWebView* requestingWebView = webkit_uri_scheme_request_get_web_view(request);
+    if (!requestingWebView) return 0;
+    const uint32_t storedWebviewId = GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(requestingWebView), kWebviewIdDataKey));
+    if (storedWebviewId != 0) return storedWebviewId;
+    std::lock_guard<std::mutex> lock(g_webviewMapMutex);
+    for (auto& [id, view] : g_webviewMap) {
+        auto* wkImpl = dynamic_cast<WebKitWebViewImpl*>(view.get());
+        if (wkImpl && wkImpl->webview == GTK_WIDGET(requestingWebView)) return id;
+    }
+    return 0;
+}
+
+static void finishSchemeResponse(WebKitURISchemeRequest* request,
+                                 gchar* contents,
+                                 gsize size,
+                                 const char* mimeType) {
+    GInputStream* stream = g_memory_input_stream_new_from_data(contents, size, g_free);
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+    WebKitURISchemeResponse* response = webkit_uri_scheme_response_new(stream, size);
+    webkit_uri_scheme_response_set_content_type(response, mimeType);
+    SoupMessageHeaders* headers = soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+    soup_message_headers_append(headers, "Access-Control-Allow-Origin", "*");
+    soup_message_headers_append(headers, "X-Content-Type-Options", "nosniff");
+    webkit_uri_scheme_response_set_http_headers(response, headers);
+    webkit_uri_scheme_request_finish_with_response(request, response);
+    g_object_unref(response);
+#else
+    webkit_uri_scheme_request_finish(request, stream, size, mimeType);
+#endif
+    g_object_unref(stream);
+}
+
+static void handleAppDataURIScheme(WebKitURISchemeRequest* request, gpointer user_data) {
+    const uint32_t webviewId = webviewIdForSchemeRequest(request);
+    if (!protocolAllowed(webviewId, true)) {
+        GError* error = g_error_new(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "appdata:// is not enabled");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    const std::string relative = normalizeViewsRelativePath(uri ? uri : "");
+    std::string data;
+    if (!readContainedFile(appDataRoot(), relative, data)) {
+        GError* error = g_error_new(G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "File not found");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    gchar* contents = static_cast<gchar*>(g_memdup2(data.data(), data.size()));
+    finishSchemeResponse(request, contents, data.size(), getMimeTypeFromUrl(relative).c_str());
+}
+
 // views:// URI scheme handler callback
 static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer user_data) {
+    const uint32_t requestingWebviewId = webviewIdForSchemeRequest(request);
+    if (!protocolAllowed(requestingWebviewId, false)) {
+        GError* error = g_error_new(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "views:// is not enabled");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
     const char* uri = webkit_uri_scheme_request_get_uri(request);
     
     // Parse the full URI to get everything after views://
@@ -5999,20 +6150,12 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer user_
     
     // If viewsRoot is set, try to read from that directory first
     if (!viewsRootPath.empty()) {
-        gchar* filePath = g_build_filename(viewsRootPath.c_str(), fullPath, nullptr);
-        
-        if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
-            GError* error = nullptr;
-            if (g_file_get_contents(filePath, &fileContents, &fileSize, &error)) {
-                foundFile = true;
-            } else {
-                if (error) {
-                    g_error_free(error);
-                }
-            }
+        std::string contents;
+        if (readContainedFile(viewsRootPath, fullPath, contents)) {
+            fileContents = static_cast<gchar*>(g_memdup2(contents.data(), contents.size()));
+            fileSize = contents.size();
+            foundFile = true;
         }
-        
-        g_free(filePath);
     }
     
     // Build paths relative to current directory (bin)
@@ -6067,29 +6210,13 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer user_
     // Fallback: Read from flat file system (for non-ASAR builds or missing files)
     if (!foundFile) {
         gchar* viewsDir = g_build_filename(resourcesDir, "app", "views", nullptr);
-        gchar* filePath = g_build_filename(viewsDir, fullPath, nullptr);
-
-        fflush(stdout);
-
-        // Check if file exists and read it
-        if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
-            GError* error = nullptr;
-            if (g_file_get_contents(filePath, &fileContents, &fileSize, &error)) {
-                foundFile = true;
-            } else {
-                if (error) {
-                    printf("ERROR WebKit: Failed to read file: %s\n", error->message);
-                    fflush(stdout);
-                    g_error_free(error);
-                }
-            }
-        } else {
-            printf("File not found: %s\n", filePath);
-            fflush(stdout);
+        std::string contents;
+        if (readContainedFile(viewsDir, fullPath, contents)) {
+            fileContents = static_cast<gchar*>(g_memdup2(contents.data(), contents.size()));
+            fileSize = contents.size();
+            foundFile = true;
         }
-
         g_free(viewsDir);
-        g_free(filePath);
     }
 
     // Send response if file was found
@@ -6098,8 +6225,10 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer user_
         std::string mimeTypeStr = getMimeTypeFromUrl(fullPath);
         const char* mimeType = mimeTypeStr.c_str();
 
-        // Create response
-        GInputStream* stream = g_memory_input_stream_new_from_data(fileContents, fileSize, g_free);
+        GInputStream* stream = g_memory_input_stream_new_from_data(
+            fileContents,
+            fileSize,
+            g_free);
         webkit_uri_scheme_request_finish(request, stream, fileSize, mimeType);
         g_object_unref(stream);
     } else {
@@ -6459,10 +6588,22 @@ static WebKitWebContext* getContextForPartition(const char* partitionIdentifier)
     static const char* viewsSchemeRegisteredKey =
         "electrobun-views-scheme-registered";
     if (!g_object_get_data(G_OBJECT(context), viewsSchemeRegisteredKey)) {
+        WebKitSecurityManager* securityManager =
+            webkit_web_context_get_security_manager(context);
+        webkit_security_manager_register_uri_scheme_as_secure(securityManager, "views");
+        webkit_security_manager_register_uri_scheme_as_cors_enabled(securityManager, "views");
+        webkit_security_manager_register_uri_scheme_as_secure(securityManager, "appdata");
+        webkit_security_manager_register_uri_scheme_as_cors_enabled(securityManager, "appdata");
         webkit_web_context_register_uri_scheme(
             context,
             "views",
             handleViewsURIScheme,
+            nullptr,
+            nullptr);
+        webkit_web_context_register_uri_scheme(
+            context,
+            "appdata",
+            handleAppDataURIScheme,
             nullptr,
             nullptr);
         g_object_set_data(
@@ -6575,19 +6716,17 @@ void resizeAutoSizingWebviewsInWindow(uint32_t windowId, int width, int height) 
         x11WindowHandle = windowIt->second->window;
     }
     
-    // Find all webviews that belong to this window
+    // Find all auto-sized WGPU views that belong to this window.
     std::vector<std::shared_ptr<AbstractView>> fullSizeWebviews;
     {
-        std::lock_guard<std::mutex> lock(g_webviewMapMutex);
-        for (auto& [webviewId, webview] : g_webviewMap) {
+        std::lock_guard<std::mutex> lock(g_wgpuViewMapMutex);
+        for (auto& [webviewId, webview] : g_wgpuViewMap) {
             (void)webviewId;
             if (webview) {
-                CEFWebViewImpl* cefView = dynamic_cast<CEFWebViewImpl*>(webview.get());
                 WGPUViewImpl* wgpuView = dynamic_cast<WGPUViewImpl*>(webview.get());
                 // CEF has a separate geometry hook because pure parent moves
                 // may change monitor scale without changing parent size.
-                if (!cefView && wgpuView &&
-                    wgpuView->parentXWindow == x11WindowHandle &&
+                if (wgpuView && wgpuView->parentXWindow == x11WindowHandle &&
                     webview->fullSize) {
                     fullSizeWebviews.push_back(webview);
                 }
@@ -6866,6 +7005,7 @@ gboolean process_x11_events(gpointer data) {
             // This function takes registry locks internally, so it must remain
             // outside g_x11WindowsMutex.
             removeCEFViewsForParentWindow(closingWindow->window);
+            removeWGPUViewsForParentWindow(closingWindow->window);
             XDestroyWindow(closingWindow->display, closingWindow->window);
             XFlush(closingWindow->display);
         }
@@ -7571,6 +7711,7 @@ static struct {
     bool startTransparent;
     bool startPassthrough;
 } g_nextWebviewFlags = {false, false};
+static AllowedProtocols g_nextAllowedProtocols = {true, false};
 
 AbstractView* initGTKWebkitWebview(uint32_t webviewId,
                          void* window,
@@ -7662,6 +7803,10 @@ ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
 // so the parent BrowserWindow's frame x/y is a no-op here.
 ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
 
+ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
+    g_nextAllowedProtocols = {allowViews, allowAppData};
+}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          void* window,
                          const char* renderer,
@@ -7684,6 +7829,12 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
     bool startTransparent = g_nextWebviewFlags.startTransparent;
     bool startPassthrough = g_nextWebviewFlags.startPassthrough;
     g_nextWebviewFlags = {false, false};
+    const AllowedProtocols allowedProtocols = g_nextAllowedProtocols;
+    g_nextAllowedProtocols = {true, false};
+    {
+        std::lock_guard<std::mutex> lock(g_allowedProtocolsMutex);
+        g_allowedProtocols[webviewId] = allowedProtocols;
+    }
 
     // TODO: Implement transparent handling for Linux
 
@@ -7872,8 +8023,8 @@ ELECTROBUN_EXPORT AbstractView* initWGPUView(uint32_t webviewId,
     }
 
     {
-        std::lock_guard<std::mutex> lock(g_webviewMapMutex);
-        g_webviewMap[webviewId] = view;
+        std::lock_guard<std::mutex> lock(g_wgpuViewMapMutex);
+        g_wgpuViewMap[webviewId] = view;
     }
 
     return view.get();
@@ -7919,22 +8070,35 @@ ELECTROBUN_EXPORT void wgpuViewSetHidden(AbstractView* abstractView, bool hidden
 
 ELECTROBUN_EXPORT void wgpuViewRemove(AbstractView* abstractView) {
     if (!abstractView) return;
-    uint32_t viewId = abstractView->webviewId;
-    WGPUViewImpl* view = dynamic_cast<WGPUViewImpl*>(abstractView);
-    if (view && view->xWindow) {
-        std::lock_guard<std::mutex> lock(g_x11WindowsMutex);
-        g_x11_child_window_to_parent_id.erase(view->xWindow);
-        if (view->inputXWindow) {
-            g_x11_child_window_to_parent_id.erase(view->inputXWindow);
+    dispatch_sync_main_void([abstractView]() {
+        std::shared_ptr<AbstractView> retainedView;
+        {
+            std::lock_guard<std::mutex> lock(g_wgpuViewMapMutex);
+            auto it = std::find_if(
+                g_wgpuViewMap.begin(),
+                g_wgpuViewMap.end(),
+                [abstractView](const auto& entry) {
+                    return entry.second.get() == abstractView;
+                });
+            if (it == g_wgpuViewMap.end()) {
+                return;
+            }
+            retainedView = it->second;
+            g_wgpuViewMap.erase(it);
         }
-    }
-    dispatch_sync_main_void([&]() {
-        abstractView->remove();
+
+        g_pendingResizeQueue.remove(retainedView.get());
+
+        WGPUViewImpl* view = dynamic_cast<WGPUViewImpl*>(retainedView.get());
+        if (view && view->xWindow) {
+            std::lock_guard<std::mutex> lock(g_x11WindowsMutex);
+            g_x11_child_window_to_parent_id.erase(view->xWindow);
+            if (view->inputXWindow) {
+                g_x11_child_window_to_parent_id.erase(view->inputXWindow);
+            }
+        }
+        retainedView->remove();
     });
-    {
-        std::lock_guard<std::mutex> lock(g_webviewMapMutex);
-        g_webviewMap.erase(viewId);
-    }
 }
 
 ELECTROBUN_EXPORT void* wgpuViewGetNativeHandle(AbstractView* abstractView) {
@@ -8122,6 +8286,13 @@ static bool ensureWgpuTestSymbols() {
     LOAD_TEST_SYM(wgpuCommandEncoderRelease);
 #undef LOAD_TEST_SYM
     return true;
+}
+
+ELECTROBUN_EXPORT void wgpuSurfaceCapabilitiesFreeMembersShim(void* capabilitiesPtr) {
+    if (!capabilitiesPtr || !ensureWgpuTestSymbols()) return;
+    WGPUSurfaceCapabilities* capabilities = (WGPUSurfaceCapabilities*)capabilitiesPtr;
+    p_wgpuSurfaceCapabilitiesFreeMembers(*capabilities);
+    *capabilities = {};
 }
 
 struct GPUTestState {
@@ -9116,18 +9287,28 @@ ELECTROBUN_EXPORT void webviewRemove(AbstractView* abstractView) {
     if (abstractView) {
         // Get the webview ID before scheduling async removal
         uint32_t webviewId = abstractView->webviewId;
+        {
+            std::lock_guard<std::mutex> lock(g_allowedProtocolsMutex);
+            g_allowedProtocols.erase(webviewId);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_webviewViewsRootMutex);
+            g_webviewViewsRoot.erase(webviewId);
+        }
         
         // Find the shared_ptr for this view to keep it alive during async removal
         std::shared_ptr<AbstractView> viewPtr;
         {
             std::lock_guard<std::mutex> lock(g_webviewMapMutex);
             auto it = g_webviewMap.find(webviewId);
-            if (it != g_webviewMap.end()) {
+            if (it != g_webviewMap.end() && it->second.get() == abstractView) {
                 viewPtr = it->second;
             } else {
                 return;
             }
         }
+
+        g_pendingResizeQueue.remove(viewPtr.get());
         
         // Use g_idle_add to remove the webview asynchronously on the main thread
         // Pass the shared_ptr to keep the object alive
@@ -9338,13 +9519,27 @@ ELECTROBUN_EXPORT void webviewToggleDevTools(AbstractView* abstractView) {
 }
 
 ELECTROBUN_EXPORT void webviewSetPageZoom(AbstractView* abstractView, double zoomLevel) {
-    // pageZoom is WebKit-specific, not available on Linux CEF
-    // TODO: implement CEF zoom if needed
+    if (!abstractView) return;
+
+    dispatch_sync_main_void([abstractView, zoomLevel]() {
+        auto* webKitView = dynamic_cast<WebKitWebViewImpl*>(abstractView);
+        if (webKitView && webKitView->webview) {
+            webkit_web_view_set_zoom_level(WEBKIT_WEB_VIEW(webKitView->webview), zoomLevel);
+        }
+    });
 }
 
 ELECTROBUN_EXPORT double webviewGetPageZoom(AbstractView* abstractView) {
-    // pageZoom is WebKit-specific, not available on Linux CEF
-    return 1.0;
+    if (!abstractView) return 1.0;
+
+    double zoomLevel = 1.0;
+    dispatch_sync_main_void([abstractView, &zoomLevel]() {
+        auto* webKitView = dynamic_cast<WebKitWebViewImpl*>(abstractView);
+        if (webKitView && webKitView->webview) {
+            zoomLevel = webkit_web_view_get_zoom_level(WEBKIT_WEB_VIEW(webKitView->webview));
+        }
+    });
+    return zoomLevel;
 }
 
 ELECTROBUN_EXPORT void updatePreloadScriptToWebView(AbstractView* abstractView, const char* scriptIdentifier, const char* scriptContent, bool forMainFrameOnly) {
@@ -9481,14 +9676,18 @@ ELECTROBUN_EXPORT void addPreloadScriptToWebView(AbstractView* abstractView, con
 }
 
 ELECTROBUN_EXPORT void callAsyncJavaScript(const char* messageId, const char* jsString, uint32_t webviewId, uint32_t hostWebviewId, void* completionHandler) {
-    // Find the webview in containers
-    for (auto& [id, container] : g_containers) {
-        for (auto& view : container->abstractViews) {
-            if (view->webviewId == webviewId) {
-                view->callAsyncJavascript(messageId, jsString, webviewId, hostWebviewId, completionHandler);
-                return;
-            }
+    std::shared_ptr<AbstractView> browserView;
+    {
+        std::lock_guard<std::mutex> lock(g_webviewMapMutex);
+        auto it = g_webviewMap.find(webviewId);
+        if (it != g_webviewMap.end()) {
+            browserView = it->second;
         }
+    }
+
+    if (browserView) {
+        browserView->callAsyncJavascript(
+            messageId, jsString, webviewId, hostWebviewId, completionHandler);
     }
 }
 
@@ -10280,6 +10479,7 @@ ELECTROBUN_EXPORT void stopEventLoop() {
     printf("[stopEventLoop] Initiating clean event loop exit\n");
 
     runOnMainThreadAsyncVoid([]() {
+        wayland_screen_capture::shutdown();
         if (g_cefInitialized.load()) {
             beginCEFShutdownOnMainThread();
         } else {
@@ -10429,10 +10629,24 @@ void cleanupWebviewsForWindow(uint32_t windowId) {
             }
         });
 
-        std::lock_guard<std::mutex> lock(g_webviewMapMutex);
-        for (auto& webview : container->abstractViews) {
-            if (webview) {
-                g_webviewMap.erase(webview->webviewId);
+        {
+            std::lock_guard<std::mutex> lock(g_webviewMapMutex);
+            for (auto& webview : container->abstractViews) {
+                if (webview && !dynamic_cast<WGPUViewImpl*>(webview.get())) {
+                    g_webviewMap.erase(webview->webviewId);
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_wgpuViewMapMutex);
+            for (auto& webview : container->abstractViews) {
+                if (webview && dynamic_cast<WGPUViewImpl*>(webview.get())) {
+                    auto it = g_wgpuViewMap.find(webview->webviewId);
+                    if (it != g_wgpuViewMap.end() &&
+                        it->second.get() == webview.get()) {
+                        g_wgpuViewMap.erase(it);
+                    }
+                }
             }
         }
     }
@@ -10529,6 +10743,7 @@ ELECTROBUN_EXPORT void closeWindow(void* window) {
                 // close callback. Also cover native adapters and abnormal window
                 // teardown before destroying the X11 parent.
                 removeCEFViewsForParentWindow(x11_window);
+                removeWGPUViewsForParentWindow(x11_window);
                 
                 // Remove the X11 window from global maps.
                 {
@@ -11190,6 +11405,62 @@ ELECTROBUN_EXPORT void getWindowFrame(void* window, double* outX, double* outY, 
     });
 }
 
+// Return the drawable client area's screen-space origin. Unlike
+// getWindowFrame(), this intentionally excludes window-manager decorations so
+// screen-space pointer coordinates can be translated into content coordinates.
+ELECTROBUN_EXPORT void getWindowContentOrigin(void* window, double* outX, double* outY) {
+    if (!outX || !outY) return;
+
+    *outX = 0;
+    *outY = 0;
+    if (!window) return;
+
+    dispatch_sync_main_void([&]() {
+        if (GTK_IS_WIDGET(window)) {
+            GtkWidget* gtkWindow = static_cast<GtkWidget*>(window);
+            if (!GTK_IS_WINDOW(gtkWindow)) return;
+
+            GdkWindow* contentWindow = gtk_widget_get_window(gtkWindow);
+            if (contentWindow) {
+                gint contentX = 0;
+                gint contentY = 0;
+                gdk_window_get_origin(contentWindow, &contentX, &contentY);
+                *outX = static_cast<double>(contentX);
+                *outY = static_cast<double>(contentY);
+                return;
+            }
+
+            // A not-yet-realized GTK window has no client GdkWindow. Preserve
+            // the best available position until it is realized.
+            gint windowX = 0;
+            gint windowY = 0;
+            gtk_window_get_position(GTK_WINDOW(gtkWindow), &windowX, &windowY);
+            *outX = static_cast<double>(windowX);
+            *outY = static_cast<double>(windowY);
+            return;
+        }
+
+        X11Window* x11win = static_cast<X11Window*>(window);
+        if (!x11win || !x11win->display || !x11win->window) return;
+
+        int contentX = 0;
+        int contentY = 0;
+        Window child = None;
+        if (XTranslateCoordinates(
+                x11win->display,
+                x11win->window,
+                DefaultRootWindow(x11win->display),
+                0,
+                0,
+                &contentX,
+                &contentY,
+                &child)) {
+            *outX = static_cast<double>(contentX);
+            *outY = static_cast<double>(contentY);
+        }
+    });
+}
+
 ELECTROBUN_EXPORT void getWindowPosition(void* window, double* outX, double* outY) {
     double width, height;
     getWindowFrame(window, outX, outY, &width, &height);
@@ -11716,20 +11987,33 @@ ELECTROBUN_EXPORT const char* getPrimaryDisplay() {
 
 // Get current cursor position as JSON: {"x": 123, "y": 456}
 ELECTROBUN_EXPORT const char* getCursorScreenPoint() {
-    return dispatch_sync_main([&]() -> const char* {
+    static thread_local std::string resultStorage;
+
+    resultStorage = dispatch_sync_main([&]() -> std::string {
+        if (wayland_screen_capture::isWaylandSession()) {
+            double portalX = 0;
+            double portalY = 0;
+            if (wayland_screen_capture::getCursorScreenPoint(
+                    &portalX, &portalY)) {
+                std::ostringstream result;
+                result << "{\"x\":" << portalX << ",\"y\":" << portalY << "}";
+                return result.str();
+            }
+        }
+
         GdkDisplay* display = gdk_display_get_default();
         if (!display) {
-            return strdup("{\"x\":0,\"y\":0}");
+            return "{\"x\":0,\"y\":0}";
         }
 
         GdkSeat* seat = gdk_display_get_default_seat(display);
         if (!seat) {
-            return strdup("{\"x\":0,\"y\":0}");
+            return "{\"x\":0,\"y\":0}";
         }
 
         GdkDevice* pointer = gdk_seat_get_pointer(seat);
         if (!pointer) {
-            return strdup("{\"x\":0,\"y\":0}");
+            return "{\"x\":0,\"y\":0}";
         }
 
         int x = 0;
@@ -11738,7 +12022,180 @@ ELECTROBUN_EXPORT const char* getCursorScreenPoint() {
 
         std::ostringstream result;
         result << "{\"x\":" << x << ",\"y\":" << y << "}";
-        return strdup(result.str().c_str());
+        return result.str();
+    });
+
+    return resultStorage.c_str();
+}
+
+ELECTROBUN_EXPORT bool captureScreenRegion(
+    double x,
+    double y,
+    uint32_t width,
+    uint32_t height,
+    uint8_t* out_rgba,
+    uint64_t out_len
+) {
+    if (!out_rgba || width == 0 || height == 0 ||
+        !std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
+
+    const uint64_t logicalWidth = static_cast<uint64_t>(width);
+    const uint64_t logicalHeight = static_cast<uint64_t>(height);
+    if (logicalWidth > std::numeric_limits<uint64_t>::max() / logicalHeight) {
+        return false;
+    }
+    const uint64_t logicalPixels = logicalWidth * logicalHeight;
+    if (logicalPixels > std::numeric_limits<uint64_t>::max() / 4) {
+        return false;
+    }
+    const uint64_t requiredOutputBytes = logicalPixels * 4;
+    if (out_len != requiredOutputBytes ||
+        requiredOutputBytes > std::numeric_limits<size_t>::max() ||
+        width > static_cast<uint32_t>(G_MAXINT) ||
+        height > static_cast<uint32_t>(G_MAXINT)) {
+        return false;
+    }
+
+    // Keep the conversion well-defined even for hostile FFI inputs. Screen
+    // coordinates ultimately have gint-sized GDK bounds; use int64_t while
+    // validating before narrowing them for the GDK call.
+    const long double roundedX = std::round(static_cast<long double>(x));
+    const long double roundedY = std::round(static_cast<long double>(y));
+    if (roundedX < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
+        roundedX > static_cast<long double>(std::numeric_limits<int64_t>::max()) ||
+        roundedY < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
+        roundedY > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+        return false;
+    }
+    const int64_t requestedLeft = static_cast<int64_t>(roundedX);
+    const int64_t requestedTop = static_cast<int64_t>(roundedY);
+
+    return dispatch_sync_main([=]() -> bool {
+        if (wayland_screen_capture::isWaylandSession()) {
+            return wayland_screen_capture::captureRegion(
+                static_cast<double>(requestedLeft),
+                static_cast<double>(requestedTop),
+                width,
+                height,
+                out_rgba,
+                out_len);
+        }
+
+        GdkDisplay* display = gdk_display_get_default();
+        if (!display || !GDK_IS_X11_DISPLAY(display)) {
+            // GTK is intentionally initialized with GDK_BACKEND=x11. Do not
+            // pretend capture succeeded if that contract ever changes (for
+            // example, on a native Wayland backend without portal capture).
+            return false;
+        }
+
+        GdkWindow* root = gdk_get_default_root_window();
+        if (!root || gdk_window_is_destroyed(root)) {
+            return false;
+        }
+
+        const int rootWidth = gdk_window_get_width(root);
+        const int rootHeight = gdk_window_get_height(root);
+        if (rootWidth <= 0 || rootHeight <= 0) {
+            return false;
+        }
+
+        const int64_t requestedWidth = static_cast<int64_t>(width);
+        const int64_t requestedHeight = static_cast<int64_t>(height);
+        // Screen.getCursorScreenPoint(), display bounds, and GDK's root
+        // drawable share this coordinate space. Negative/clipped XRandR CRTC
+        // coordinates are outside the drawable and therefore fail cleanly.
+        if (requestedLeft < 0 || requestedTop < 0 ||
+            requestedLeft > rootWidth || requestedTop > rootHeight ||
+            requestedWidth > static_cast<int64_t>(rootWidth) - requestedLeft ||
+            requestedHeight > static_cast<int64_t>(rootHeight) - requestedTop) {
+            return false;
+        }
+
+        GdkPixbuf* pixbuf = gdk_pixbuf_get_from_window(
+            root,
+            static_cast<int>(requestedLeft),
+            static_cast<int>(requestedTop),
+            static_cast<int>(width),
+            static_cast<int>(height));
+        if (!pixbuf) {
+            return false;
+        }
+
+        const int pixbufWidth = gdk_pixbuf_get_width(pixbuf);
+        const int pixbufHeight = gdk_pixbuf_get_height(pixbuf);
+        const int channels = gdk_pixbuf_get_n_channels(pixbuf);
+        const int rowstride = gdk_pixbuf_get_rowstride(pixbuf);
+        const bool validFormat =
+            gdk_pixbuf_get_colorspace(pixbuf) == GDK_COLORSPACE_RGB &&
+            gdk_pixbuf_get_bits_per_sample(pixbuf) == 8 &&
+            channels >= 3 &&
+            pixbufWidth > 0 && pixbufHeight > 0 &&
+            pixbufWidth % static_cast<int>(width) == 0 &&
+            pixbufHeight % static_cast<int>(height) == 0;
+        if (!validFormat) {
+            g_object_unref(pixbuf);
+            return false;
+        }
+
+        const int scaleX = pixbufWidth / static_cast<int>(width);
+        const int scaleY = pixbufHeight / static_cast<int>(height);
+        if (scaleX <= 0 || scaleX != scaleY) {
+            g_object_unref(pixbuf);
+            return false;
+        }
+
+        const uint64_t packedRowBytes =
+            static_cast<uint64_t>(pixbufWidth) * static_cast<uint64_t>(channels);
+        if (rowstride <= 0 || static_cast<uint64_t>(rowstride) < packedRowBytes) {
+            g_object_unref(pixbuf);
+            return false;
+        }
+
+        guint sourceLength = 0;
+        const guchar* source =
+            gdk_pixbuf_get_pixels_with_length(pixbuf, &sourceLength);
+        const uint64_t requiredSourceBytes =
+            static_cast<uint64_t>(pixbufHeight - 1) *
+                static_cast<uint64_t>(rowstride) +
+            packedRowBytes;
+        if (!source || requiredSourceBytes > static_cast<uint64_t>(sourceLength)) {
+            g_object_unref(pixbuf);
+            return false;
+        }
+
+        // The pixbuf is device-resolution (logical dimensions multiplied by
+        // the root window's integer scale). Sample the center device pixel for
+        // each requested logical pixel and always expose opaque RGBA.
+        const int sampleOffset = scaleX / 2;
+        for (uint32_t destinationY = 0; destinationY < height; ++destinationY) {
+            const int sourceY =
+                static_cast<int>(destinationY) * scaleY + sampleOffset;
+            const uint64_t sourceRow =
+                static_cast<uint64_t>(sourceY) * static_cast<uint64_t>(rowstride);
+            const uint64_t destinationRow =
+                static_cast<uint64_t>(destinationY) * logicalWidth * 4;
+
+            for (uint32_t destinationX = 0; destinationX < width; ++destinationX) {
+                const int sourceX =
+                    static_cast<int>(destinationX) * scaleX + sampleOffset;
+                const uint64_t sourceOffset =
+                    sourceRow + static_cast<uint64_t>(sourceX) *
+                        static_cast<uint64_t>(channels);
+                const uint64_t destinationOffset =
+                    destinationRow + static_cast<uint64_t>(destinationX) * 4;
+
+                out_rgba[destinationOffset] = source[sourceOffset];
+                out_rgba[destinationOffset + 1] = source[sourceOffset + 1];
+                out_rgba[destinationOffset + 2] = source[sourceOffset + 2];
+                out_rgba[destinationOffset + 3] = 255;
+            }
+        }
+
+        g_object_unref(pixbuf);
+        return true;
     });
 }
 

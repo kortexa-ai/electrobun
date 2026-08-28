@@ -34,10 +34,16 @@ import {
 	CHROMIUM_VERSION,
 	DEFAULT_CEF_VERSION_STRING,
 } from "./src/shared/cef-version";
-import { BUN_VERSION } from "./src/shared/bun-version";
 import { RUST_VERSION } from "./src/shared/rust-version";
 import { GO_VERSION } from "./src/shared/go-version";
 import { ODIN_VERSION } from "./src/shared/odin-version";
+import { ELECTROBUN_VERSION } from "./src/shared/electrobun-version";
+import {
+	NATIVE_DEVKIT_MANIFEST_FILENAME,
+	createNativeDevkitManifest,
+	nativeDevkitTarget,
+	serializeNativeDevkitManifest,
+} from "./src/shared/native-devkit-manifest";
 import {
 	MACOS_DEPLOYMENT_TARGET,
 	macosZigTarget,
@@ -82,7 +88,6 @@ const ARCH: "arm64" | "x64" = getArch();
 
 const isWindows = platform() === "win32";
 const binExt = OS === "win" ? ".exe" : "";
-const bunBin = isWindows ? "bun.exe" : "bun";
 const zigBinary = OS === "win" ? "zig.exe" : "zig";
 const rustBinary = OS === "win" ? "rustc.exe" : "rustc";
 const cargoBinary = OS === "win" ? "cargo.exe" : "cargo";
@@ -94,10 +99,6 @@ const macosClangDeploymentFlag = `-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET
 
 // PATHS
 const PATH = {
-	bun: {
-		RUNTIME: join(process.cwd(), "vendors", "bun", bunBin),
-		DIST: join(process.cwd(), "dist", bunBin),
-	},
 	zig: {
 		BIN: join(process.cwd(), "vendors", "zig", zigBinary),
 	},
@@ -334,8 +335,13 @@ function runInherited(command: string, args: string[], cwd = process.cwd()) {
 	}
 }
 
-async function runZigBuild(projectDir: string, zigArgs: string[]) {
-	const optimizeArgs = CHANNEL === "release" ? ["-Doptimize=ReleaseSmall"] : [];
+async function runZigBuild(
+	projectDir: string,
+	zigArgs: string[],
+	releaseOptimize: "ReleaseFast" | "ReleaseSmall" = "ReleaseSmall",
+) {
+	const optimizeArgs =
+		CHANNEL === "release" ? [`-Doptimize=${releaseOptimize}`] : [];
 	if (OS === "win") {
 		runInherited(
 			PATH.zig.BIN,
@@ -346,42 +352,10 @@ async function runZigBuild(projectDir: string, zigArgs: string[]) {
 	}
 
 	const projectPath = join("src", projectDir);
-	try {
-		if (CHANNEL === "release") {
-			await $`cd ${projectPath} && ../../vendors/zig/zig build -Doptimize=ReleaseSmall ${zigArgs}`;
-		} else {
-			await $`cd ${projectPath} && ../../vendors/zig/zig build ${zigArgs}`;
-		}
-	} catch (error) {
-		// Zig 0.13's build runner can panic on aarch64 Linux. Bypass the
-		// runner while preserving each project's normal output layout.
-		if (OS !== "linux" || ARCH !== "arm64") {
-			throw error;
-		}
-
-		const targetFlag = zigArgs
-			.find((arg) => arg.startsWith("-Dtarget="))
-			?.replace("-Dtarget=", "");
-		const targetArgs = targetFlag ? ["-target", targetFlag] : [];
-		const optimize = CHANNEL === "release" ? "ReleaseSmall" : "Debug";
-
-		if (projectDir === "core") {
-			console.warn(
-				"zig build panicked on aarch64 Linux; falling back to zig build-lib",
-			);
-			await $`cd ${projectPath} && mkdir -p zig-out/lib && ../../vendors/zig/zig build-lib main.zig -dynamic --name ElectrobunCore -lc ${targetArgs} -O ${optimize} && mv libElectrobunCore.so zig-out/lib/libElectrobunCore.so && rm -f libElectrobunCore.so.o`;
-			return;
-		}
-
-		if (projectDir === "launcher" || projectDir === "extractor") {
-			console.warn(
-				`zig build panicked on aarch64 Linux; falling back to zig build-exe for ${projectDir}`,
-			);
-			await $`cd ${projectPath} && mkdir -p zig-out/bin && ../../vendors/zig/zig build-exe main.zig --name ${projectDir} -lc ${targetArgs} -O ${optimize} && mv ${projectDir} zig-out/bin/${projectDir} && rm -f ${projectDir}.o`;
-			return;
-		}
-
-		throw error;
+	if (CHANNEL === "release") {
+		await $`cd ${projectPath} && ../../vendors/zig/zig build ${optimizeArgs} ${zigArgs}`;
+	} else {
+		await $`cd ${projectPath} && ../../vendors/zig/zig build ${zigArgs}`;
 	}
 }
 
@@ -677,7 +651,6 @@ async function setup() {
 		recursive: true,
 		force: true,
 	});
-	await vendorBun();
 	await Promise.all([
 		vendorBsdiff(),
 		vendorZstd(),
@@ -753,14 +726,17 @@ async function copyApiFiles() {
 	cpSync("src/sdks/rust/electrobun.rs", "dist/rust-sdk/electrobun.rs", {
 		force: true,
 	});
+	cpSync("src/sdks/rust/Cargo.toml", "dist/rust-sdk/Cargo.toml", {
+		force: true,
+	});
 	mkdirSync("dist/go-sdk", { recursive: true });
 	cpSync("src/sdks/go", "dist/go-sdk", { recursive: true, force: true });
 
 	// Odin SDK is a package directory; the CLI exposes its parent as an Odin
 	// collection so user code can `import "electrobun_sdk:electrobun"`.
-	mkdirSync("dist/odin-sdk", { recursive: true });
-	cpSync("src/sdks/odin", "dist/odin-sdk/electrobun", {
-		recursive: true,
+	rmSync("dist/odin-sdk/electrobun", { recursive: true, force: true });
+	mkdirSync("dist/odin-sdk/electrobun", { recursive: true });
+	cpSync("src/sdks/odin/electrobun.odin", "dist/odin-sdk/electrobun/electrobun.odin", {
 		force: true,
 	});
 }
@@ -781,9 +757,9 @@ function copyMatchingFiles(
 }
 
 async function copyToDist() {
-	// Bun remains an optional application runtime. Hutch and Electrobun's build
-	// pipeline continue to run through Cottontail.
-	cpSync(PATH.bun.RUNTIME, PATH.bun.DIST, { force: true });
+	// Bun is not distributed here: Hutch vendors it as a toolchain and stages
+	// it into app bundles for mainProcess "bun"; the devkit only pins the
+	// default version.
 	// Zig launcher for all platforms
 	cpSync(`src/launcher/zig-out/bin/launcher${binExt}`, `dist/launcher${binExt}`, { force: true });
 	cpSync(`src/extractor/zig-out/bin/extractor${binExt}`, `dist/extractor${binExt}`, { force: true });
@@ -1016,6 +992,15 @@ async function copyToDist() {
 		console.log("[done]Copying CEF files for Linux...");
 	}
 
+	const nativeDevkitManifest = createNativeDevkitManifest({
+		productVersion: ELECTROBUN_VERSION,
+		target: nativeDevkitTarget(OS, ARCH),
+	});
+	writeFileSync(
+		join("dist", NATIVE_DEVKIT_MANIFEST_FILENAME),
+		serializeNativeDevkitManifest(nativeDevkitManifest),
+	);
+
 	normalizeDistExecutableModes("dist");
 	writeRuntimeManifest(coreLibName);
 	// Create platform-specific dist folder and copy all files
@@ -1053,7 +1038,6 @@ function writeRuntimeManifest(coreLibName: string) {
 function normalizeDistExecutableModes(directory: string) {
 	if (OS === "win") return;
 	for (const filename of [
-		bunBin,
 		"launcher",
 		"extractor",
 		"bsdiff",
@@ -1077,10 +1061,12 @@ async function createPlatformDistFolder() {
 	// Copy all files from dist/ to platform-specific folder
 	if (OS === "win") {
 		rmSync(platformDistDir, { recursive: true, force: true });
+		// Keep this on Cottontail's native tree-copy path. Its older JavaScript
+		// fallback rounded large NTFS directory IDs and could report a false ELOOP;
+		// this generated staging mirror does not need source timestamps.
 		cpSync("dist", platformDistDir, {
 			recursive: true,
 			force: true,
-			preserveTimestamps: true,
 		});
 	} else if (OS === "macos") {
 		rmSync(platformDistDir, { recursive: true, force: true });
@@ -1149,62 +1135,6 @@ async function installPackageDependencies() {
 	await $`npm install`;
 }
 
-async function vendorBun() {
-	const bunDir = join(process.cwd(), "vendors", "bun");
-	const bunVersionFile = join(bunDir, ".bun-version");
-
-	if (existsSync(PATH.bun.RUNTIME)) {
-		if (existsSync(bunVersionFile)) {
-			const vendoredVersion = readFileSync(bunVersionFile, "utf-8").trim();
-			if (vendoredVersion === BUN_VERSION) return;
-			console.log(
-				`Bun version mismatch: vendored "${vendoredVersion}" vs expected "${BUN_VERSION}"`,
-			);
-			unlinkSync(PATH.bun.RUNTIME);
-		} else {
-			mkdirSync(bunDir, { recursive: true });
-			writeFileSync(bunVersionFile, BUN_VERSION);
-			return;
-		}
-	}
-
-	let assetName: string;
-	let archiveDirectory: string;
-	if (OS === "win") {
-		// Electrobun's Windows target is x64, including on ARM hosts.
-		assetName = "bun-windows-x64-baseline.zip";
-		archiveDirectory = "bun-windows-x64-baseline";
-	} else if (OS === "macos") {
-		assetName = ARCH === "arm64" ? "bun-darwin-aarch64.zip" : "bun-darwin-x64.zip";
-		archiveDirectory = ARCH === "arm64" ? "bun-darwin-aarch64" : "bun-darwin-x64";
-	} else {
-		assetName = ARCH === "arm64" ? "bun-linux-aarch64.zip" : "bun-linux-x64.zip";
-		archiveDirectory = ARCH === "arm64" ? "bun-linux-aarch64" : "bun-linux-x64";
-	}
-
-	const tempZipPath = join(bunDir, "temp.zip");
-	mkdirSync(bunDir, { recursive: true });
-	await $`curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o ${tempZipPath} https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${assetName}`;
-	validateDownload(tempZipPath, "bun");
-
-	if (isWindows) {
-		await $`powershell -NoProfile -Command "Expand-Archive -Path '${tempZipPath}' -DestinationPath '${bunDir}' -Force"`;
-	} else {
-		await $`unzip -o ${tempZipPath} -d ${bunDir}`;
-	}
-
-	const extractedBinary = join(
-		bunDir,
-		archiveDirectory,
-		isWindows ? "bun.exe" : "bun",
-	);
-	cpSync(extractedBinary, PATH.bun.RUNTIME, { force: true });
-	if (!isWindows) chmodSync(PATH.bun.RUNTIME, 0o755);
-
-	rmSync(tempZipPath, { force: true });
-	rmSync(join(bunDir, archiveDirectory), { recursive: true, force: true });
-	writeFileSync(bunVersionFile, BUN_VERSION);
-}
 
 function verifyVendoredZig() {
 	const versionOutput = runCaptured(PATH.zig.BIN, ["version"]).trim();
@@ -1870,7 +1800,7 @@ async function vendorCEF() {
 			await $`rm -f src/native/build/process_helper_mac.o src/native/build/process_helper_win.obj src/native/linux/build/process_helper_linux.o`;
 			await $`rm -f src/native/build/libNativeWrapper.dylib src/native/build/libNativeWrapper.so src/native/build/libNativeWrapper_cef.so`;
 			await $`rm -f src/native/win/build/libNativeWrapper.dll src/native/win/build/nativeWrapper.obj`;
-			await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o`;
+			await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o src/native/linux/build/wayland_screen_capture.o src/native/linux/build/wayland_pipewire_capture.o`;
 		}
 	} else if (existsSync(cefDir) && !existsSync(versionFile)) {
 		// CEF dir exists but no version file (legacy state) — force re-vendor
@@ -1882,7 +1812,7 @@ async function vendorCEF() {
 		await $`rm -f src/native/build/process_helper_mac.o src/native/build/process_helper_win.obj src/native/linux/build/process_helper_linux.o`;
 		await $`rm -f src/native/build/libNativeWrapper.dylib src/native/build/libNativeWrapper.so src/native/build/libNativeWrapper_cef.so`;
 		await $`rm -f src/native/win/build/libNativeWrapper.dll src/native/win/build/nativeWrapper.obj`;
-		await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o`;
+		await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o src/native/linux/build/wayland_screen_capture.o src/native/linux/build/wayland_pipewire_capture.o`;
 	}
 
 	if (OS === "macos") {
@@ -1990,11 +1920,24 @@ async function vendorCEF() {
 			"libcef_dll_wrapper",
 			"libcef_dll_wrapper.a",
 		);
-		if (!existsSync(processHelperPath) || !macCefBuildIsCurrent(wrapperPath)) {
+		const helperSourcePath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"macos",
+			"cef_process_helper_mac.cc",
+		);
+		const wrapperNeedsBuild = !macCefBuildIsCurrent(wrapperPath);
+		const helperNeedsBuild = outputMissingOrOlder(processHelperPath, [
+			helperSourcePath,
+		]);
+		if (helperNeedsBuild || wrapperNeedsBuild) {
 			await $`mkdir -p src/native/build`;
-			console.log("Building CEF wrapper library...");
-			await buildMacCefWrapper();
-			console.log("CEF wrapper library built successfully");
+			if (wrapperNeedsBuild) {
+				console.log("Building CEF wrapper library...");
+				await buildMacCefWrapper();
+				console.log("CEF wrapper library built successfully");
+			}
 
 			// build helper
 			await $`xcrun --sdk macosx clang++ ${macosClangDeploymentFlag} -std=c++20 -ObjC++ -fobjc-arc -I./vendors/cef -c src/native/macos/cef_process_helper_mac.cc -o src/native/build/process_helper_mac.o`;
@@ -2169,11 +2112,21 @@ async function vendorCEF() {
 		}
 
 		// Build process_helper binary for Linux
-		if (
-			!existsSync(
-				join(process.cwd(), "src", "native", "build", "process_helper"),
-			)
-		) {
+		const processHelperPath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"build",
+			"process_helper",
+		);
+		const processHelperSourcePath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"linux",
+			"cef_process_helper_linux.cpp",
+		);
+		if (outputMissingOrOlder(processHelperPath, [processHelperSourcePath])) {
 			console.log("Building CEF process helper for Linux...");
 			await $`mkdir -p src/native/build`;
 
@@ -2243,6 +2196,7 @@ async function vendorLinuxDeps() {
 			"libgtk-3-dev",
 			"libwebkit2gtk-4.1-dev",
 			"libayatana-appindicator3-dev",
+			"libpipewire-0.3-dev",
 			"librsvg2-dev",
 			"fuse",
 			"libfuse2",
@@ -2526,6 +2480,8 @@ async function buildNative() {
 				let pkgConfigCflags = "";
 				let pkgConfigLibs = "";
 				let hasAppIndicator = false;
+				let pipewireCflags = "";
+				let hasWaylandScreenCapture = false;
 
 				try {
 					// Try to get flags for all packages
@@ -2549,6 +2505,18 @@ async function buildNative() {
 					console.log("   cflags:", pkgConfigCflags.substring(0, 100) + "...");
 				}
 
+				try {
+					const cflagsResult =
+						await $`pkg-config --cflags libpipewire-0.3`.quiet();
+					pipewireCflags = cflagsResult.stdout.toString().trim();
+					hasWaylandScreenCapture = true;
+					console.log("Wayland screen capture enabled via PipeWire");
+				} catch {
+					console.warn(
+						"⚠️  Wayland screen capture disabled: PipeWire development headers not found",
+					);
+				}
+
 				// Compile the main wrapper with WebKitGTK, AppIndicator, and CEF headers
 				await $`mkdir -p src/native/linux/build`;
 				console.log(
@@ -2564,9 +2532,13 @@ async function buildNative() {
 					"-O2",
 					"-fPIC",
 					...pkgConfigCflags.split(/\s+/).filter((f) => f),
+					...pipewireCflags.split(/\s+/).filter((f) => f),
 					`-I${cefInclude}`,
 					...(existsSync(wgpuIncludeDir) ? [`-I${wgpuIncludeDir}`] : []),
 					...(hasAppIndicator ? [] : ["-DNO_APPINDICATOR"]),
+					...(hasWaylandScreenCapture
+						? ["-DELECTROBUN_ENABLE_WAYLAND_SCREEN_CAPTURE"]
+						: []),
 				];
 				writeNativeCompileFlags("linux", compileFlags);
 				const compileCmd = [
@@ -2580,6 +2552,26 @@ async function buildNative() {
 
 				await $`${compileCmd}`;
 
+				const waylandCaptureCompileCmd = [
+					"g++",
+					"-c",
+					...compileFlags,
+					"-o",
+					"src/native/linux/build/wayland_screen_capture.o",
+					"src/native/linux/wayland_screen_capture.cpp",
+				];
+				await $`${waylandCaptureCompileCmd}`;
+
+				const waylandPipeWireCaptureCompileCmd = [
+					"g++",
+					"-c",
+					...compileFlags,
+					"-o",
+					"src/native/linux/build/wayland_pipewire_capture.o",
+					"src/native/linux/wayland_pipewire_capture.cpp",
+				];
+				await $`${waylandPipeWireCaptureCompileCmd}`;
+
 				console.log("Building GTK-only version (libNativeWrapper.so)");
 				const linkCmd = [
 					"g++",
@@ -2587,6 +2579,8 @@ async function buildNative() {
 					"-o",
 					"src/native/build/libNativeWrapper.so",
 					"src/native/linux/build/nativeWrapper.o",
+					"src/native/linux/build/wayland_screen_capture.o",
+					"src/native/linux/build/wayland_pipewire_capture.o",
 					asarLib,
 					...pkgConfigLibs.split(/\s+/).filter((f) => f),
 					"-ldl",
@@ -2607,6 +2601,8 @@ async function buildNative() {
 						"-o",
 						"src/native/build/libNativeWrapper_cef.so",
 						"src/native/linux/build/nativeWrapper.o",
+						"src/native/linux/build/wayland_screen_capture.o",
+						"src/native/linux/build/wayland_pipewire_capture.o",
 						"src/native/linux/build/cef_loader.o",
 						asarLib,
 						...pkgConfigLibs.split(/\s+/).filter((f) => f),
@@ -2769,11 +2765,13 @@ async function buildSelfExtractor() {
 						`-Dtarget=${macosZigTarget(ARCH)}`,
 						...(ARCH === "x64" ? ["-Dcpu=baseline"] : []),
 					]
+			: OS === "linux" && ARCH === "arm64"
+				? ["-Dtarget=aarch64-linux-gnu", "-Dcpu=baseline"]
 			: ARCH === "x64"
 				? ["-Dcpu=baseline"]
 				: [];
 
-	await runZigBuild("extractor", zigArgs);
+	await runZigBuild("extractor", zigArgs, "ReleaseFast");
 }
 
 async function buildPreload() {

@@ -65,6 +65,22 @@ let currentScope: Scope | null = null;
 let trackingScope: Scope | null = null;
 let inertDepth = 0;
 
+function runTeardownSteps(steps: ReadonlyArray<() => void>): void {
+	let firstError: unknown;
+	let failed = false;
+	for (const step of steps) {
+		try {
+			step();
+		} catch (error) {
+			if (!failed) {
+				failed = true;
+				firstError = error;
+			}
+		}
+	}
+	if (failed) throw firstError;
+}
+
 class Scope {
 	kind: ScopeKind;
 	fn: (() => void) | null;
@@ -74,6 +90,8 @@ class Scope {
 	sources: SubscriberSet[] = [];
 	disposed = false;
 	hasRun = false;
+	enteredInert = false;
+	readStaticMaybe = false;
 
 	constructor(kind: ScopeKind, fn: (() => void) | null, parent: Scope | null) {
 		this.kind = kind;
@@ -85,15 +103,13 @@ class Scope {
 	run(): void {
 		if (this.disposed || !this.fn) return;
 		// A re-run replaces the previous run's scope state.
-		for (let i = this.children.length - 1; i >= 0; i--) {
-			this.children[i]!.dispose();
-		}
-		this.children.length = 0;
-		for (let i = this.cleanups.length - 1; i >= 0; i--) {
-			this.cleanups[i]!();
-		}
-		this.cleanups.length = 0;
-		this.clearSources();
+		const children = this.children.splice(0).reverse();
+		const cleanups = this.cleanups.splice(0).reverse();
+		runTeardownSteps([
+			...children.map((child) => () => child.dispose()),
+			...cleanups,
+			() => this.clearSources(),
+		]);
 
 		const prevScope = currentScope;
 		const prevTracking = trackingScope;
@@ -120,19 +136,19 @@ class Scope {
 		if (this.disposed) return;
 		this.disposed = true;
 		liveQueue.delete(this);
-		this.clearSources();
-		for (let i = this.children.length - 1; i >= 0; i--) {
-			this.children[i]!.dispose();
-		}
-		this.children.length = 0;
-		for (let i = this.cleanups.length - 1; i >= 0; i--) {
-			this.cleanups[i]!();
-		}
-		this.cleanups.length = 0;
-		if (this.parent && !this.parent.disposed) {
-			const idx = this.parent.children.indexOf(this);
-			if (idx >= 0) this.parent.children.splice(idx, 1);
-		}
+		const children = this.children.splice(0).reverse();
+		const cleanups = this.cleanups.splice(0).reverse();
+		runTeardownSteps([
+			() => this.clearSources(),
+			...children.map((child) => () => child.dispose()),
+			...cleanups,
+			() => {
+				if (this.parent && !this.parent.disposed) {
+					const idx = this.parent.children.indexOf(this);
+					if (idx >= 0) this.parent.children.splice(idx, 1);
+				}
+			},
+		]);
 	}
 }
 
@@ -341,11 +357,25 @@ export function memo<T>(
 // live
 // ---------------------------------------------------------------------------
 
-function warnZeroDeps(scope: Scope): void {
+const warnedZeroDepSites = new Set<string>();
+
+function warnZeroDeps(scope: Scope, source?: () => unknown): void {
 	if (!devMode || !scope.hasRun) return;
+	// live(() => { inert(() => ...) }) is the deferred-run-once idiom: the
+	// author explicitly opted out of tracking, so zero deps is the point.
+	// A scope that registered cleanup() is a lifecycle hook — dropping the
+	// marker would lose the teardown scoping, so it is not redundant either.
+	if (scope.enteredInert || scope.readStaticMaybe || scope.cleanups.length > 0) return;
 	if (scope.sources.length === 0) {
+		// Name the offender: an anonymous warning across hundreds of live()
+		// call sites is unactionable.
+		const snippet = source
+			? ` in: ${String(source).replace(/\s+/g, " ").slice(0, 160)}`
+			: "";
+		if (warnedZeroDepSites.has(snippet)) return;
+		warnedZeroDepSites.add(snippet);
 		console.warn(
-			"Warren: live() registered zero dependencies — the wrapped expression is static; drop the marker.",
+			`Warren: live() registered zero dependencies — the wrapped expression is static; drop the marker.${snippet}`,
 		);
 	} else if (scope.sources.every((s) => s.fromSignal)) {
 		// Inside another scope the signal calls would have tracked anyway.
@@ -391,7 +421,7 @@ export function live<T>(fn: () => T): Reactive<T> {
 			binding.fn();
 		};
 		decide.run();
-		warnZeroDeps(decide);
+		warnZeroDeps(decide, binding.fn);
 	};
 	liveQueue.add(decide);
 	scheduleFlush();
@@ -414,7 +444,7 @@ export function claimLive<T>(
 	const scope = new Scope("live", null, currentScope);
 	scope.fn = () => {
 		apply(binding.fn());
-		warnZeroDeps(scope);
+		warnZeroDeps(scope, binding.fn);
 	};
 	liveQueue.add(scope);
 	scheduleFlush();
@@ -434,8 +464,31 @@ export function liveScope(fn: () => void): void {
 // inert / cleanup / roots
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// readMaybe
+// ---------------------------------------------------------------------------
+
+export type MaybeAccessor<T> = T | (() => T);
+
+/**
+ * Reads a maybe-reactive value: call it when it's an accessor, return it
+ * as-is otherwise. Warren component props are eager values; call sites that
+ * need a prop to stay reactive pass an accessor instead, and readMaybe()
+ * lets static call sites keep passing plain values. Reading a plain value
+ * inside live() marks the scope as deliberately maybe-static, so the
+ * zero-dependency dev warning stays quiet for this idiom.
+ */
+export function readMaybe<T>(value: MaybeAccessor<T>): T {
+	if (typeof value === "function") {
+		return (value as () => T)();
+	}
+	if (trackingScope) trackingScope.readStaticMaybe = true;
+	return value;
+}
+
 export function inert<T>(fn: () => T): T {
 	// Outside a scope this is a no-op — inert is already the default there.
+	if (trackingScope) trackingScope.enteredInert = true;
 	inertDepth++;
 	try {
 		return fn();

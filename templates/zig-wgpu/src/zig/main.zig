@@ -183,26 +183,26 @@ const WgpuApi = struct {
     const InstanceProcessEventsFn = *const fn (?*anyopaque) callconv(.c) void;
     const ReleaseFn = *const fn (?*anyopaque) callconv(.c) void;
 
-    fn load(lib: *std.DynLib) !WgpuApi {
+    fn load(native: *electrobun.WgpuNative) !WgpuApi {
         return .{
-            .device_create_shader_module = lib.lookup(DeviceCreateShaderModuleFn, "wgpuDeviceCreateShaderModule") orelse return error.MissingWgpuSymbol,
-            .device_create_render_pipeline = lib.lookup(DeviceCreateRenderPipelineFn, "wgpuDeviceCreateRenderPipeline") orelse return error.MissingWgpuSymbol,
-            .device_create_buffer = lib.lookup(DeviceCreateBufferFn, "wgpuDeviceCreateBuffer") orelse return error.MissingWgpuSymbol,
-            .device_create_command_encoder = lib.lookup(DeviceCreateCommandEncoderFn, "wgpuDeviceCreateCommandEncoder") orelse return error.MissingWgpuSymbol,
-            .texture_create_view = lib.lookup(TextureCreateViewFn, "wgpuTextureCreateView") orelse return error.MissingWgpuSymbol,
-            .command_encoder_begin_render_pass = lib.lookup(CommandEncoderBeginRenderPassFn, "wgpuCommandEncoderBeginRenderPass") orelse return error.MissingWgpuSymbol,
-            .render_pass_encoder_set_pipeline = lib.lookup(RenderPassEncoderSetPipelineFn, "wgpuRenderPassEncoderSetPipeline") orelse return error.MissingWgpuSymbol,
-            .render_pass_encoder_set_vertex_buffer = lib.lookup(RenderPassEncoderSetVertexBufferFn, "wgpuRenderPassEncoderSetVertexBuffer") orelse return error.MissingWgpuSymbol,
-            .render_pass_encoder_draw = lib.lookup(RenderPassEncoderDrawFn, "wgpuRenderPassEncoderDraw") orelse return error.MissingWgpuSymbol,
-            .render_pass_encoder_end = lib.lookup(RenderPassEncoderEndFn, "wgpuRenderPassEncoderEnd") orelse return error.MissingWgpuSymbol,
-            .command_encoder_finish = lib.lookup(CommandEncoderFinishFn, "wgpuCommandEncoderFinish") orelse return error.MissingWgpuSymbol,
-            .queue_write_buffer = lib.lookup(QueueWriteBufferFn, "wgpuQueueWriteBuffer") orelse return error.MissingWgpuSymbol,
-            .queue_submit = lib.lookup(QueueSubmitFn, "wgpuQueueSubmit") orelse return error.MissingWgpuSymbol,
-            .instance_process_events = lib.lookup(InstanceProcessEventsFn, "wgpuInstanceProcessEvents") orelse return error.MissingWgpuSymbol,
-            .texture_release = lib.lookup(ReleaseFn, "wgpuTextureRelease") orelse return error.MissingWgpuSymbol,
-            .texture_view_release = lib.lookup(ReleaseFn, "wgpuTextureViewRelease") orelse return error.MissingWgpuSymbol,
-            .command_buffer_release = lib.lookup(ReleaseFn, "wgpuCommandBufferRelease") orelse return error.MissingWgpuSymbol,
-            .command_encoder_release = lib.lookup(ReleaseFn, "wgpuCommandEncoderRelease") orelse return error.MissingWgpuSymbol,
+            .device_create_shader_module = native.lookup(DeviceCreateShaderModuleFn, "wgpuDeviceCreateShaderModule") orelse return error.MissingWgpuSymbol,
+            .device_create_render_pipeline = native.lookup(DeviceCreateRenderPipelineFn, "wgpuDeviceCreateRenderPipeline") orelse return error.MissingWgpuSymbol,
+            .device_create_buffer = native.lookup(DeviceCreateBufferFn, "wgpuDeviceCreateBuffer") orelse return error.MissingWgpuSymbol,
+            .device_create_command_encoder = native.lookup(DeviceCreateCommandEncoderFn, "wgpuDeviceCreateCommandEncoder") orelse return error.MissingWgpuSymbol,
+            .texture_create_view = native.lookup(TextureCreateViewFn, "wgpuTextureCreateView") orelse return error.MissingWgpuSymbol,
+            .command_encoder_begin_render_pass = native.lookup(CommandEncoderBeginRenderPassFn, "wgpuCommandEncoderBeginRenderPass") orelse return error.MissingWgpuSymbol,
+            .render_pass_encoder_set_pipeline = native.lookup(RenderPassEncoderSetPipelineFn, "wgpuRenderPassEncoderSetPipeline") orelse return error.MissingWgpuSymbol,
+            .render_pass_encoder_set_vertex_buffer = native.lookup(RenderPassEncoderSetVertexBufferFn, "wgpuRenderPassEncoderSetVertexBuffer") orelse return error.MissingWgpuSymbol,
+            .render_pass_encoder_draw = native.lookup(RenderPassEncoderDrawFn, "wgpuRenderPassEncoderDraw") orelse return error.MissingWgpuSymbol,
+            .render_pass_encoder_end = native.lookup(RenderPassEncoderEndFn, "wgpuRenderPassEncoderEnd") orelse return error.MissingWgpuSymbol,
+            .command_encoder_finish = native.lookup(CommandEncoderFinishFn, "wgpuCommandEncoderFinish") orelse return error.MissingWgpuSymbol,
+            .queue_write_buffer = native.lookup(QueueWriteBufferFn, "wgpuQueueWriteBuffer") orelse return error.MissingWgpuSymbol,
+            .queue_submit = native.lookup(QueueSubmitFn, "wgpuQueueSubmit") orelse return error.MissingWgpuSymbol,
+            .instance_process_events = native.lookup(InstanceProcessEventsFn, "wgpuInstanceProcessEvents") orelse return error.MissingWgpuSymbol,
+            .texture_release = native.lookup(ReleaseFn, "wgpuTextureRelease") orelse return error.MissingWgpuSymbol,
+            .texture_view_release = native.lookup(ReleaseFn, "wgpuTextureViewRelease") orelse return error.MissingWgpuSymbol,
+            .command_buffer_release = native.lookup(ReleaseFn, "wgpuCommandBufferRelease") orelse return error.MissingWgpuSymbol,
+            .command_encoder_release = native.lookup(ReleaseFn, "wgpuCommandEncoderRelease") orelse return error.MissingWgpuSymbol,
         };
     }
 };
@@ -210,6 +210,30 @@ const WgpuApi = struct {
 var g_state: ?*AppState = null;
 var host_queue_running = std.atomic.Value(bool).init(false);
 var gpu_thread_started = std.atomic.Value(bool).init(false);
+var shutting_down = std.atomic.Value(bool).init(false);
+
+// Stop the worker threads as soon as the window goes away. The core destroys a
+// window's webviews and WGPU views before it reports the close, so anything the
+// render loop sends afterwards targets ids that no longer exist and the core
+// answers with "Webview <id> not found". The SDK quits the app on last window
+// close; this just makes sure we stop talking to dead views first.
+fn requestShutdown() void {
+    if (shutting_down.swap(true, .acq_rel)) return;
+
+    if (g_state) |state| {
+        state.gpu.mutex.lock();
+        state.gpu.running = false;
+        state.gpu.view_id = 0;
+        state.gpu.host_webview_id = 0;
+        state.gpu.mutex.unlock();
+    }
+
+    host_queue_running.store(false, .release);
+}
+
+fn mainWindowClosed(_: u32) callconv(.c) void {
+    requestShutdown();
+}
 
 fn appState() *AppState {
     return g_state orelse @panic("zig-wgpu state not initialized");
@@ -605,7 +629,7 @@ fn gpuRenderLoop() void {
     };
     defer native.close();
 
-    const api = WgpuApi.load(&native.lib) catch |err| {
+    const api = WgpuApi.load(&native) catch |err| {
         std.debug.print("[zig-wgpu] failed to load WGPU symbols: {s}\n", .{@errorName(err)});
         return;
     };
@@ -797,6 +821,7 @@ fn createUi(state: *AppState) void {
             .width = 1040,
             .height = 720,
         },
+        .callbacks = .{ .close = mainWindowClosed },
     }) catch |err| {
         std.debug.print("[zig-wgpu] failed to create window: {s}\n", .{@errorName(err)});
         return;
@@ -859,10 +884,7 @@ pub fn main() !void {
     host_queue_running.store(true, .release);
     const host_queue_thread = try std.Thread.spawn(.{}, drainHostMessageQueue, .{});
     defer {
-        state.gpu.mutex.lock();
-        state.gpu.running = false;
-        state.gpu.mutex.unlock();
-        host_queue_running.store(false, .release);
+        requestShutdown();
         host_queue_thread.join();
     }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const workflowUrl = new URL("../../.github/workflows/release.yml", import.meta.url);
-const workflow = readFileSync(workflowUrl, "utf8");
+const workflow = readFileSync(workflowUrl, "utf8").replace(/\r\n/g, "\n");
 
 function job(source, name) {
 	const startMarker = `  ${name}:\n`;
@@ -25,11 +25,95 @@ function namedStep(jobSource, name) {
 }
 
 function validateReleaseWorkflow(source) {
+	const buildJob = job(source, "build");
 	const releaseJob = job(source, "release");
-	const createRelease = namedStep(releaseJob, "Create Release");
+	const npmPublishJob = job(source, "npm-publish");
+	const npmAcceptanceJob = job(source, "npm-acceptance");
+	const publishTemplatesJob = job(source, "publish-templates");
+	const createRelease = namedStep(releaseJob, "Create or refresh draft Release");
+	const buildVersionCheck = namedStep(buildJob, "Verify release tag and version");
+	const releaseVersionCheck = namedStep(
+		releaseJob,
+		"Verify release tag and version",
+	);
+	const npmVersionCheck = namedStep(
+		npmPublishJob,
+		"Verify matching npm bootstrap version",
+	);
+	const npmAcceptanceVersionCheck = namedStep(
+		npmAcceptanceJob,
+		"Verify exact published npm acceptance version",
+	);
+	const npmAcceptance = namedStep(
+		npmAcceptanceJob,
+		"Accept public single-package npm bootstrap on ${{ matrix.platform }}",
+	);
+
+	for (const versionCheck of [buildVersionCheck, releaseVersionCheck]) {
+		assert.match(versionCheck, /^        id: release-type$/m);
+		assert.match(
+			versionCheck,
+			/^          RELEASE_TAG: \$\{\{ github\.event\.inputs\.tag \|\| github\.ref_name \}\}$/m,
+		);
+		assert.match(
+			versionCheck,
+			/^          RELEASE_PACKAGE_JSON: package\/package\.json$/m,
+		);
+		assert.match(
+			versionCheck,
+			/^        run: node package\/scripts\/verify-release-version\.mjs$/m,
+		);
+	}
+	assert.match(npmVersionCheck, /^        id: release-type$/m);
+	assert.match(
+		npmVersionCheck,
+		/^          RELEASE_TAG: \$\{\{ github\.event\.inputs\.tag \|\| github\.ref_name \}\}$/m,
+	);
+	assert.match(
+		npmVersionCheck,
+		/^          RELEASE_PACKAGE_JSON: npm\/electrobun\/package\.json$/m,
+	);
+	assert.match(
+		npmVersionCheck,
+		/^        run: node package\/scripts\/verify-release-version\.mjs$/m,
+	);
+	assert.match(npmAcceptanceVersionCheck, /^        id: release-type$/m);
+	assert.match(
+		npmAcceptanceVersionCheck,
+		/^          RELEASE_PACKAGE_JSON: npm\/electrobun\/package\.json$/m,
+	);
+	assert.match(
+		npmAcceptanceVersionCheck,
+		/^        run: node package\/scripts\/verify-release-version\.mjs$/m,
+	);
+	assert.ok(
+		buildJob.indexOf("- name: Verify release tag and version") <
+			buildJob.indexOf("- name: Install Hutch"),
+		"release version verification must run before build setup",
+	);
+	assert.ok(
+		releaseJob.indexOf("- name: Verify release tag and version") <
+			releaseJob.indexOf("- name: Download Electrobun release artifacts"),
+		"release version verification must run before release assembly",
+	);
+	assert.doesNotMatch(source, /Determine release type/);
+	for (const releasePath of [
+		buildJob,
+		releaseJob,
+		npmPublishJob,
+		npmAcceptanceJob,
+		publishTemplatesJob,
+	]) {
+		assert.match(
+			releasePath,
+			/^          ref: \$\{\{ github\.event_name == 'workflow_dispatch' && format\('refs\/tags\/\{0\}', github\.event\.inputs\.tag\) \|\| github\.ref \}\}$/m,
+			"manual releases must check out the exact requested tag",
+		);
+	}
 
 	assert.match(createRelease, /^        uses: softprops\/action-gh-release@v2$/m);
 	assert.match(createRelease, /^          generate_release_notes: true$/m);
+	assert.match(createRelease, /^          draft: true$/m);
 	assert.doesNotMatch(createRelease, /^          body(?:_path)?:/m);
 	assert.match(
 		createRelease,
@@ -38,7 +122,7 @@ function validateReleaseWorkflow(source) {
 	assert.match(createRelease, /^            artifacts\/\*\*\/\*\.tar\.gz$/m);
 	assert.match(
 		createRelease,
-		/^          prerelease: \$\{\{ github\.event\.inputs\.prerelease \|\| contains\(github\.ref_name, '-beta'\) \|\| contains\(github\.event\.inputs\.tag, '-beta'\) \}\}$/m,
+		/^          prerelease: \$\{\{ steps\.release-type\.outputs\.prerelease == 'true' \}\}$/m,
 	);
 
 	assert.match(
@@ -47,10 +131,36 @@ function validateReleaseWorkflow(source) {
 	);
 	assert.ok(
 		releaseJob.indexOf("- name: Verify release notes configuration") <
-			releaseJob.indexOf("- name: Create Release"),
+			releaseJob.indexOf("- name: Create or refresh draft Release"),
 		"release notes verification must run before release creation",
 	);
-	assert.match(job(source, "npm-publish"), /^    needs: \[release\]$/m);
+	assert.match(npmPublishJob, /^    needs: \[release\]$/m);
+	assert.match(npmAcceptanceJob, /^    needs: \[npm-publish\]$/m);
+	assert.match(publishTemplatesJob, /^    needs: \[npm-acceptance\]$/m);
+	assert.match(npmAcceptance, /accept-published-bootstrap\.mjs/);
+	assert.match(
+		npmAcceptance,
+		/--version "\$\{\{ steps\.release-type\.outputs\.version \}\}"/,
+	);
+	assert.match(
+		npmAcceptance,
+		/--platform "\$\{\{ matrix\.platform \}\}"/,
+	);
+	assert.ok(
+		source.indexOf("  npm-publish:\n") <
+			source.indexOf("  npm-acceptance:\n") &&
+			source.indexOf("  npm-acceptance:\n") <
+			source.indexOf("  publish-templates:\n"),
+		"public npm acceptance must run after npm publish and before mutable templates",
+	);
+	assert.match(
+		npmPublishJob,
+		/^        working-directory: npm\/electrobun$/m,
+	);
+	assert.match(
+		npmPublishJob,
+		/^        run: npm publish --access public --tag "\$\{\{ steps\.release-type\.outputs\.dist-tag \}\}"$/m,
+	);
 }
 
 validateReleaseWorkflow(workflow);

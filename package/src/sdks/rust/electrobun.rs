@@ -1,7 +1,12 @@
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::mem;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+pub const INSTALL_ROOT_NAME_ENVIRONMENT_VARIABLE: &str = "ELECTROBUN_INSTALL_ROOT_NAME";
 
 #[cfg(unix)]
 mod dynlib {
@@ -145,6 +150,33 @@ pub type QuitRequestedHandler = extern "C" fn();
 pub type URLOpenHandler = extern "C" fn(*const c_char);
 pub type AppReopenHandler = extern "C" fn();
 
+// Quit-requested plumbing.
+//
+// The core invokes its quit-requested handler when the last window closes (see
+// `set_exit_on_last_window_closed`, on by default), when the app is asked to
+// terminate (Cmd+Q), and on SIGINT/SIGTERM. The JS SDK always registers a
+// handler, which is why closing the last window quits a Bun app. Rust apps used
+// to leave the handler unset, so the process kept running headless after the
+// last window closed. `Core::load` now installs the trampoline below so every
+// Rust app gets the same default: stop the event loop, which lets
+// `run_main_thread` return and `main` unwind normally.
+static QUIT_REQUESTED_STOP_EVENT_LOOP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static QUIT_REQUESTED_USER_HANDLER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+extern "C" fn quit_requested_trampoline() {
+    let user = QUIT_REQUESTED_USER_HANDLER.load(Ordering::Acquire);
+    if !user.is_null() {
+        let handler: QuitRequestedHandler = unsafe { mem::transmute(user) };
+        handler();
+        return;
+    }
+    let stop = QUIT_REQUESTED_STOP_EVENT_LOOP.load(Ordering::Acquire);
+    if !stop.is_null() {
+        let stop_event_loop: StopEventLoopFn = unsafe { mem::transmute(stop) };
+        unsafe { stop_event_loop() };
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Renderer {
     Native,
@@ -168,9 +200,9 @@ pub struct AppInfo {
 }
 
 impl AppInfo {
-    /// Returns false for dev builds and true for nonempty release channels.
+    /// Returns true only for the canonical stable and canary release channels.
     pub fn is_packaged(&self) -> bool {
-        !self.channel.is_empty() && self.channel != "dev"
+        matches!(self.channel.as_str(), "stable" | "canary")
     }
 }
 
@@ -296,6 +328,21 @@ pub struct WebviewCallbacks {
     pub internal_bridge: Option<WebviewPostMessageHandler>,
 }
 
+#[derive(Clone, Copy)]
+pub struct AllowedProtocols {
+    pub views: bool,
+    pub app_data: bool,
+}
+
+impl Default for AllowedProtocols {
+    fn default() -> Self {
+        Self {
+            views: true,
+            app_data: false,
+        }
+    }
+}
+
 pub struct WebviewOptions<'a> {
     pub window_id: u32,
     pub host_webview_id: u32,
@@ -308,6 +355,7 @@ pub struct WebviewOptions<'a> {
     pub secret_key: &'a str,
     pub preload: &'a str,
     pub views_root: &'a str,
+    pub allowed_protocols: AllowedProtocols,
     pub sandbox: bool,
     pub start_transparent: bool,
     pub start_passthrough: bool,
@@ -329,6 +377,7 @@ impl<'a> WebviewOptions<'a> {
             secret_key: "",
             preload: "",
             views_root: "",
+            allowed_protocols: AllowedProtocols::default(),
             sandbox: true,
             start_transparent: false,
             start_passthrough: false,
@@ -438,13 +487,12 @@ impl Paths {
         let pictures = user_dir(&home, "Pictures");
         let music = user_dir(&home, "Music");
         let videos = user_dir(&home, "Videos");
-        let scoped = app_scoped_name(app_info);
 
         Ok(Self {
             home,
-            user_data: join_path(&app_data, &scoped),
-            user_cache: join_path(&cache, &scoped),
-            user_logs: join_path(&logs, &scoped),
+            user_data: app_scoped_dir(&app_data, app_info),
+            user_cache: app_scoped_dir(&cache, app_info),
+            user_logs: app_scoped_dir(&logs, app_info),
             app_data,
             config,
             cache,
@@ -586,6 +634,20 @@ pub fn resolve_app_info_from_bundle(bundle_paths: &BundlePaths) -> Result<AppInf
     })
 }
 
+/// Reads `runtime.exitOnLastWindowClosed` out of the bundled
+/// Resources/build.json, the same value the JS SDK reads through BuildConfig.
+/// Anything missing or malformed falls back to the documented default: quit when
+/// the last window closes.
+pub fn exit_on_last_window_closed_from_build_config(bundle_paths: &BundlePaths) -> bool {
+    let Ok(build_json) = fs::read_to_string(bundle_paths.resources_dir.join("build.json")) else {
+        return true;
+    };
+    let Some(runtime_object) = json_object_field(&build_json, "runtime") else {
+        return true;
+    };
+    json_bool_field(runtime_object, "exitOnLastWindowClosed").unwrap_or(true)
+}
+
 type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
 type RunMainThreadFn =
     unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, c_int) -> c_int;
@@ -650,6 +712,7 @@ type CreateWebviewFn = unsafe extern "C" fn(
     bool,
     bool,
 ) -> u32;
+type SetNextWebviewAllowedProtocolsFn = unsafe extern "C" fn(bool, bool);
 type CreateWGPUViewFn = unsafe extern "C" fn(u32, f64, f64, f64, f64, bool, bool, bool) -> u32;
 type SetWindowTitleFn = unsafe extern "C" fn(u32, *const c_char);
 type MinimizeWindowFn = unsafe extern "C" fn(u32);
@@ -732,6 +795,7 @@ type IsDockIconVisibleFn = unsafe extern "C" fn() -> bool;
 type GetPrimaryDisplayFn = unsafe extern "C" fn() -> *mut c_char;
 type GetAllDisplaysFn = unsafe extern "C" fn() -> *mut c_char;
 type GetCursorScreenPointFn = unsafe extern "C" fn() -> *mut c_char;
+type CaptureScreenRegionFn = unsafe extern "C" fn(f64, f64, u32, u32, *mut u8, u64) -> bool;
 type MoveToTrashFn = unsafe extern "C" fn(*const c_char) -> bool;
 type ShowItemInFolderFn = unsafe extern "C" fn(*const c_char);
 type OpenExternalFn = unsafe extern "C" fn(*const c_char) -> bool;
@@ -768,6 +832,7 @@ type SessionClearStorageDataFn = unsafe extern "C" fn(*const c_char, *const c_ch
 type SetURLOpenHandlerFn = unsafe extern "C" fn(Option<URLOpenHandler>);
 type SetAppReopenHandlerFn = unsafe extern "C" fn(Option<AppReopenHandler>);
 type SetQuitRequestedHandlerFn = unsafe extern "C" fn(Option<QuitRequestedHandler>);
+type SetExitOnLastWindowClosedFn = unsafe extern "C" fn(bool);
 type StopEventLoopFn = unsafe extern "C" fn();
 type WaitForShutdownCompleteFn = unsafe extern "C" fn(c_int);
 type ForceExitFn = unsafe extern "C" fn(c_int);
@@ -785,6 +850,7 @@ struct Symbols {
     get_window_style: GetWindowStyleFn,
     create_window: CreateWindowFn,
     create_webview: CreateWebviewFn,
+    set_next_webview_allowed_protocols: SetNextWebviewAllowedProtocolsFn,
     create_wgpu_view: CreateWGPUViewFn,
     set_window_title: SetWindowTitleFn,
     minimize_window: MinimizeWindowFn,
@@ -860,6 +926,7 @@ struct Symbols {
     get_primary_display: GetPrimaryDisplayFn,
     get_all_displays: GetAllDisplaysFn,
     get_cursor_screen_point: GetCursorScreenPointFn,
+    capture_screen_region: CaptureScreenRegionFn,
     move_to_trash: MoveToTrashFn,
     show_item_in_folder: ShowItemInFolderFn,
     open_external: OpenExternalFn,
@@ -886,6 +953,7 @@ struct Symbols {
     set_url_open_handler: SetURLOpenHandlerFn,
     set_app_reopen_handler: SetAppReopenHandlerFn,
     set_quit_requested_handler: SetQuitRequestedHandlerFn,
+    set_exit_on_last_window_closed: SetExitOnLastWindowClosedFn,
     stop_event_loop: StopEventLoopFn,
     wait_for_shutdown_complete: WaitForShutdownCompleteFn,
     force_exit: ForceExitFn,
@@ -917,6 +985,7 @@ impl Core {
             get_window_style: lib.symbol("getWindowStyle")?,
             create_window: lib.symbol("createWindow")?,
             create_webview: lib.symbol("createWebview")?,
+            set_next_webview_allowed_protocols: lib.symbol("setNextWebviewAllowedProtocols")?,
             create_wgpu_view: lib.symbol("createWGPUView")?,
             set_window_title: lib.symbol("setWindowTitle")?,
             minimize_window: lib.symbol("minimizeWindow")?,
@@ -994,6 +1063,7 @@ impl Core {
             get_primary_display: lib.symbol("getPrimaryDisplay")?,
             get_all_displays: lib.symbol("getAllDisplays")?,
             get_cursor_screen_point: lib.symbol("getCursorScreenPoint")?,
+            capture_screen_region: lib.symbol("captureScreenRegion")?,
             move_to_trash: lib.symbol("moveToTrash")?,
             show_item_in_folder: lib.symbol("showItemInFolder")?,
             open_external: lib.symbol("openExternal")?,
@@ -1020,6 +1090,7 @@ impl Core {
             set_url_open_handler: lib.symbol("setURLOpenHandler")?,
             set_app_reopen_handler: lib.symbol("setAppReopenHandler")?,
             set_quit_requested_handler: lib.symbol("setQuitRequestedHandler")?,
+            set_exit_on_last_window_closed: lib.symbol("setExitOnLastWindowClosed")?,
             stop_event_loop: lib.symbol("stopEventLoop")?,
             wait_for_shutdown_complete: lib.symbol("waitForShutdownComplete")?,
             force_exit: lib.symbol("forceExit")?,
@@ -1031,6 +1102,21 @@ impl Core {
                 .symbol("wgpuSurfaceGetCurrentTextureMainThread")?,
             wgpu_surface_present_main_thread: lib.symbol("wgpuSurfacePresentMainThread")?,
         };
+
+        // Honour the app's `runtime.exitOnLastWindowClosed` setting, which the
+        // JS SDK applies at startup too. The core only acts on it when a
+        // quit-requested handler is registered, so install one as well.
+        unsafe {
+            (symbols.set_exit_on_last_window_closed)(exit_on_last_window_closed_from_build_config(
+                &bundle_paths,
+            ));
+        }
+        QUIT_REQUESTED_STOP_EVENT_LOOP
+            .store(symbols.stop_event_loop as *mut c_void, Ordering::Release);
+        QUIT_REQUESTED_USER_HANDLER.store(ptr::null_mut(), Ordering::Release);
+        unsafe {
+            (symbols.set_quit_requested_handler)(Some(quit_requested_trampoline));
+        }
 
         Ok(Self { _lib: lib, symbols })
     }
@@ -1295,6 +1381,13 @@ impl Core {
         let secret_key = to_c_string(options.secret_key, "secret key")?;
         let preload = to_c_string(options.preload, "preload")?;
         let views_root = to_c_string(options.views_root, "views root")?;
+
+        unsafe {
+            (self.symbols.set_next_webview_allowed_protocols)(
+                options.allowed_protocols.views,
+                options.allowed_protocols.app_data,
+            );
+        }
 
         let webview_id = unsafe {
             (self.symbols.create_webview)(
@@ -1806,6 +1899,35 @@ impl Core {
         Ok(parse_point_json(&json))
     }
 
+    /// Captures a logical desktop rectangle as tightly packed, row-major RGBA pixels.
+    /// Fractional origins are aligned down to the logical pixel grid.
+    pub fn capture_screen_region(&self, rectangle: Rect) -> Result<Vec<u8>, String> {
+        let layout = screen_capture_layout(rectangle)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(layout.byte_len).map_err(|_| {
+            format!(
+                "failed to allocate {} bytes for screen capture",
+                layout.byte_len
+            )
+        })?;
+        pixels.resize(layout.byte_len, 0);
+
+        let captured = unsafe {
+            (self.symbols.capture_screen_region)(
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                pixels.as_mut_ptr(),
+                layout.byte_len_u64,
+            )
+        };
+        if !captured {
+            return Err("failed to capture screen region".to_string());
+        }
+        Ok(pixels)
+    }
+
     pub fn move_to_trash(&self, path: &str) -> Result<bool, String> {
         let path = to_c_string(path, "path")?;
         Ok(unsafe { (self.symbols.move_to_trash)(path.as_ptr()) })
@@ -2053,12 +2175,27 @@ impl Core {
         self.ensure_last_call_succeeded()
     }
 
+    /// Override the default quit behaviour. Pass `None` to restore the SDK
+    /// default (stop the event loop so `run_main_thread` returns).
     pub fn set_quit_requested_handler(
         &self,
         handler: Option<QuitRequestedHandler>,
     ) -> Result<(), String> {
+        let handler_ptr = match handler {
+            Some(handler) => handler as *mut c_void,
+            None => ptr::null_mut(),
+        };
+        QUIT_REQUESTED_USER_HANDLER.store(handler_ptr, Ordering::Release);
         unsafe {
-            (self.symbols.set_quit_requested_handler)(handler);
+            (self.symbols.set_quit_requested_handler)(Some(quit_requested_trampoline));
+        }
+        self.ensure_last_call_succeeded()
+    }
+
+    /// When enabled (the default), closing the last window quits the app.
+    pub fn set_exit_on_last_window_closed(&self, enabled: bool) -> Result<(), String> {
+        unsafe {
+            (self.symbols.set_exit_on_last_window_closed)(enabled);
         }
         self.ensure_last_call_succeeded()
     }
@@ -2188,6 +2325,57 @@ fn core_library_name() -> &'static str {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct ScreenCaptureLayout {
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    byte_len_u64: u64,
+}
+
+fn screen_capture_layout(rectangle: Rect) -> Result<ScreenCaptureLayout, String> {
+    if !rectangle.x.is_finite() || !rectangle.y.is_finite() {
+        return Err("screen capture origin must be finite".to_string());
+    }
+    if !rectangle.width.is_finite()
+        || !rectangle.height.is_finite()
+        || rectangle.width <= 0.0
+        || rectangle.height <= 0.0
+        || rectangle.width.fract() != 0.0
+        || rectangle.height.fract() != 0.0
+        || rectangle.width > u32::MAX as f64
+        || rectangle.height > u32::MAX as f64
+    {
+        return Err(
+            "screen capture dimensions must be positive integers no greater than u32::MAX"
+                .to_string(),
+        );
+    }
+
+    let width = rectangle.width as u32;
+    let height = rectangle.height as u32;
+    let byte_len_u64 = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "screen capture byte length overflowed u64".to_string())?;
+    let byte_len = usize::try_from(byte_len_u64)
+        .map_err(|_| "screen capture exceeds the addressable memory size".to_string())?;
+    if byte_len > isize::MAX as usize {
+        return Err("screen capture exceeds the maximum allocation size".to_string());
+    }
+
+    Ok(ScreenCaptureLayout {
+        x: rectangle.x.floor(),
+        y: rectangle.y.floor(),
+        width,
+        height,
+        byte_len,
+        byte_len_u64,
+    })
+}
+
 fn wgpu_library_name() -> &'static str {
     if cfg!(windows) {
         "webgpu_dawn.dll"
@@ -2307,6 +2495,52 @@ pub fn json_bool_field(source: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// Returns the text of a nested JSON object, braces included, so the field
+/// helpers above can be scoped to it instead of scanning the whole document.
+pub fn json_object_field<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let key_index = source.find(&needle)?;
+    let after_key = &source[key_index + needle.len()..];
+    let colon_index = after_key.find(':')?;
+    let value = after_key[colon_index + 1..].trim_start();
+    let value_offset = after_key.len() - value.len();
+    if !value.starts_with('{') {
+        return None;
+    }
+
+    let start = key_index + needle.len() + value_offset;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in source[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[start..start + index + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn parse_rect_json(json: &str) -> Rect {
     Rect {
         x: json_number_field(json, "x").unwrap_or_default(),
@@ -2413,7 +2647,7 @@ fn app_data_dir(home: &str) -> String {
     if cfg!(target_os = "macos") {
         join_path(home, "Library/Application Support")
     } else if cfg!(windows) {
-        std::env::var("APPDATA").unwrap_or_else(|_| join_path(home, "AppData/Roaming"))
+        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| join_path(home, "AppData/Local"))
     } else {
         std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| join_path(home, ".local/share"))
     }
@@ -2457,10 +2691,108 @@ fn join_path(base: &str, child: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn app_scoped_name(app_info: &AppInfo) -> String {
-    if app_info.identifier.is_empty() {
-        app_info.name.clone()
-    } else {
-        app_info.identifier.clone()
+fn app_scoped_dir(base: &str, app_info: &AppInfo) -> String {
+    if app_info.identifier.is_empty() || app_info.channel.is_empty() {
+        return base.to_string();
+    }
+    let install_root_name = effective_install_root_name(&app_info.channel);
+    join_path(&join_path(base, &app_info.identifier), &install_root_name)
+}
+
+fn is_safe_install_root_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 256 || value == "." || value == ".." {
+        return false;
+    }
+    if value
+        .bytes()
+        .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'/' || byte == b'\\')
+    {
+        return false;
+    }
+    if cfg!(windows)
+        && (value.ends_with(' ')
+            || value.ends_with('.')
+            || value.bytes().any(|byte| b"\"%*:<>?|".contains(&byte)))
+    {
+        return false;
+    }
+    true
+}
+
+fn effective_install_root_name(fallback: &str) -> String {
+    match std::env::var(INSTALL_ROOT_NAME_ENVIRONMENT_VARIABLE) {
+        Ok(candidate) if is_safe_install_root_name(&candidate) => candidate,
+        _ => fallback.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod install_root_name_tests {
+    use super::{is_safe_install_root_name, AppInfo};
+
+    #[test]
+    fn validates_launcher_install_root_leaf() {
+        assert!(is_safe_install_root_name("stable"));
+        assert!(is_safe_install_root_name("Legacy App"));
+        for invalid in ["", ".", "..", "nested/root", "nested\\root", "line\nbreak"] {
+            assert!(!is_safe_install_root_name(invalid));
+        }
+    }
+
+    #[test]
+    fn packaged_mode_uses_canonical_release_channels() {
+        for channel in ["stable", "canary"] {
+            assert!(AppInfo {
+                identifier: String::new(),
+                name: String::new(),
+                channel: channel.to_string(),
+            }
+            .is_packaged());
+        }
+        for channel in ["", "dev", "production", "nightly"] {
+            assert!(!AppInfo {
+                identifier: String::new(),
+                name: String::new(),
+                channel: channel.to_string(),
+            }
+            .is_packaged());
+        }
+    }
+}
+
+#[cfg(test)]
+mod screen_capture_tests {
+    use super::{screen_capture_layout, Rect};
+
+    #[test]
+    fn validates_and_aligns_capture_rectangle() {
+        let layout = screen_capture_layout(Rect::new(-1.25, 3.99, 2.0, 3.0)).unwrap();
+        assert_eq!(layout.x, -2.0);
+        assert_eq!(layout.y, 3.0);
+        assert_eq!(layout.width, 2);
+        assert_eq!(layout.height, 3);
+        assert_eq!(layout.byte_len, 24);
+        assert_eq!(layout.byte_len_u64, 24);
+    }
+
+    #[test]
+    fn rejects_invalid_capture_rectangles_before_allocation() {
+        for rectangle in [
+            Rect::new(f64::NAN, 0.0, 1.0, 1.0),
+            Rect::new(0.0, f64::INFINITY, 1.0, 1.0),
+            Rect::new(0.0, 0.0, 0.0, 1.0),
+            Rect::new(0.0, 0.0, 1.0, -1.0),
+            Rect::new(0.0, 0.0, 1.5, 1.0),
+            Rect::new(0.0, 0.0, u32::MAX as f64 + 1.0, 1.0),
+        ] {
+            assert!(screen_capture_layout(rectangle).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_capture_byte_length_overflow() {
+        let error = screen_capture_layout(Rect::new(0.0, 0.0, u32::MAX as f64, u32::MAX as f64))
+            .unwrap_err();
+        assert!(error.contains("overflowed u64"));
     }
 }

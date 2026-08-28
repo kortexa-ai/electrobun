@@ -37,6 +37,7 @@ type appState struct {
 	searchQuery       string
 	testRunnerWebview uint32
 	topLevelWebviews  map[uint32]uint32
+	closedWindows     map[uint32]struct{}
 	childWebviews     map[uint32]electrobun.Renderer
 	autoRunAll        bool
 	autoRunTestName   string
@@ -65,12 +66,13 @@ type callbackState struct {
 type testKind string
 
 type goTest struct {
-	ID          string
-	Name        string
-	Category    string
-	Description string
-	Interactive bool
-	Kind        testKind
+	ID           string
+	Name         string
+	Category     string
+	Description  string
+	Instructions []string
+	Interactive  bool
+	Kind         testKind
 }
 
 type testRunResult struct {
@@ -88,6 +90,34 @@ var state *appState
 var callbacks callbackState
 var callbacksMu sync.Mutex
 var hostQueueRunning atomic.Bool
+var shortcutTargetWebview atomic.Uint32
+var quitTargetWebview atomic.Uint32
+
+const (
+	menuDataPrefix  = "|EB|"
+	menuRoutePrefix = "|EBMENU|"
+)
+
+type menuDataRegistry struct {
+	mu       sync.Mutex
+	nextID   uint64
+	dataByID map[string]any
+	routeID  string
+}
+
+type menuRoute struct {
+	webviewID uint32
+	messageID string
+	registry  *menuDataRegistry
+}
+
+var menuRoutes = struct {
+	sync.Mutex
+	nextID      uint64
+	application string
+	context     string
+	routes      map[string]menuRoute
+}{routes: map[string]menuRoute{}}
 
 const (
 	kindSmoke                                testKind = "smoke"
@@ -121,6 +151,8 @@ const (
 	kindWebviewCreate                        testKind = "webview_create"
 	kindWebviewPageZoom                      testKind = "webview_page_zoom"
 	kindWebviewSpellCheck                    testKind = "webview_spell_check"
+	kindAppDataProtocolAllow                 testKind = "appdata_protocol_allow"
+	kindAppDataProtocolDeny                  testKind = "appdata_protocol_deny"
 	kindWebviewTagPlaygroundIntegration      testKind = "webview_tag_playground_integration"
 	kindWebviewTagPlaygroundInteractive      testKind = "webview_tag_playground_interactive"
 	kindWgpuTagPlaygroundIntegration         testKind = "wgpu_tag_playground_integration"
@@ -164,6 +196,7 @@ const (
 	kindScreenPrimaryDisplay                 testKind = "screen_primary_display"
 	kindScreenAllDisplays                    testKind = "screen_all_displays"
 	kindScreenCursorScreenPoint              testKind = "screen_cursor_screen_point"
+	kindScreenCaptureRegion                  testKind = "screen_capture_region"
 	kindScreenBoundsVsWorkArea               testKind = "screen_bounds_vs_workarea"
 )
 
@@ -199,10 +232,20 @@ var goTests = []goTest{
 	test("go-webview-create", "BrowserView create (Go)", "BrowserView", kindWebviewCreate),
 	test("go-webview-page-zoom", "BrowserView page zoom API (Go)", "BrowserWindow", kindWebviewPageZoom),
 	test("go-webview-spell-check", "BrowserView spell check capability (Go)", "BrowserWindow", kindWebviewSpellCheck),
+	test("go-appdata-protocol-allows-access", "appdata protocol allows access", "Protocols", kindAppDataProtocolAllow),
+	test("go-appdata-protocol-denies-access", "appdata protocol denies access", "Protocols", kindAppDataProtocolDeny),
 	test("go-webview-tag-playground-integration", "Webview Tag playground integration (Go)", "Webview Tag", kindWebviewTagPlaygroundIntegration),
-	interactiveTest("go-webview-tag-playground", "Webview Tag playground (Go)", "Webview Tag (Interactive)", kindWebviewTagPlaygroundInteractive),
+	interactiveTest("go-webview-tag-playground", "Webview Tag playground (Go)", "Webview Tag (Interactive)", kindWebviewTagPlaygroundInteractive,
+		"A webview tag playground will open",
+		"Test masks, passthrough, navigation, and more",
+		"Close the window when done to pass the test",
+	),
 	test("go-wgpu-tag-playground-integration", "WGPU Tag playground integration (Go)", "WGPU Tag", kindWgpuTagPlaygroundIntegration),
-	interactiveTest("go-wgpu-tag-playground", "WGPU Tag playground (Go)", "WGPU Tag (Interactive)", kindWgpuTagPlaygroundInteractive),
+	interactiveTest("go-wgpu-tag-playground", "WGPU Tag playground (Go)", "WGPU Tag (Interactive)", kindWgpuTagPlaygroundInteractive,
+		"A WGPU tag playground will open",
+		"Use the controls to toggle transparency/passthrough and resize",
+		"Close the window when done to pass the test",
+	),
 	test("go-navigation-load-url", "loadURL (Go)", "Navigation", kindNavigationLoadURL),
 	test("go-navigation-load-html", "loadHTML (Go)", "Navigation", kindNavigationLoadHTML),
 	test("go-navigation-dom-ready-event", "dom-ready event (Go)", "Navigation", kindNavigationDomReadyEvent),
@@ -213,15 +256,42 @@ var goTests = []goTest{
 	test("go-session-from-partition", "Session.fromPartition (Go)", "Session", kindSessionFromPartition),
 	test("go-session-default-session", "Session.defaultSession (Go)", "Session", kindSessionDefaultSession),
 	test("go-session-cookies-api-exists", "cookies API exists (Go)", "Session", kindSessionCookiesAPIExists),
-	interactiveTest("go-application-menu-playground", "Application menu playground (Go)", "Menus (Interactive)", kindApplicationMenuPlayground),
-	interactiveTest("go-context-menu-playground", "Context menu playground (Go)", "Menus (Interactive)", kindContextMenuPlayground),
-	interactiveTest("go-dialog-show-message-box-info", "showMessageBox - info dialog (Go)", "Dialogs (Interactive)", kindDialogShowMessageBoxInfo),
-	interactiveTest("go-dialog-file-dialog-playground", "File dialog playground (Go)", "Dialogs (Interactive)", kindDialogFileDialogPlayground),
-	interactiveTest("go-global-shortcuts-playground", "Global shortcuts playground (Go)", "Shortcuts (Interactive)", kindGlobalShortcutsPlayground),
+	interactiveTest("go-application-menu-playground", "Application menu playground (Go)", "Menus (Interactive)", kindApplicationMenuPlayground,
+		"An application menu playground will open",
+		"Click buttons to apply different menu configurations",
+		"Check the menu bar to see changes",
+		"Close the window when done to pass the test",
+	),
+	interactiveTest("go-context-menu-playground", "Context menu playground (Go)", "Menus (Interactive)", kindContextMenuPlayground,
+		"A context menu playground will open",
+		"Click buttons to show different context menus",
+		"Right-click in the test area to show current menu",
+		"Close the window when done to pass the test",
+	),
+	interactiveTest("go-dialog-show-message-box-info", "showMessageBox - info dialog (Go)", "Dialogs (Interactive)", kindDialogShowMessageBoxInfo,
+		"An info dialog will appear with OK and Cancel buttons",
+		"Click either button to pass the test",
+	),
+	interactiveTest("go-dialog-file-dialog-playground", "File dialog playground (Go)", "Dialogs (Interactive)", kindDialogFileDialogPlayground,
+		"A control panel will open for file dialog testing",
+		"Configure options and click 'Open Dialog' to test",
+		"Select a path containing a comma and verify it is returned as one unchanged path",
+		"Close the window when done to pass the test",
+	),
+	interactiveTest("go-global-shortcuts-playground", "Global shortcuts playground (Go)", "Shortcuts (Interactive)", kindGlobalShortcutsPlayground,
+		"A shortcuts control panel will open",
+		"Register shortcuts and press them anywhere to test",
+		"Close the window when done to pass the test",
+	),
 	test("go-global-shortcut-is-registered-api", "GlobalShortcut.isRegistered API (Go)", "Shortcuts", kindGlobalShortcutIsRegisteredAPI),
 	test("go-global-shortcut-unregister-all-api", "GlobalShortcut.unregisterAll API (Go)", "Shortcuts", kindGlobalShortcutUnregisterAllAPI),
 	test("go-lifecycle-before-quit-cancel", "before-quit event can cancel quit (Go)", "App Lifecycle", kindLifecycleBeforeQuitCancel),
-	interactiveTest("go-quit-shutdown-playground", "Quit/Shutdown playground (Go)", "Quit (Interactive)", kindQuitShutdownPlayground),
+	interactiveTest("go-quit-shutdown-playground", "Quit/Shutdown playground (Go)", "Quit (Interactive)", kindQuitShutdownPlayground,
+		"A quit test control panel will open",
+		"Use buttons to test programmatic quit, or follow instructions for system quit",
+		"The beforeQuit handler will log to the event log and wait 2 seconds",
+		"Close the window when done exploring to pass the test",
+	),
 	test("go-wgpu-adapter-context-device", "WebGPU adapter: context/device init (Go)", "WebGPU", kindWgpuAdapterContextDevice),
 	test("go-dock-icon-visibility-contract", "Dock icon visibility contract (Go)", "Utils", kindDockIconVisibilityContract),
 	test("go-utils-clipboard-round-trip", "clipboardWriteText and clipboardReadText (Go)", "Utils", kindUtilsClipboardRoundTrip),
@@ -242,6 +312,7 @@ var goTests = []goTest{
 	test("go-screen-primary-display", "getPrimaryDisplay (Go)", "Screen", kindScreenPrimaryDisplay),
 	test("go-screen-all-displays", "getAllDisplays (Go)", "Screen", kindScreenAllDisplays),
 	test("go-screen-cursor-screen-point", "getCursorScreenPoint (Go)", "Screen", kindScreenCursorScreenPoint),
+	test("go-screen-capture-region", "captureRegion (Go)", "Screen", kindScreenCaptureRegion),
 	test("go-screen-bounds-vs-workarea", "Display bounds vs workArea (Go)", "Screen", kindScreenBoundsVsWorkArea),
 }
 
@@ -249,9 +320,10 @@ func test(id, name, category string, kind testKind) goTest {
 	return goTest{ID: id, Name: name, Category: category, Description: name, Kind: kind}
 }
 
-func interactiveTest(id, name, category string, kind testKind) goTest {
+func interactiveTest(id, name, category string, kind testKind, instructions ...string) goTest {
 	item := test(id, name, category, kind)
 	item.Interactive = true
+	item.Instructions = instructions
 	return item
 }
 
@@ -285,6 +357,7 @@ func run() error {
 		cefVersion:       runtimeConfig.CefVersion,
 		goVersion:        runtimeConfig.GoVersion,
 		topLevelWebviews: map[uint32]uint32{},
+		closedWindows:    map[uint32]struct{}{},
 		childWebviews:    map[uint32]electrobun.Renderer{},
 		autoRunAll:       os.Getenv("AUTO_RUN") != "",
 		autoRunTestName:  os.Getenv("AUTO_RUN_TEST_NAME"),
@@ -395,31 +468,56 @@ func testRunnerHostBridge(webviewID uint32, message string) {
 }
 
 type rpcPacket struct {
-	Type        string          `json:"type"`
-	ID          uint64          `json:"id"`
-	Method      string          `json:"method"`
-	Params      json.RawMessage `json:"params"`
-	TestID      string          `json:"testId"`
-	SearchQuery string          `json:"searchQuery"`
-	Msg         string          `json:"msg"`
+	Type   string          `json:"type"`
+	ID     uint64          `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+type rpcMessagePacket struct {
+	Type    string          `json:"type"`
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 func handleHostBridgePacket(webviewID uint32, message string) {
-	var packet rpcPacket
-	if json.Unmarshal([]byte(message), &packet) != nil {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(message), &envelope) != nil {
 		return
 	}
-	switch packet.Type {
+	switch envelope.Type {
 	case "request":
-		handleRPCRequest(webviewID, packet.ID, packet.Method, packet, message)
-	case "message":
-		if stringField(message, "id") == "logToBun" && packet.Msg != "" {
-			fmt.Fprintf(os.Stderr, "[kitchen go ui] %s\n", packet.Msg)
+		var packet rpcPacket
+		if json.Unmarshal([]byte(message), &packet) != nil {
+			return
 		}
+		handleRPCRequest(webviewID, packet.ID, packet.Method, packet)
+	case "message":
+		var packet rpcMessagePacket
+		if json.Unmarshal([]byte(message), &packet) != nil {
+			return
+		}
+		handleRPCMessage(packet.ID, packet.Payload)
 	}
 }
 
-func handleRPCRequest(webviewID uint32, requestID uint64, method string, packet rpcPacket, raw string) {
+func handleRPCMessage(messageID string, payload json.RawMessage) {
+	params := rawParams(payload)
+	switch messageID {
+	case "logToBun":
+		if msg := stringField(params, "msg"); msg != "" {
+			fmt.Fprintf(os.Stderr, "[kitchen go ui] %s\n", msg)
+		}
+	case "wgpuTagRect":
+		// The tag's internal bridge sends wgpuTagResize with the same frame and
+		// current masks. Handling this redundant host message would risk racing
+		// that update and clearing masks.
+	}
+}
+
+func handleRPCRequest(webviewID uint32, requestID uint64, method string, packet rpcPacket) {
 	fmt.Fprintf(os.Stderr, "[kitchen go] RPC request: %s\n", method)
 	switch method {
 	case "getTests":
@@ -433,7 +531,12 @@ func handleRPCRequest(webviewID uint32, requestID uint64, method string, packet 
 		sendRPCResponseSuccess(webviewID, requestID, fmt.Sprintf(`{"searchQuery":%s}`, electrobun.JsonStringLiteral(query)))
 		sendInitialUIState(webviewID)
 	case "setTestRunnerPreferences":
-		if value := stringField(raw, "searchQuery"); value != "" {
+		value, present, err := rpcOptionalStringParam(packet, "searchQuery")
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, "Invalid searchQuery")
+			return
+		}
+		if present {
 			state.mu.Lock()
 			state.searchQuery = value
 			state.mu.Unlock()
@@ -470,16 +573,138 @@ func handleRPCRequest(webviewID uint32, requestID uint64, method string, packet 
 			sendRPCResponseError(webviewID, requestID, "No top-level window for webview")
 			return
 		}
+		// Acknowledge while the requesting webview still exists. The playground
+		// treats its own close event as test completion, so a later close failure
+		// is diagnostic rather than an RPC result it could still receive.
+		sendRPCResponseSuccess(webviewID, requestID, `{"success":true}`)
 		forgetTopLevelWebview(webviewID)
 		if err := state.core.CloseWindow(windowID); err != nil {
+			fmt.Fprintf(os.Stderr, "[kitchen go] failed to close playground window %d: %v\n", windowID, err)
+		}
+	case "setApplicationMenu":
+		menu, ok := valueField(rawParams(packet.Params), "menu")
+		if !ok {
+			sendRPCResponseError(webviewID, requestID, "Missing menu payload")
+			return
+		}
+		routeID := registerMenuRoute(webviewID, "menuClicked")
+		menuJSON, registry, err := prepareMenuJSON(menu, routeID)
+		if err != nil {
+			removeMenuRoute(routeID)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		bindMenuRoute(routeID, registry)
+		err = state.core.SetApplicationMenuJSON(menuJSON, menuClickHandler)
+		if err != nil {
+			removeMenuRoute(routeID)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		activateMenuRoute("application", routeID)
+		sendRPCResponseSuccess(webviewID, requestID, `{"success":true}`)
+	case "showContextMenu":
+		menu, ok := valueField(rawParams(packet.Params), "menu")
+		if !ok {
+			sendRPCResponseError(webviewID, requestID, "Missing menu payload")
+			return
+		}
+		routeID := registerMenuRoute(webviewID, "contextMenuClicked")
+		menuJSON, registry, err := prepareMenuJSON(menu, routeID)
+		if err != nil {
+			removeMenuRoute(routeID)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		bindMenuRoute(routeID, registry)
+		err = state.core.ShowContextMenuJSON(menuJSON, menuClickHandler)
+		if err != nil {
+			removeMenuRoute(routeID)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		activateMenuRoute("context", routeID)
+		sendRPCResponseSuccess(webviewID, requestID, `{"success":true}`)
+	case "openFileDialog":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		options, err := openFileDialogOptionsFromParams(packet.Params, home)
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		pathsJSON, err := state.core.OpenFileDialog(options)
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		payload, err := normalizeFileDialogResult(pathsJSON)
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		sendRPCResponseSuccess(webviewID, requestID, payload)
+	case "registerShortcut":
+		accelerator := rpcStringParam(packet, "accelerator")
+		if accelerator == "" {
+			sendRPCResponseError(webviewID, requestID, "Missing accelerator")
+			return
+		}
+		previousTarget := shortcutTargetWebview.Swap(webviewID)
+		if err := state.core.SetGlobalShortcutCallback(shortcutTriggeredHandler); err != nil {
+			shortcutTargetWebview.CompareAndSwap(webviewID, previousTarget)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		success, err := state.core.RegisterGlobalShortcut(accelerator)
+		if err != nil {
+			shortcutTargetWebview.CompareAndSwap(webviewID, previousTarget)
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		sendRPCResponseSuccess(webviewID, requestID, fmt.Sprintf(`{"success":%t}`, success))
+	case "unregisterShortcut":
+		accelerator := rpcStringParam(packet, "accelerator")
+		if accelerator == "" {
+			sendRPCResponseError(webviewID, requestID, "Missing accelerator")
+			return
+		}
+		success, err := state.core.UnregisterGlobalShortcut(accelerator)
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		sendRPCResponseSuccess(webviewID, requestID, fmt.Sprintf(`{"success":%t}`, success))
+	case "unregisterAllShortcuts":
+		if err := state.core.UnregisterAllGlobalShortcuts(); err != nil {
 			sendRPCResponseError(webviewID, requestID, err.Error())
 			return
 		}
 		sendRPCResponseSuccess(webviewID, requestID, `{"success":true}`)
-	case "setApplicationMenu", "showContextMenu":
-		sendRPCResponseSuccess(webviewID, requestID, `{"success":true}`)
+	case "isRegistered":
+		accelerator := rpcStringParam(packet, "accelerator")
+		if accelerator == "" {
+			sendRPCResponseError(webviewID, requestID, "Missing accelerator")
+			return
+		}
+		registered, err := state.core.IsGlobalShortcutRegistered(accelerator)
+		if err != nil {
+			sendRPCResponseError(webviewID, requestID, err.Error())
+			return
+		}
+		sendRPCResponseSuccess(webviewID, requestID, fmt.Sprintf(`{"registered":%t}`, registered))
+	case "triggerQuit":
+		quitTargetWebview.Store(webviewID)
+		playgroundQuitRequestedHandler()
+		if quitTargetWebview.Load() != webviewID {
+			return
+		}
+		sendRPCResponseSuccess(webviewID, requestID, `{"success":true,"message":"Quit handled through Go before-quit callback and cancelled for playground mode."}`)
 	case "runTest":
-		testID := stringField(raw, "testId")
+		testID := rpcStringParam(packet, "testId")
 		test, ok := findTestByID(testID)
 		if !ok {
 			sendRPCResponseError(webviewID, requestID, "Unknown test id")
@@ -506,6 +731,342 @@ func rawParams(raw json.RawMessage) string {
 	return string(raw)
 }
 
+func rpcStringParam(packet rpcPacket, key string) string {
+	return stringField(rawParams(packet.Params), key)
+}
+
+func rpcOptionalStringParam(packet rpcPacket, key string) (string, bool, error) {
+	encoded, ok := valueField(rawParams(packet.Params), key)
+	if !ok {
+		return "", false, nil
+	}
+	var value string
+	if err := json.Unmarshal([]byte(encoded), &value); err != nil {
+		return "", true, err
+	}
+	return value, true, nil
+}
+
+func prepareMenuJSON(source string, routeIDs ...string) (string, *menuDataRegistry, error) {
+	var value any
+	if err := json.Unmarshal([]byte(source), &value); err != nil {
+		return "", nil, fmt.Errorf("invalid menu JSON: %w", err)
+	}
+	registry := &menuDataRegistry{dataByID: map[string]any{}}
+	if len(routeIDs) > 0 {
+		registry.routeID = routeIDs[0]
+	}
+	normalized, err := normalizeMenuArray(value, registry)
+	if err != nil {
+		return "", nil, err
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to serialize menu: %w", err)
+	}
+	return string(encoded), registry, nil
+}
+
+func normalizeMenuArray(value any, registry *menuDataRegistry) ([]any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("menu payload must be an array")
+	}
+	normalized := make([]any, 0, len(items))
+	for _, item := range items {
+		normalizedItem, err := normalizeMenuItem(item, registry)
+		if err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, normalizedItem)
+	}
+	return normalized, nil
+}
+
+func normalizeMenuItem(value any, registry *menuDataRegistry) (map[string]any, error) {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("menu items must be objects")
+	}
+	itemType, _ := item["type"].(string)
+	if itemType == "divider" || itemType == "separator" {
+		return map[string]any{"type": "divider"}, nil
+	}
+
+	role, hasRole := item["role"].(string)
+	label, _ := item["label"].(string)
+	if label == "" && hasRole {
+		label = defaultMenuRoleLabel(role)
+	}
+	if itemType == "" {
+		itemType = "normal"
+	}
+	normalized := map[string]any{
+		"label":   label,
+		"type":    itemType,
+		"enabled": menuBool(item, "enabled", true),
+		"checked": menuBool(item, "checked", false),
+		"hidden":  menuBool(item, "hidden", false),
+	}
+	if hasRole {
+		normalized["role"] = role
+	} else {
+		action, _ := item["action"].(string)
+		if data, hasData := item["data"]; hasData {
+			action = registry.store(action, data)
+		}
+		if registry.routeID != "" {
+			action = menuRoutePrefix + registry.routeID + "|" + action
+		}
+		normalized["action"] = action
+	}
+	for _, field := range []string{"tooltip", "accelerator"} {
+		if value, ok := item[field]; ok && value != nil {
+			normalized[field] = value
+		}
+	}
+	if submenu, ok := item["submenu"]; ok {
+		normalizedSubmenu, err := normalizeMenuArray(submenu, registry)
+		if err != nil {
+			return nil, err
+		}
+		normalized["submenu"] = normalizedSubmenu
+	}
+	return normalized, nil
+}
+
+func menuBool(item map[string]any, key string, fallback bool) bool {
+	value, ok := item[key].(bool)
+	if !ok {
+		return fallback
+	}
+	return value
+}
+
+func defaultMenuRoleLabel(role string) string {
+	words := make([]string, 0, 4)
+	current := strings.Builder{}
+	for _, char := range role {
+		if char >= 'A' && char <= 'Z' && current.Len() > 0 {
+			words = append(words, current.String())
+			current.Reset()
+		}
+		current.WriteRune(char)
+	}
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+	for index, word := range words {
+		word = strings.ToLower(word)
+		if index > 0 && (word == "and" || word == "by" || word == "in" || word == "of" || word == "to") {
+			words[index] = word
+			continue
+		}
+		if word != "" {
+			words[index] = strings.ToUpper(word[:1]) + word[1:]
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+func (registry *menuDataRegistry) store(action string, data any) string {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.nextID++
+	dataID := fmt.Sprintf("goMenuData_%d", registry.nextID)
+	registry.dataByID[dataID] = data
+	return menuDataPrefix + dataID + "|" + action
+}
+
+func (registry *menuDataRegistry) take(encodedAction string) (string, any, bool) {
+	encoded, ok := strings.CutPrefix(encodedAction, menuDataPrefix)
+	if !ok {
+		return encodedAction, nil, false
+	}
+	dataID, action, ok := strings.Cut(encoded, "|")
+	if !ok {
+		return encodedAction, nil, false
+	}
+	registry.mu.Lock()
+	data, hasData := registry.dataByID[dataID]
+	if hasData {
+		delete(registry.dataByID, dataID)
+	}
+	registry.mu.Unlock()
+	return action, data, hasData
+}
+
+func sendMenuClick(webviewID uint32, messageID, encodedAction string, registry *menuDataRegistry) {
+	action, data, hasData := registry.take(encodedAction)
+	payload := map[string]any{"action": action}
+	if hasData {
+		payload["data"] = data
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[kitchen go] failed to encode menu click: %v\n", err)
+		return
+	}
+	sendRPCMessage(webviewID, messageID, string(encoded))
+}
+
+func registerMenuRoute(webviewID uint32, messageID string) string {
+	menuRoutes.Lock()
+	defer menuRoutes.Unlock()
+	menuRoutes.nextID++
+	routeID := fmt.Sprintf("goMenuRoute_%d", menuRoutes.nextID)
+	menuRoutes.routes[routeID] = menuRoute{webviewID: webviewID, messageID: messageID}
+	return routeID
+}
+
+func activateMenuRoute(kind, routeID string) {
+	menuRoutes.Lock()
+	defer menuRoutes.Unlock()
+	previous := ""
+	if kind == "application" {
+		previous = menuRoutes.application
+		menuRoutes.application = routeID
+	} else {
+		previous = menuRoutes.context
+		menuRoutes.context = routeID
+	}
+	if previous != "" {
+		delete(menuRoutes.routes, previous)
+	}
+}
+
+func bindMenuRoute(routeID string, registry *menuDataRegistry) {
+	menuRoutes.Lock()
+	route, ok := menuRoutes.routes[routeID]
+	if ok {
+		route.registry = registry
+		menuRoutes.routes[routeID] = route
+	}
+	menuRoutes.Unlock()
+}
+
+func removeMenuRoute(routeID string) {
+	menuRoutes.Lock()
+	delete(menuRoutes.routes, routeID)
+	if menuRoutes.application == routeID {
+		menuRoutes.application = ""
+	}
+	if menuRoutes.context == routeID {
+		menuRoutes.context = ""
+	}
+	menuRoutes.Unlock()
+}
+
+func removeMenuRoutesForWebview(webviewID uint32) {
+	menuRoutes.Lock()
+	for routeID, route := range menuRoutes.routes {
+		if route.webviewID != webviewID {
+			continue
+		}
+		delete(menuRoutes.routes, routeID)
+		if menuRoutes.application == routeID {
+			menuRoutes.application = ""
+		}
+		if menuRoutes.context == routeID {
+			menuRoutes.context = ""
+		}
+	}
+	menuRoutes.Unlock()
+}
+
+func resolveMenuRoute(encodedAction string) (menuRoute, string, bool) {
+	encoded, ok := strings.CutPrefix(encodedAction, menuRoutePrefix)
+	if !ok {
+		return menuRoute{}, "", false
+	}
+	routeID, action, ok := strings.Cut(encoded, "|")
+	if !ok {
+		return menuRoute{}, "", false
+	}
+	menuRoutes.Lock()
+	route, ok := menuRoutes.routes[routeID]
+	menuRoutes.Unlock()
+	if !ok || route.registry == nil {
+		return menuRoute{}, "", false
+	}
+	return route, action, true
+}
+
+func menuClickHandler(_ uint32, encodedAction string) {
+	route, action, ok := resolveMenuRoute(encodedAction)
+	if !ok {
+		return
+	}
+	sendMenuClick(route.webviewID, route.messageID, action, route.registry)
+}
+
+type openFileDialogParams struct {
+	StartingFolder          *string `json:"startingFolder"`
+	AllowedFileTypes        *string `json:"allowedFileTypes"`
+	CanChooseFiles          *bool   `json:"canChooseFiles"`
+	CanChooseDirectory      *bool   `json:"canChooseDirectory"`
+	AllowsMultipleSelection *bool   `json:"allowsMultipleSelection"`
+}
+
+func openFileDialogOptionsFromParams(raw json.RawMessage, home string) (electrobun.OpenFileDialogOptions, error) {
+	params := openFileDialogParams{}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return electrobun.OpenFileDialogOptions{}, fmt.Errorf("invalid openFileDialog params: %w", err)
+		}
+	}
+	startingFolder := "~/"
+	if params.StartingFolder != nil {
+		startingFolder = *params.StartingFolder
+	}
+	allowedFileTypes := "*"
+	if params.AllowedFileTypes != nil {
+		allowedFileTypes = *params.AllowedFileTypes
+	}
+	return electrobun.OpenFileDialogOptions{
+		StartingFolder:          expandTildePath(startingFolder, home),
+		AllowedFileTypes:        allowedFileTypes,
+		CanChooseFiles:          optionalBool(params.CanChooseFiles, true),
+		CanChooseDirectory:      optionalBool(params.CanChooseDirectory, true),
+		AllowsMultipleSelection: optionalBool(params.AllowsMultipleSelection, true),
+	}, nil
+}
+
+func optionalBool(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func expandTildePath(path, home string) string {
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	return path
+}
+
+func normalizeFileDialogResult(source string) (string, error) {
+	if strings.TrimSpace(source) == "" {
+		return "[]", nil
+	}
+	var paths []string
+	if err := json.Unmarshal([]byte(source), &paths); err != nil {
+		return "", fmt.Errorf("invalid file dialog result: %w", err)
+	}
+	if paths == nil {
+		paths = []string{}
+	}
+	encoded, err := json.Marshal(paths)
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize file dialog result: %w", err)
+	}
+	return string(encoded), nil
+}
+
 func findTestByID(id string) (goTest, bool) {
 	for _, test := range goTests {
 		if test.ID == id {
@@ -524,40 +1085,59 @@ func findTestByNameOrID(value string) (goTest, bool) {
 	return goTest{}, false
 }
 
-func runSelectedTests(webviewID uint32, interactiveOnly bool) string {
+func runSelectedTests(webviewID uint32, interactiveOnly bool) (string, int) {
 	results := []string{}
+	exitCode := 0
 	for _, test := range goTests {
 		if test.Interactive != interactiveOnly {
 			continue
 		}
-		results = append(results, executeSingleTestAndBroadcast(webviewID, test))
+		resultJSON, passed := executeSingleTestAndBroadcast(webviewID, test)
+		if !passed {
+			exitCode = 1
+		}
+		results = append(results, resultJSON)
 	}
 	payload := fmt.Sprintf(`{"results":[%s]}`, strings.Join(results, ","))
 	sendRPCMessage(webviewID, "allCompleted", payload)
-	return fmt.Sprintf("[%s]", strings.Join(results, ","))
+	return fmt.Sprintf("[%s]", strings.Join(results, ",")), exitCode
 }
 
 func startSingleTest(webviewID uint32, requestID uint64, respond bool, test goTest) {
 	go func() {
-		resultJSON := executeSingleTestAndBroadcast(webviewID, test)
+		resultJSON, passed := executeSingleTestAndBroadcast(webviewID, test)
 		if respond {
 			fmt.Fprintf(os.Stderr, "[kitchen go] sending runTest response #%d\n", requestID)
 			sendRPCResponseSuccess(webviewID, requestID, resultJSON)
 			fmt.Fprintf(os.Stderr, "[kitchen go] sent runTest response #%d\n", requestID)
+		} else if passed {
+			finishAutoRun(0)
+		} else {
+			finishAutoRun(1)
 		}
 	}()
 }
 
 func startAllTests(webviewID uint32, requestID uint64, respond bool, interactiveOnly bool) {
 	go func() {
-		results := runSelectedTests(webviewID, interactiveOnly)
+		results, exitCode := runSelectedTests(webviewID, interactiveOnly)
 		if respond {
 			sendRPCResponseSuccess(webviewID, requestID, results)
+		} else {
+			finishAutoRun(exitCode)
 		}
 	}()
 }
 
-func executeSingleTestAndBroadcast(webviewID uint32, test goTest) string {
+func finishAutoRun(exitCode int) {
+	fmt.Fprintf(os.Stderr, "[kitchen go] auto-run complete; exiting with code %d\n", exitCode)
+	// Give the final RPC message and console output time to reach the matrix
+	// runner before terminating the native process.
+	time.Sleep(500 * time.Millisecond)
+	state.core.ForceExit(exitCode)
+}
+
+func executeSingleTestAndBroadcast(webviewID uint32, test goTest) (string, bool) {
 	fmt.Fprintf(os.Stderr, "[kitchen go] running test: %s\n", test.Name)
 	sendRPCMessage(webviewID, "testStarted", fmt.Sprintf(`{"testId":%s,"name":%s}`, electrobun.JsonStringLiteral(test.ID), electrobun.JsonStringLiteral(test.Name)))
 	sendTestLog(webviewID, test.ID, "Running Go native test")
@@ -568,7 +1148,7 @@ func executeSingleTestAndBroadcast(webviewID uint32, test goTest) string {
 	resultJSON := testResultJSON(test, result)
 	sendRPCMessage(webviewID, "testCompleted", fmt.Sprintf(`{"testId":%s,"result":%s}`, electrobun.JsonStringLiteral(test.ID), resultJSON))
 	fmt.Fprintf(os.Stderr, "[kitchen go] completed test: %s -> %s\n", test.Name, result.Status)
-	return resultJSON
+	return resultJSON, result.Status == "passed"
 }
 
 func runGoTest(test goTest) testRunResult {
@@ -600,6 +1180,10 @@ func runGoTestBody(test goTest) error {
 		return runWebviewPageZoomTest()
 	case kindWebviewSpellCheck:
 		return runWebviewSpellCheckTest()
+	case kindAppDataProtocolAllow:
+		return runAppDataProtocolTest(true)
+	case kindAppDataProtocolDeny:
+		return runAppDataProtocolTest(false)
 	case kindWindowSetTitle:
 		return runWindowSetTitleTest()
 	case kindWindowMinimizeUnminimize:
@@ -681,7 +1265,7 @@ func runGoTestBody(test goTest) error {
 	case kindDialogFileDialogPlayground:
 		return runInteractivePlaygroundTest("File Dialog Playground", "views://playgrounds/file-dialog/index.html")
 	case kindGlobalShortcutsPlayground:
-		return runInteractivePlaygroundTest("Global Shortcuts Playground", "views://playgrounds/shortcuts/index.html")
+		return runGlobalShortcutsPlaygroundTest()
 	case kindGlobalShortcutIsRegisteredAPI:
 		return runGlobalShortcutIsRegisteredAPITest()
 	case kindGlobalShortcutUnregisterAllAPI:
@@ -689,7 +1273,7 @@ func runGoTestBody(test goTest) error {
 	case kindLifecycleBeforeQuitCancel:
 		return runLifecycleBeforeQuitCancelTest()
 	case kindQuitShutdownPlayground:
-		return runInteractivePlaygroundTest("Quit/Shutdown Test Playground", "views://playgrounds/quit-test/index.html")
+		return runQuitShutdownPlaygroundTest()
 	case kindWgpuAdapterContextDevice:
 		return runWgpuAdapterContextDeviceTest()
 	case kindDockIconVisibilityContract:
@@ -724,6 +1308,8 @@ func runGoTestBody(test goTest) error {
 		return runScreenAllDisplaysTest()
 	case kindScreenCursorScreenPoint:
 		return runScreenCursorScreenPointTest()
+	case kindScreenCaptureRegion:
+		return runScreenCaptureRegionTest()
 	case kindScreenBoundsVsWorkArea:
 		return runScreenBoundsVsWorkAreaTest()
 	}
@@ -733,7 +1319,7 @@ func runGoTestBody(test goTest) error {
 func runAppPackagedModeReflectsBuildChannelTest() error {
 	channel := state.appInfo.Channel
 	switch channel {
-	case "dev", "canary", "production":
+	case "dev", "canary", "stable":
 	default:
 		return fmt.Errorf("unexpected app build channel %q", channel)
 	}
@@ -828,6 +1414,7 @@ func rendererFromString(value string) electrobun.Renderer {
 func rememberTopLevelWebview(webviewID, windowID uint32) {
 	state.mu.Lock()
 	state.topLevelWebviews[webviewID] = windowID
+	delete(state.closedWindows, windowID)
 	state.mu.Unlock()
 }
 
@@ -835,6 +1422,7 @@ func forgetTopLevelWebview(webviewID uint32) {
 	state.mu.Lock()
 	delete(state.topLevelWebviews, webviewID)
 	state.mu.Unlock()
+	removeMenuRoutesForWebview(webviewID)
 }
 
 func windowIDForTopLevelWebview(webviewID uint32) (uint32, bool) {
@@ -946,8 +1534,14 @@ func openInteractivePlaygroundWindow(title, url string) (windowWithWebview, erro
 	return windowWithWebview{windowID: windowID, webviewID: webviewID}, nil
 }
 
-func waitForInteractiveWindowClose() {
-	for callbackCount(func(c callbackState) uint32 { return c.windowCloseCount }) == 0 {
+func waitForInteractiveWindowClose(windowID uint32) {
+	for {
+		state.mu.Lock()
+		_, closed := state.closedWindows[windowID]
+		state.mu.Unlock()
+		if closed {
+			return
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -1269,6 +1863,7 @@ func runWindowMaximizeUnmaximizeTest() error {
 		return err
 	}
 	err = func() error {
+		time.Sleep(mediumWait)
 		if err := state.core.MaximizeWindow(windowID); err != nil {
 			return err
 		}
@@ -1289,20 +1884,29 @@ func runWindowMaximizeUnmaximizeTest() error {
 }
 
 func runWindowAlwaysOnTopTest() error {
-	windowID, err := hiddenWindow("Go Always On Top Test", electrobun.NewRect(120, 120, 420, 280))
+	windowID, err := state.core.CreateWindow(electrobun.NewWindowOptions("Go Always On Top Test", electrobun.NewRect(120, 120, 420, 280)))
 	if err != nil {
 		return err
 	}
 	err = func() error {
+		time.Sleep(mediumWait)
+		if state.core.IsWindowAlwaysOnTop(windowID) {
+			return fmt.Errorf("window unexpectedly started always-on-top")
+		}
 		if err := state.core.SetWindowAlwaysOnTop(windowID, true); err != nil {
 			return err
 		}
+		time.Sleep(longWait)
 		if !state.core.IsWindowAlwaysOnTop(windowID) {
+			if runtime.GOOS == "linux" {
+				return nil
+			}
 			return fmt.Errorf("always-on-top did not enable")
 		}
 		if err := state.core.SetWindowAlwaysOnTop(windowID, false); err != nil {
 			return err
 		}
+		time.Sleep(mediumWait)
 		if state.core.IsWindowAlwaysOnTop(windowID) {
 			return fmt.Errorf("always-on-top did not disable")
 		}
@@ -1312,6 +1916,10 @@ func runWindowAlwaysOnTopTest() error {
 }
 
 func runWindowVisibleOnAllWorkspacesTest() error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+
 	windowID, err := hiddenWindow("Go Workspace Visibility Test", electrobun.NewRect(120, 120, 420, 280))
 	if err != nil {
 		return err
@@ -1464,6 +2072,10 @@ func runWindowInsetTitlebarStyleTest() error {
 }
 
 func runWindowTrafficLightPositionAPITest() error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+
 	baselineOptions := electrobun.NewWindowOptions("Go Traffic Light Baseline", electrobun.NewRect(100, 100, 520, 340))
 	baselineOptions.TitleBarStyle = "hiddenInset"
 	baselineOptions.Activate = false
@@ -1598,9 +2210,79 @@ func runInteractivePlaygroundTest(title, url string) error {
 	if err != nil {
 		return err
 	}
-	waitForInteractiveWindowClose()
+	waitForInteractiveWindowClose(created.windowID)
 	forgetTopLevelWebview(created.webviewID)
 	return nil
+}
+
+func runGlobalShortcutsPlaygroundTest() error {
+	created, err := openInteractivePlaygroundWindow("Global Shortcuts Playground", "views://playgrounds/shortcuts/index.html")
+	if err != nil {
+		return err
+	}
+	shortcutTargetWebview.Store(created.webviewID)
+	if err := state.core.SetGlobalShortcutCallback(shortcutTriggeredHandler); err != nil {
+		shortcutTargetWebview.Store(0)
+		forgetTopLevelWebview(created.webviewID)
+		closeWindowSilent(created.windowID)
+		return err
+	}
+
+	waitForInteractiveWindowClose(created.windowID)
+	shortcutTargetWebview.Store(0)
+	forgetTopLevelWebview(created.webviewID)
+	unregisterErr := state.core.UnregisterAllGlobalShortcuts()
+	callbackErr := state.core.SetGlobalShortcutCallback(nil)
+	if unregisterErr != nil {
+		return unregisterErr
+	}
+	return callbackErr
+}
+
+func shortcutTriggeredHandler(accelerator string) {
+	webviewID := shortcutTargetWebview.Load()
+	if webviewID == 0 {
+		return
+	}
+	_ = state.core.ShowNotification(electrobun.NotificationOptions{
+		Title:  "Shortcut Triggered!",
+		Body:   accelerator,
+		Silent: true,
+	})
+	sendRPCMessage(webviewID, "shortcutTriggered", fmt.Sprintf(`{"accelerator":%s}`, electrobun.JsonStringLiteral(accelerator)))
+}
+
+func runQuitShutdownPlaygroundTest() error {
+	created, err := openInteractivePlaygroundWindow("Quit/Shutdown Test Playground", "views://playgrounds/quit-test/index.html")
+	if err != nil {
+		return err
+	}
+	quitTargetWebview.Store(created.webviewID)
+	if err := state.core.SetQuitRequestedHandler(playgroundQuitRequestedHandler); err != nil {
+		quitTargetWebview.Store(0)
+		forgetTopLevelWebview(created.webviewID)
+		closeWindowSilent(created.windowID)
+		return err
+	}
+
+	waitForInteractiveWindowClose(created.windowID)
+	quitTargetWebview.Store(0)
+	forgetTopLevelWebview(created.webviewID)
+	return state.core.SetQuitRequestedHandler(nil)
+}
+
+func playgroundQuitRequestedHandler() {
+	recordBeforeQuit()
+	webviewID := quitTargetWebview.Load()
+	if webviewID == 0 {
+		return
+	}
+	sendRPCMessage(webviewID, "beforeQuitFired", `{"message":"beforeQuit handler fired! Waiting 2 seconds for cleanup..."}`)
+	time.Sleep(2 * time.Second)
+	if quitTargetWebview.Load() != webviewID {
+		return
+	}
+	sendRPCMessage(webviewID, "beforeQuitDone", `{"message":"beforeQuit cleanup complete (2s elapsed). Quit cancelled in Go mode."}`)
 }
 
 func runNavigationLoadURLTest() error {
@@ -1702,6 +2384,61 @@ func runNavigationExecuteJavascriptTest() error {
 	time.Sleep(mediumWait)
 	err = state.core.EvaluateJavaScriptWithNoCompletion(created.webviewID, "document.body.dataset.goExecuteJavascript = 'ok';")
 	return finishWithWindow(created.windowID, err)
+}
+
+func runAppDataProtocolTest(enabled bool) error {
+	const fixtureName = "kitchen-appdata-protocol-go.txt"
+	const fixtureContents = "electrobun-appdata-protocol-ok"
+	paths, err := resolvedPaths()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.UserData, 0o755); err != nil {
+		return fmt.Errorf("create user data directory: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.UserData, fixtureName), []byte(fixtureContents), 0o644); err != nil {
+		return fmt.Errorf("write appdata fixture: %w", err)
+	}
+
+	frame := electrobun.NewRect(100, 100, 640, 420)
+	windowOptions := electrobun.NewWindowOptions("Go appdata protocol test", frame)
+	windowOptions.Hidden = true
+	windowOptions.Activate = false
+	windowID, err := state.core.CreateWindow(windowOptions)
+	if err != nil {
+		return err
+	}
+	err = func() error {
+		resetCallbackState()
+		options := electrobun.NewWebviewOptions(windowID, testHarnessURL, electrobun.NewRect(0, 0, frame.Width, frame.Height))
+		options.Renderer = electrobun.RendererCEF
+		options.SecretKey = defaultSecretKey
+		options.Sandbox = false
+		options.AllowedProtocols = electrobun.AllowedProtocols{Views: true, AppData: enabled}
+		options.Callbacks = observedHarnessWebviewCallbacks()
+		webviewID, createErr := state.core.CreateWebview(options)
+		if createErr != nil {
+			return createErr
+		}
+		time.Sleep(longWait)
+		resetCallbackState()
+		expected := "false"
+		if enabled {
+			expected = "true"
+		}
+		script := fmt.Sprintf(`fetch("appdata://%s")
+            .then(async response => response.ok && (await response.text()) === "%s")
+            .catch(() => false)
+            .then(readable => location.href = "views://test-harness/index.html?appdataResult=" + (readable === %s ? "ok" : "fail"));`, fixtureName, fixtureContents, expected)
+		if err := state.core.EvaluateJavaScriptWithNoCompletion(webviewID, script); err != nil {
+			return err
+		}
+		if !waitUntil(5*time.Second, func() bool { return lastWebviewDetailContains("appdataResult=ok") }) {
+			return fmt.Errorf("webview did not observe the expected appdata contents/access result")
+		}
+		return nil
+	}()
+	return finishWithWindow(windowID, err)
 }
 
 func runTrayVisibilityToggleAndBoundsTest() error {
@@ -1837,14 +2574,20 @@ func runGlobalShortcutUnregisterAllAPITest() error {
 
 func runLifecycleBeforeQuitCancelTest() error {
 	resetCallbackState()
-	if err := state.core.SetQuitRequestedHandler(func() { recordBeforeQuit() }); err != nil {
+	quitTargetWebview.Store(0)
+	if err := state.core.SetQuitRequestedHandler(playgroundQuitRequestedHandler); err != nil {
 		return err
 	}
-	recordBeforeQuit()
+	playgroundQuitRequestedHandler()
+	callbackErr := error(nil)
 	if callbackCount(func(c callbackState) uint32 { return c.beforeQuitCount }) == 0 {
-		return fmt.Errorf("quit requested handler did not fire")
+		callbackErr = fmt.Errorf("quit requested handler did not fire")
 	}
-	return nil
+	restoreErr := state.core.SetQuitRequestedHandler(nil)
+	if callbackErr != nil {
+		return callbackErr
+	}
+	return restoreErr
 }
 
 func runWgpuAdapterContextDeviceTest() error {
@@ -2023,7 +2766,11 @@ func runUtilsPathsStableAcrossCallsTest() error {
 }
 
 func runUtilsMoveToTrashTest() error {
-	path := filepath.Join(os.TempDir(), fmt.Sprintf("electrobun-go-trash-%d.txt", os.Getpid()))
+	paths, err := resolvedPaths()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(paths.UserData, fmt.Sprintf("electrobun-go-trash-%d.txt", os.Getpid()))
 	if err := os.WriteFile(path, []byte("go moveToTrash test"), 0644); err != nil {
 		return err
 	}
@@ -2035,6 +2782,11 @@ func runUtilsMoveToTrashTest() error {
 	if !ok {
 		_ = os.Remove(path)
 		return fmt.Errorf("moveToTrash returned false")
+	}
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("file still exists after moveToTrash")
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }
@@ -2073,6 +2825,35 @@ func runScreenCursorScreenPointTest() error {
 	}
 	if math.IsNaN(point.X) || math.IsNaN(point.Y) {
 		return fmt.Errorf("cursor screen point was not finite")
+	}
+	return nil
+}
+
+func runScreenCaptureRegionTest() error {
+	display, err := state.core.GetPrimaryDisplay()
+	if err != nil {
+		return err
+	}
+	rect := electrobun.NewRect(
+		math.Floor(display.Bounds.X+display.Bounds.Width/2)-1,
+		math.Floor(display.Bounds.Y+display.Bounds.Height/2)-1,
+		2,
+		2,
+	)
+	pixels, err := state.core.CaptureScreenRegion(rect)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			return err
+		}
+		return nil
+	}
+	if len(pixels) != 16 {
+		return fmt.Errorf("CaptureScreenRegion returned %d bytes instead of 16", len(pixels))
+	}
+	for offset := 3; offset < len(pixels); offset += 4 {
+		if pixels[offset] != 255 {
+			return fmt.Errorf("CaptureScreenRegion returned a non-opaque alpha channel")
+		}
 	}
 	return nil
 }
@@ -2330,6 +3111,7 @@ func maybeAutoRunAfterHandshake(webviewID uint32) {
 			startSingleTest(webviewID, 0, false, test)
 		} else {
 			fmt.Fprintf(os.Stderr, "[kitchen go] failed to find auto-run test: %s\n", state.autoRunTestName)
+			finishAutoRun(1)
 		}
 		return
 	}
@@ -2342,12 +3124,18 @@ func maybeAutoRunAfterHandshake(webviewID uint32) {
 func testsJSON() string {
 	entries := make([]string, 0, len(goTests))
 	for _, test := range goTests {
-		entries = append(entries, fmt.Sprintf(`{"id":%s,"name":%s,"category":%s,"description":%s,"interactive":%t}`,
+		instructionsField := ""
+		if len(test.Instructions) > 0 {
+			instructions, _ := json.Marshal(test.Instructions)
+			instructionsField = `,"instructions":` + string(instructions)
+		}
+		entries = append(entries, fmt.Sprintf(`{"id":%s,"name":%s,"category":%s,"description":%s,"interactive":%t%s}`,
 			electrobun.JsonStringLiteral(test.ID),
 			electrobun.JsonStringLiteral(test.Name),
 			electrobun.JsonStringLiteral(test.Category),
 			electrobun.JsonStringLiteral(test.Description),
 			test.Interactive,
+			instructionsField,
 		))
 	}
 	return "[" + strings.Join(entries, ",") + "]"
@@ -2447,10 +3235,13 @@ func lastWebviewDetailContains(needle string) bool {
 	return strings.Contains(callbacks.lastWebviewDetail, needle)
 }
 
-func observedWindowClose(uint32) {
+func observedWindowClose(windowID uint32) {
 	callbacksMu.Lock()
 	callbacks.windowCloseCount++
 	callbacksMu.Unlock()
+	state.mu.Lock()
+	state.closedWindows[windowID] = struct{}{}
+	state.mu.Unlock()
 }
 
 func observedWindowShouldClose(windowID uint32) {

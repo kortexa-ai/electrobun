@@ -28,6 +28,10 @@ export type WindowOptionsType<T = undefined> = {
 	html: string | null;
 	preload: string | null;
 	viewsRoot: string | null;
+	allowedProtocols: {
+		views?: boolean;
+		appData?: boolean;
+	};
 	renderer: "native" | "cef";
 	rpc?: T;
 	styleMask?: {};
@@ -63,6 +67,7 @@ const defaultOptions: WindowOptionsType = {
 	html: null,
 	preload: null,
 	viewsRoot: null,
+	allowedProtocols: { views: true, appData: false },
 	renderer: buildConfig.defaultRenderer,
 	titleBarStyle: "default",
 	transparent: false,
@@ -237,6 +242,10 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	html: string | null = null;
 	preload: string | null = null;
 	viewsRoot: string | null = null;
+	allowedProtocols: { views: boolean; appData: boolean } = {
+		views: true,
+		appData: false,
+	};
 	renderer: "native" | "cef" = "native";
 	transparent: boolean = false;
 	passthrough: boolean = false;
@@ -286,6 +295,10 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		this.html = options.html || null;
 		this.preload = options.preload || null;
 		this.viewsRoot = options.viewsRoot || null;
+		this.allowedProtocols = {
+			views: options.allowedProtocols?.views ?? true,
+			appData: options.allowedProtocols?.appData ?? false,
+		};
 		this.renderer = options.renderer || defaultOptions.renderer;
 		this.transparent = options.transparent ?? false;
 		this.passthrough = options.passthrough ?? false;
@@ -387,6 +400,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			partition: usesEmbeddedChrome
 				? "__electrobun_content_with_chrome__"
 				: null,
+			allowedProtocols: this.allowedProtocols,
 			// frame: this.frame,
 			renderer: this.renderer,
 			frame: {

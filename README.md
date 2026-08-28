@@ -14,25 +14,46 @@
 ## What is Electrobun?
 
 Electrobun aims to be a complete **solution-in-a-box** for building, updating, and shipping fast, compact, cross-platform desktop applications written in TypeScript.
-Hutch is the native build and package-management CLI. Cottontail is Electrobun's JSC-based default JavaScript runtime. Electrobun's platform layer combines Zig, Objective-C, and C++.
+Hutch is the native build and workspace CLI. Cottontail is Electrobun's JSC-based default JavaScript runtime. Electrobun's platform layer combines Zig, Objective-C, and C++.
 
 Visit <a href="https://framework.blackboard.sh/electrobun/">https://framework.blackboard.sh/electrobun/</a> to see api documentation, guides, and more.
 
-Install Hutch globally, then use it to create a project, install the npm package that provides Electrobun's SDKs, and build the application:
+Install Hutch globally, then use it to create and build a project. Published
+templates include the exact Electrobun release they were tested with. In a
+hand-written project that pin is optional; without one, Hutch uses an
+npm-supplied paired default or floats on the active release channel. Hutch
+verifies and installs the resolved release's platform archive under
+`~/.hutch/releases/electrobun` and copies its SDKs into the project's generated
+`.hutch/devkit` sysroot:
 
 ```bash
 curl -fsSL https://hutch.blackboard.sh/hutch/install.sh | sh
 hutch electrobun init
 ```
 
-Or bootstrap the same interactive initializer from npm or Bun. This installs
-Hutch when it is not already available:
+Initialization requires network access to fetch the current template catalog
+and selected template. Later builds can reuse exact releases and managed
+toolchains that are already installed.
+
+Or bootstrap the same interactive initializer from npm or Bun. The single,
+dependency-free npm package downloads the exact paired Hutch archive from that
+version's Electrobun GitHub Release when needed, verifies and caches it, and
+forwards the command. The initializer also ensures a compatible global launcher
+for the generated project's `hutch` tasks. It does not carry or own the
+Electrobun runtime or SDKs:
 
 ```bash
 npx electrobun init
 # or
 bunx electrobun init
 ```
+
+Hutch's built-in npm-compatible resolver installs JavaScript dependencies by
+default and writes `hutch.lock`; `hutch pm exec` runs project-local package
+binaries. A project's `hutch.config.ts` may instead select npm, Bun, pnpm, Yarn,
+or a custom executable, and Hutch delegates package operations to that explicit
+choice. Package management is independent of whether the app's main process
+runs on Cottontail or Bun.
 
 Don't miss our:
 - self-extracting bundles that use Zstandard compression for compact distributables
@@ -111,7 +132,11 @@ Don't miss our:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=blackboardsh/electrobun&type=date&legend=top-left&cache=3)](https://www.star-history.com/#blackboardsh/electrobun&type=date&legend=top-left)
+<p align="center">
+  <img src="./.github/assets/star-history-v1.jpg" alt="Electrobun star history four weeks after the v1 launch">
+  <br>
+  <em>star history 4 weeks after v1 launch</em>
+</p>
 
 ## Contributing
 Electrobun is one piece of a vision I'm building. I'm optimizing for focus and execution. Issues and PRs can be used to share ideas, but there should be no expectation that I will review, respond to, or merge them.
@@ -156,20 +181,23 @@ On Windows PowerShell:
 - cmake
 - webkit2gtk and GTK development packages
 
-On Ubuntu/Debian based distros: `sudo apt install build-essential cmake pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`
+On Ubuntu/Debian based distros: `sudo apt install build-essential cmake pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libpipewire-0.3-dev librsvg2-dev`
 
 Linux applications also require the corresponding GTK 3, WebKitGTK 4.1,
 Ayatana AppIndicator, and librsvg runtime packages on end-user systems. See the
 [cross-platform development guide](./docs/src/content/docs/electrobun/guides/cross-platform-development.mdx#linux)
 for distro-specific install commands. The launcher reports the exact missing
 shared library when these dependencies are unavailable.
+Wayland screen-region capture additionally requires a working desktop portal,
+PipeWire, and the `libpipewire-0.3.so.0` runtime library (provided by
+`libpipewire-0.3-0`, or `libpipewire-0.3-0t64` on newer Ubuntu/Debian releases).
 
 ### First-time Setup
 
 ```bash
 git clone --recurse-submodules https://github.com/blackboardsh/electrobun.git
 cd electrobun/package
-hutch install
+npm ci
 hutch dev:clean
 ```
 
@@ -182,9 +210,22 @@ cd electrobun/package
 # After making changes to source code
 hutch dev
 
+# Exercise one repository template against the same local package/dist
+hutch dev:template hello-world
+
 # If you need a completely fresh start
 hutch dev:clean
 ```
+
+`hutch dev` builds `package/dist` and runs Kitchen against that local
+Electrobun devkit. Running `hutch dev` directly from `kitchen/` continues to
+use the Electrobun version pinned in `kitchen/hutch.config.ts`.
+
+`hutch dev:template <template-name>` builds the same local devkit, runs the
+template's configured dependency installation, and starts its `dev` task against
+those local bytes. Repository templates stay unpinned for this workflow; the
+release publisher injects the shipped Electrobun version into each staged
+template archive.
 
 The native build generates `package/src/native/compile_flags.txt` from the
 compiler flags resolved for the current machine. clangd-compatible editors
@@ -192,8 +233,8 @@ discover it automatically; rerun the build after changing native dependencies
 or system toolchains.
 
 With sibling `jsc`, `cottontail`, `dash-cloud`, and `electrobun` checkouts, use
-one command to build only changed native layers and run Kitchen with the local
-stack:
+`--local` to additionally build and select the local JSC, Cottontail, and Hutch
+layers:
 
 ```bash
 hutch dev --local
@@ -208,6 +249,7 @@ command.
 All commands are run from the `/package` directory:
 
 - `hutch dev:canary` - Build and run kitchen sink in canary mode
+- `hutch dev:template <template-name>` - Build and run one template against the local devkit
 - `hutch build:dev` - Build Electrobun in development mode
 - `hutch build:release` - Build Electrobun in release mode
 

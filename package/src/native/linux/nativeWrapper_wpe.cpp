@@ -381,6 +381,14 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextStartPassthrough.store(startPassthrough);
 }
 
+// Keep ABI parity with desktop wrappers. WPE currently exposes views:// to
+// application views and has no appdata:// backend, so this is advisory until
+// the embedded scheme handler gains per-view protocol policy.
+ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
+    (void)allowViews;
+    (void)allowAppData;
+}
+
 // Trust class for the next initWebview call. 0 = trusted (default — view
 // shares the WPEWebProcess of the seed via related-view), 1 = untrusted
 // (view gets its own WPEWebProcess). Mirrors the setNextWebviewFlags

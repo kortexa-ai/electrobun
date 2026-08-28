@@ -9,7 +9,7 @@ export default {
 	build: {
 		mainProcess: "go",
 		go: {
-			entrypoint: "src/go/main.go",
+			package: "./src/go",
 		},
 		views: {
 			mainview: {

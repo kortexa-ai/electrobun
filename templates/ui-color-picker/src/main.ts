@@ -4,13 +4,11 @@
 // in several formats — click a row to copy it, or cmd+C to copy your
 // preferred format (persisted across launches).
 //
-// Screen sampling uses the macOS `screencapture` CLI + Electrobun's PNG
-// decoder, so the app needs Screen Recording permission (System Settings →
-// Privacy & Security). Without it you'll see the wallpaper only — that's the
-// permission, not a bug.
+// Screen sampling uses Electrobun's native cross-platform capture API. macOS
+// requires Screen Recording permission; Windows and the current Linux/X11
+// backend do not require a separate app permission prompt.
 
-import { Screen, Tray, Utils, webgpu } from "electrobun/main";
-import { tmpdir } from "node:os";
+import { Screen, Tray, Utils } from "electrobun/main";
 import { join } from "node:path";
 import {
 	live,
@@ -26,6 +24,7 @@ import {
 	Key,
 	Mod,
 } from "electrobun/main/ui";
+import { packRgbaPixels, packedPixelsEqual } from "./colorSampling";
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -49,12 +48,21 @@ const theme = {
 
 const GRID = 11; // odd, so the cursor pixel is the center cell
 const CENTER = Math.floor((GRID * GRID) / 2);
+const CURSOR_POLL_INTERVAL_MS = 16; // near-60 Hz while the pointer is moving
+const POST_MOTION_SAMPLE_BURST_MS = 70;
+const STATIONARY_SAMPLE_INTERVAL_MS = 100;
+const IS_WAYLAND_SESSION =
+	process.platform === "linux" &&
+	(process.env.XDG_SESSION_TYPE?.toLowerCase() === "wayland" ||
+		Boolean(process.env.WAYLAND_DISPLAY));
 
 const [cells, setCells] = signal<Uint32Array>(
 	new Uint32Array(GRID * GRID).fill(0x101010ff),
 	{ equals: false },
 );
-// Sampling state machine, driven by the mode button:
+// Sampling state machine, driven by the mode button. Wayland cannot observe
+// passive global mouse-button state, so its second button freezes immediately
+// instead of arming the outside-click flow:
 //   live  -> click button   -> armed ("pick mode")
 //   armed -> click anywhere outside the window -> frozen
 //   armed -> click button / Escape -> live
@@ -66,6 +74,7 @@ const [copied, setCopied] = signal("");
 const [hasScreenAccess, setHasScreenAccess] = signal(
 	Utils.screenCapture.hasAccess(),
 );
+const [captureAvailable, setCaptureAvailable] = signal(true);
 
 const centerColor = memo(() => cells()[CENTER]! >>> 0);
 
@@ -152,58 +161,20 @@ function copy(format: Format) {
 // a row keeps the sampled color) or while frozen (space bar).
 // ---------------------------------------------------------------------------
 
-const capturePath = join(tmpdir(), `ui-color-picker-${process.pid}.png`);
-const { decodePngRGBA } = webgpu.utils;
-let sampling = false;
-
-async function sampleAround(cx: number, cy: number): Promise<void> {
+function sampleAround(cx: number, cy: number): boolean {
 	const half = Math.floor(GRID / 2);
-	const proc = Bun.spawn(
-		[
-			"screencapture",
-			"-x",
-			"-t",
-			"png",
-			"-R",
-			`${cx - half},${cy - half},${GRID},${GRID}`,
-			capturePath,
-		],
-		{ stderr: "ignore", stdout: "ignore" },
-	);
-	await proc.exited;
-	const bytes = new Uint8Array(await Bun.file(capturePath).arrayBuffer());
-	const img = decodePngRGBA(bytes) as {
-		width: number;
-		height: number;
-		data?: Uint8Array;
-		pixels?: Uint8Array;
-	};
-	const data = (img.data ?? img.pixels)!;
-	// Retina captures come back scaled: sample with a stride so the grid is
-	// one cell per requested point.
-	const strideX = img.width / GRID;
-	const strideY = img.height / GRID;
-	const next = new Uint32Array(GRID * GRID);
-	for (let gy = 0; gy < GRID; gy++) {
-		for (let gx = 0; gx < GRID; gx++) {
-			const px = Math.min(img.width - 1, Math.floor((gx + 0.5) * strideX));
-			const py = Math.min(img.height - 1, Math.floor((gy + 0.5) * strideY));
-			const o = (py * img.width + px) * 4;
-			next[gy * GRID + gx] =
-				((data[o]! << 24) | (data[o + 1]! << 16) | (data[o + 2]! << 8) | 0xff) >>> 0;
-		}
-	}
+	const rgba = Screen.captureRegion({
+		x: cx - half,
+		y: cy - half,
+		width: GRID,
+		height: GRID,
+	});
+	if (!rgba) return false;
+	const next = packRgbaPixels(rgba);
 	// Unchanged sample (stationary cursor, static screen): skip the update so
 	// the invalidation-driven renderer stays idle.
-	const prev = cells();
-	let changed = false;
-	for (let i = 0; i < next.length; i++) {
-		if (next[i] !== prev[i]) {
-			changed = true;
-			break;
-		}
-	}
-	if (changed) setCells(next);
+	if (!packedPixelsEqual(next, cells())) setCells(next);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,15 +217,26 @@ function ZoomGrid() {
 				},
 			},
 			() => {
-			ui.box({
-				width: 8,
-				height: 8,
-				radius: 4,
-				bg: live(() => (!hasScreenAccess() ? "#f7768e" : MODE_COLOR[mode()])),
-			});
-			ui.text(live(() => (!hasScreenAccess() ? "no access - click here" : mode())),
-				{ size: 9, color: theme.textFaint },
-			);
+				ui.box({
+					width: 8,
+					height: 8,
+					radius: 4,
+					bg: live(() =>
+						!hasScreenAccess() || !captureAvailable()
+							? "#f7768e"
+							: MODE_COLOR[mode()],
+					),
+				});
+				ui.text(
+					live(() =>
+						!hasScreenAccess() ? "no access - click here"
+						: !captureAvailable() ?
+								IS_WAYLAND_SESSION ? "share a monitor..."
+								: "capture unavailable"
+						: mode(),
+					),
+					{ size: 9, color: theme.textFaint },
+				);
 			},
 		);
 	});
@@ -313,36 +295,39 @@ function CopyFormatSelector() {
 			},
 		);
 		ui.dynamic({ dir: "row", gap: 6 }, () => {
-			if (!expanded()) return;
-			for (const format of FORMATS) {
-				let chipId = 0;
-				chipId = ui.box(
-					{
-						pad: 6,
-						radius: 5,
-						bg: live(() =>
-							ctx.hoveredId() === chipId ? theme.rowHover : theme.row),
-						border: 1,
-						borderColor: live(() =>
-							copyFormat() === format ? theme.accent : theme.line),
-						onClick: () => {
-							batch(() => {
-								setCopyFormat(format);
-								setExpanded(false);
+			const showFormats = expanded();
+			if (!showFormats) return;
+			inert(() => {
+				for (const format of FORMATS) {
+					let chipId = 0;
+					chipId = ui.box(
+						{
+							pad: 6,
+							radius: 5,
+							bg: live(() =>
+								ctx.hoveredId() === chipId ? theme.rowHover : theme.row),
+							border: 1,
+							borderColor: live(() =>
+								copyFormat() === format ? theme.accent : theme.line),
+							onClick: () => {
+								batch(() => {
+									setCopyFormat(format);
+									setExpanded(false);
+								});
+							},
+						},
+						() => {
+							ui.text(format.toUpperCase(), {
+								size: 10,
+								color: live(() =>
+									copyFormat() === format
+										? theme.accent
+										: theme.textMuted),
 							});
 						},
-					},
-					() => {
-						ui.text(format.toUpperCase(), {
-							size: 10,
-							color: live(() =>
-								copyFormat() === format
-									? theme.accent
-									: theme.textMuted),
-						});
-					},
-				);
-			}
+					);
+				}
+			});
 		});
 	});
 }
@@ -401,11 +386,15 @@ function ModeButtons() {
 			() => setMode("live"),
 		);
 		StateButton(
-			() => (mode() === "armed" ? "click a pixel..." : "pick mode"),
-			() => mode() === "armed",
-			MODE_COLOR.armed,
-			"#3d2f56",
-			() => setMode("armed"),
+			() =>
+				IS_WAYLAND_SESSION ? "freeze sample"
+				: mode() === "armed" ? "click a pixel..."
+				: "pick mode",
+			() =>
+				mode() === (IS_WAYLAND_SESSION ? "frozen" : "armed"),
+			IS_WAYLAND_SESSION ? MODE_COLOR.frozen : MODE_COLOR.armed,
+			IS_WAYLAND_SESSION ? "#403820" : "#3d2f56",
+			() => setMode(IS_WAYLAND_SESSION ? "frozen" : "armed"),
 		);
 	});
 }
@@ -447,6 +436,7 @@ function ColorPanel() {
 
 const WIDTH = 512;
 const HEIGHT = 336;
+let pickerVisible = true;
 
 const uiWindow = await createUIWindow(
 	{
@@ -481,22 +471,51 @@ const uiWindow = await createUIWindow(
 				setMode(inert(mode) === "frozen" ? "live" : "frozen");
 			} else if (e.keyCode === Key.Escape) {
 				if (inert(mode) === "armed") setMode("live");
-				else uiWindow.window.hide();
+				else setPickerVisible(false);
 			}
 		});
 	},
 );
 
+function setPickerVisible(visible: boolean) {
+	if (visible === pickerVisible) return;
+	pickerVisible = visible;
+	if (visible) uiWindow.window.show();
+	else uiWindow.window.hide();
+}
+
 const tray = new Tray({ title: "◐" });
 tray.on("tray-clicked", () => {
-	if (uiWindow.window.isVisible()) uiWindow.window.hide();
-	else uiWindow.window.show();
+	setPickerVisible(!pickerVisible);
 });
 
-// Sampling loop: idle-cheap, skipped over our own window and while frozen.
+// Poll cursor motion near 60 Hz so the sample tracks the pointer. A short tail
+// after motion consumes asynchronously refreshed frames (notably PipeWire),
+// then capture settles to 10 Hz while stationary. Hidden, frozen, and self-hover
+// states skip the work entirely.
+let warnedCaptureUnavailable = false;
+let lastCursorX = Number.NaN;
+let lastCursorY = Number.NaN;
+let lastCursorMovedAt = Number.NEGATIVE_INFINITY;
+let lastSampleAttemptAt = Number.NEGATIVE_INFINITY;
 setInterval(() => {
-	if (!uiWindow.window.isVisible() || mode() === "frozen" || sampling) return;
+	if (!pickerVisible || mode() === "frozen") return;
 	const cursor = Screen.getCursorScreenPoint();
+	const cursorMoved = cursor.x !== lastCursorX || cursor.y !== lastCursorY;
+	lastCursorX = cursor.x;
+	lastCursorY = cursor.y;
+
+	const now = performance.now();
+	if (cursorMoved) lastCursorMovedAt = now;
+	const motionBurstActive =
+		now - lastCursorMovedAt < POST_MOTION_SAMPLE_BURST_MS;
+	if (
+		!motionBurstActive &&
+		now - lastSampleAttemptAt < STATIONARY_SAMPLE_INTERVAL_MS
+	) {
+		return;
+	}
+
 	const frame = uiWindow.window.getFrame();
 	const overSelf =
 		cursor.x >= frame.x &&
@@ -504,47 +523,57 @@ setInterval(() => {
 		cursor.x < frame.x + frame.width &&
 		cursor.y < frame.y + frame.height;
 	if (overSelf) return;
-	sampling = true;
-	sampleAround(cursor.x, cursor.y)
-		.catch(() => {})
-		.finally(() => {
-			sampling = false;
-		});
-}, 150);
+	lastSampleAttemptAt = now;
+	const captured = sampleAround(cursor.x, cursor.y);
+	setCaptureAvailable(captured);
+	if (!captured && !warnedCaptureUnavailable) {
+		console.warn(
+			IS_WAYLAND_SESSION ?
+				"[ui-color-picker] Waiting for Wayland monitor sharing and the first frame."
+			: "[ui-color-picker] Screen pixel capture is unavailable on the current display.",
+		);
+	}
+	warnedCaptureUnavailable = !captured;
+}, CURSOR_POLL_INTERVAL_MS);
 
 // Pick-mode click watcher: fast edge-detect poll while armed; a press
-// outside our window freezes.
-let pickPrevDown = false;
-setInterval(() => {
-	if (mode() !== "armed") {
-		pickPrevDown = false;
-		return;
-	}
-	const down = (Number(Screen.getMouseButtons()) & 1) === 1;
-	if (down && !pickPrevDown) {
-		const cursor = Screen.getCursorScreenPoint();
-		const frame = uiWindow.window.getFrame();
-		const inside =
-			cursor.x >= frame.x &&
-			cursor.y >= frame.y &&
-			cursor.x < frame.x + frame.width &&
-			cursor.y < frame.y + frame.height;
-		if (!inside) setMode("frozen");
-	}
-	pickPrevDown = down;
-}, 30);
+// outside our window freezes. Wayland deliberately uses the immediate freeze
+// button because passive global button observation is compositor-restricted.
+if (!IS_WAYLAND_SESSION) {
+	let pickPrevDown = false;
+	setInterval(() => {
+		if (mode() !== "armed") {
+			pickPrevDown = false;
+			return;
+		}
+		const down = (Number(Screen.getMouseButtons()) & 1) === 1;
+		if (down && !pickPrevDown) {
+			const cursor = Screen.getCursorScreenPoint();
+			const frame = uiWindow.window.getFrame();
+			const inside =
+				cursor.x >= frame.x &&
+				cursor.y >= frame.y &&
+				cursor.x < frame.x + frame.width &&
+				cursor.y < frame.y + frame.height;
+			if (!inside) setMode("frozen");
+		}
+		pickPrevDown = down;
+	}, 30);
+}
 
 // Ask for Screen Recording permission properly: shows the system prompt the
 // first time this app identity runs. After granting in System Settings the
 // app must be relaunched for capture to work (macOS TCC behavior).
-if (!Utils.screenCapture.hasAccess()) {
+if (process.platform === "darwin" && !Utils.screenCapture.hasAccess()) {
 	Utils.screenCapture.requestAccess();
 }
 setInterval(() => setHasScreenAccess(Utils.screenCapture.hasAccess()), 3000);
 
 console.log("[ui-color-picker] running (solid-effects-ok)");
-console.log(
-	Utils.screenCapture.hasAccess()
-		? "[ui-color-picker] Screen Recording permission granted."
-		: "[ui-color-picker] Awaiting Screen Recording permission (System Settings -> Privacy & Security). Relaunch after granting.",
-);
+if (process.platform === "darwin") {
+	console.log(
+		Utils.screenCapture.hasAccess()
+			? "[ui-color-picker] Screen Recording permission granted."
+			: "[ui-color-picker] Awaiting Screen Recording permission (System Settings -> Privacy & Security). Relaunch after granting.",
+	);
+}

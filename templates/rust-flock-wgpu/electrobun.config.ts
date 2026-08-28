@@ -9,7 +9,8 @@ export default {
 	build: {
 		mainProcess: "rust",
 		rust: {
-			entrypoint: "src/rust/main.rs",
+			manifest: "Cargo.toml",
+			binary: "main",
 		},
 		views: {
 			mainview: {

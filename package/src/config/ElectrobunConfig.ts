@@ -143,8 +143,9 @@ export interface ElectrobunConfig {
 		 * Main process implementation to build and package.
 		 * - "bun": bundle and run the Bun main process entrypoint
 		 * - "cottontail": bundle and run the Cottontail main process entrypoint
-		 * - "zig": compile and run the Zig main process entrypoint
-		 * - "rust": compile and run the Rust main process entrypoint
+		 * - "zig": run the project-owned root `build.zig` and package its
+		 *   `main` artifact
+		 * - "rust": build and run a Cargo binary target
 		 * - "go": compile and run the Go main process entrypoint
 		 * - "odin": compile and run the Odin main process entrypoint
 		 * @default "cottontail"
@@ -173,6 +174,48 @@ export interface ElectrobunConfig {
 			 * @default "src/bun/index.ts"
 			 */
 			entrypoint?: string;
+
+			/**
+			 * Cottontail standard-library capabilities to ship with the app.
+			 *
+			 * Hutch scans the final tree-shaken main-process bundle for capability
+			 * usage. Entries here are additive explicit includes for dynamic or
+			 * otherwise unscannable usage.
+			 */
+			capabilities?: string[];
+
+			/**
+			 * Ship the main process as precompiled JavaScriptCore bytecode
+			 * instead of (or alongside) source. Cottontail-only.
+			 *
+			 * > **Coming soon.** This option is declared but not yet wired —
+			 * > setting it is currently a no-op (the app ships normal source).
+			 * > Build-time bytecode/obfuscation lands as a fast-follow after
+			 * > Electrobun 2.0; the underlying Cottontail/JSC support is already
+			 * > in place.
+			 *
+			 * - `false` (default): ship JavaScript source. Normal builds.
+			 * - `true`: compile the main process to bytecode for faster startup
+			 *   (skips parsing at launch). Source is still shipped as a fallback,
+			 *   so the app stays fully debuggable and `Function.prototype.toString`
+			 *   returns real source. Low risk — a version mismatch falls back to
+			 *   parsing the source.
+			 * - `"obfuscate"`: bytecode **and** strip the source. Ships only
+			 *   bytecode, so the app's source is not distributed. Tradeoffs:
+			 *   `Function.prototype.toString` returns `[native code]` (can break
+			 *   libraries that introspect function source), error stacks lose
+			 *   source frames, no sourcemaps, and there is no source fallback
+			 *   (a runtime/version mismatch is a hard error rather than a reparse).
+			 *   This is source obfuscation, not encryption.
+			 *
+			 * Dev builds (`--env=dev`) ignore this and always ship source so
+			 * sourcemaps, the debugger, and hot reload keep working. The
+			 * bytecode is generated against the exact Cottontail bundled into
+			 * this app and regenerated on every build.
+			 *
+			 * @default false
+			 */
+			bytecode?: boolean | "obfuscate";
 		} & BundlerOptions;
 
 		/**
@@ -181,10 +224,10 @@ export interface ElectrobunConfig {
 		 */
 		zig?: {
 			/**
-			 * Entry point for the main Zig process
-			 * @default "src/zig/main.zig"
+			 * Exact Zig toolchain override. When omitted, Hutch uses the default
+			 * declared by the selected Electrobun devkit.
 			 */
-			entrypoint?: string;
+			version?: string;
 		};
 
 		/**
@@ -193,10 +236,23 @@ export interface ElectrobunConfig {
 		 */
 		rust?: {
 			/**
-			 * Entry point for the main Rust process
-			 * @default "src/rust/main.rs"
+			 * Exact Rust toolchain override. When omitted, Hutch uses the default
+			 * declared by the selected Electrobun devkit.
 			 */
-			entrypoint?: string;
+			version?: string;
+
+			/**
+			 * Project-owned Cargo manifest for the Rust main process.
+			 * @default "Cargo.toml"
+			 */
+			manifest?: string;
+
+			/**
+			 * Cargo binary target staged as the Electrobun main process.
+			 * @default "main"
+			 */
+			binary?: string;
+
 		};
 
 		/**
@@ -205,10 +261,19 @@ export interface ElectrobunConfig {
 		 */
 		go?: {
 			/**
-			 * Entry point for the main Go process
-			 * @default "src/go/main.go"
+			 * Exact Go toolchain override. When omitted, Hutch uses the default
+			 * declared by the selected Electrobun devkit.
 			 */
-			entrypoint?: string;
+			version?: string;
+
+			/**
+			 * Main package to compile from the project-owned Go module.
+			 * Hutch runs `go build` from the project root and passes this value as
+			 * the package argument; it never synthesizes a GOPATH or copies source.
+			 * @default "./src/go"
+			 */
+			package?: string;
+
 		};
 
 		/**
@@ -219,6 +284,12 @@ export interface ElectrobunConfig {
 		 * Build Tools required on Windows). See docs for details.
 		 */
 		odin?: {
+			/**
+			 * Exact Odin toolchain release override. When omitted, Hutch uses the
+			 * default declared by the selected Electrobun devkit.
+			 */
+			version?: string;
+
 			/**
 			 * Entry point for the main Odin process. May be a .odin file or a
 			 * package directory; a file entrypoint compiles its containing
@@ -244,19 +315,23 @@ export interface ElectrobunConfig {
 
 		/**
 		 * Files to copy directly to the build output
-		 * Key is source path, value is destination path
+		 * Key is a project source path. The value is a safe relative path inside
+		 * the packaged application; absolute paths and `.` / `..` components are
+		 * rejected.
 		 */
 		copy?: {
 			[sourcePath: string]: string;
 		};
 		/**
-		 * Output folder for built application
+		 * Project-relative output folder for the built application. Nested paths
+		 * are allowed; absolute paths and `.` / `..` components are rejected.
 		 * @default "build"
 		 */
 		buildFolder?: string;
 
 		/**
-		 * Output folder for distribution artifacts
+		 * Project-relative output folder for distribution artifacts. Nested paths
+		 * are allowed; absolute paths and `.` / `..` components are rejected.
 		 * @default "artifacts"
 		 */
 		artifactFolder?: string;
@@ -572,7 +647,7 @@ export interface ElectrobunConfig {
 		baseUrl?: string;
 		/**
 		 * Generate delta patch files by diffing against the previous release.
-		 * Disable to skip patch generation for local canary/production testing.
+		 * Disable to skip patch generation for local canary/stable testing.
 		 * @default true
 		 */
 		generatePatch?: boolean;

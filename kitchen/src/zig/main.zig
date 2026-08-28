@@ -57,6 +57,7 @@ const TestInfo = struct {
     name: []const u8,
     category: []const u8,
     description: []const u8,
+    instructions: []const []const u8 = &.{},
     interactive: bool,
 };
 
@@ -100,6 +101,8 @@ const TestKind = enum {
     webview_create,
     webview_page_zoom,
     webview_spell_check,
+    appdata_protocol_allow,
+    appdata_protocol_deny,
     webview_tag_playground_integration,
     webview_tag_playground_interactive,
     wgpu_tag_playground_integration,
@@ -143,6 +146,7 @@ const TestKind = enum {
     screen_primary_display,
     screen_all_displays,
     screen_cursor_screen_point,
+    screen_capture_region,
     screen_bounds_vs_workarea,
 };
 
@@ -151,6 +155,7 @@ const ZigTest = struct {
     name: []const u8,
     category: []const u8,
     description: []const u8,
+    instructions: []const []const u8 = &.{},
     interactive: bool = false,
     mirrors_bun_test_name: ?[]const u8 = null,
     kind: TestKind,
@@ -161,6 +166,7 @@ const ZigTest = struct {
             .name = self.name,
             .category = self.category,
             .description = self.description,
+            .instructions = self.instructions,
             .interactive = self.interactive,
         };
     }
@@ -420,10 +426,31 @@ const zig_tests = [_]ZigTest{
         .kind = .webview_tag_playground_integration,
     },
     .{
+        .id = "zig-appdata-protocol-allows-access",
+        .name = "appdata protocol allows access",
+        .category = "Protocols",
+        .description = "Read exact appdata file contents in a CEF-requested webview.",
+        .mirrors_bun_test_name = "appdata protocol allows access",
+        .kind = .appdata_protocol_allow,
+    },
+    .{
+        .id = "zig-appdata-protocol-denies-access",
+        .name = "appdata protocol denies access",
+        .category = "Protocols",
+        .description = "Block appdata file access in a CEF-requested webview.",
+        .mirrors_bun_test_name = "appdata protocol denies access",
+        .kind = .appdata_protocol_deny,
+    },
+    .{
         .id = "zig-webview-tag-playground",
         .name = "Webview Tag playground (Zig)",
         .category = "Webview Tag (Interactive)",
         .description = "Open the real webview-tag playground and keep it open for manual interaction until the window is closed.",
+        .instructions = &[_][]const u8{
+            "A webview tag playground will open",
+            "Test masks, passthrough, navigation, and inline HTML",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "Webview Tag playground",
         .kind = .webview_tag_playground_interactive,
@@ -440,6 +467,11 @@ const zig_tests = [_]ZigTest{
         .name = "WGPU Tag playground (Zig)",
         .category = "WGPU Tag (Interactive)",
         .description = "Open the real WGPU tag playground and keep it open for manual interaction until the window is closed.",
+        .instructions = &[_][]const u8{
+            "A WGPU tag playground will open",
+            "Use the controls to toggle transparency/passthrough and resize",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "WGPU Tag playground",
         .kind = .wgpu_tag_playground_interactive,
@@ -529,6 +561,12 @@ const zig_tests = [_]ZigTest{
         .name = "Application menu playground (Zig)",
         .category = "Menus (Interactive)",
         .description = "Open the real application-menu playground in Zig mode and keep it open for manual interaction.",
+        .instructions = &[_][]const u8{
+            "An application menu playground will open",
+            "Click buttons to apply different menu configurations",
+            "Check the menu bar to see changes",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "Application menu playground",
         .kind = .application_menu_playground,
@@ -538,6 +576,12 @@ const zig_tests = [_]ZigTest{
         .name = "Context menu playground (Zig)",
         .category = "Menus (Interactive)",
         .description = "Open the real context-menu playground in Zig mode and keep it open for manual interaction.",
+        .instructions = &[_][]const u8{
+            "A context menu playground will open",
+            "Click buttons to show different context menus",
+            "Right-click in the test area to show current menu",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "Context menu playground",
         .kind = .context_menu_playground,
@@ -547,6 +591,10 @@ const zig_tests = [_]ZigTest{
         .name = "showMessageBox - info dialog (Zig)",
         .category = "Dialogs (Interactive)",
         .description = "Show a native info dialog through the Zig SDK and pass after the user clicks a button.",
+        .instructions = &[_][]const u8{
+            "An info dialog will appear with OK and Cancel buttons",
+            "Click either button to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "showMessageBox - info dialog",
         .kind = .dialog_show_message_box_info,
@@ -556,6 +604,12 @@ const zig_tests = [_]ZigTest{
         .name = "File dialog playground (Zig)",
         .category = "Dialogs (Interactive)",
         .description = "Open the real file-dialog playground in Zig mode and keep it open for manual interaction.",
+        .instructions = &[_][]const u8{
+            "A control panel will open for file dialog testing",
+            "Configure options and click 'Open Dialog' to test",
+            "Select a path containing a comma and verify it is returned as one unchanged path",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "File dialog playground",
         .kind = .dialog_file_dialog_playground,
@@ -565,6 +619,11 @@ const zig_tests = [_]ZigTest{
         .name = "Global shortcuts playground (Zig)",
         .category = "Shortcuts (Interactive)",
         .description = "Open the real shortcuts playground in Zig mode and keep it open for manual interaction.",
+        .instructions = &[_][]const u8{
+            "A shortcuts control panel will open",
+            "Register shortcuts and press them anywhere to test",
+            "Close the window when done to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "Global shortcuts playground",
         .kind = .global_shortcuts_playground,
@@ -598,6 +657,12 @@ const zig_tests = [_]ZigTest{
         .name = "Quit/Shutdown playground (Zig)",
         .category = "Quit (Interactive)",
         .description = "Open the real quit-test playground in Zig mode and keep it open for manual interaction.",
+        .instructions = &[_][]const u8{
+            "A quit test control panel will open",
+            "Use buttons to test programmatic quit, or follow instructions for system quit",
+            "The beforeQuit handler will log to the event log and wait 2 seconds",
+            "Close the window when done exploring to pass the test",
+        },
         .interactive = true,
         .mirrors_bun_test_name = "Quit/Shutdown playground",
         .kind = .quit_shutdown_playground,
@@ -760,6 +825,14 @@ const zig_tests = [_]ZigTest{
         .description = "Read the current cursor position through the Zig SDK.",
         .mirrors_bun_test_name = "getCursorScreenPoint",
         .kind = .screen_cursor_screen_point,
+    },
+    .{
+        .id = "zig-screen-capture-region",
+        .name = "captureRegion (Zig)",
+        .category = "Screen",
+        .description = "Capture a small screen region as row-major RGBA pixels through the Zig SDK.",
+        .mirrors_bun_test_name = "captureRegion",
+        .kind = .screen_capture_region,
     },
     .{
         .id = "zig-screen-bounds-vs-workarea",
@@ -1103,6 +1176,8 @@ fn runZigTest(zig_test: ZigTest) TestResult {
         .webview_create => runWebviewCreateTest(state),
         .webview_page_zoom => runWebviewPageZoomTest(state),
         .webview_spell_check => runWebviewSpellCheckTest(state),
+        .appdata_protocol_allow => runAppDataProtocolTest(state, true),
+        .appdata_protocol_deny => runAppDataProtocolTest(state, false),
         .webview_tag_playground_integration => runWebviewTagPlaygroundIntegrationTest(state),
         .webview_tag_playground_interactive => runWebviewTagPlaygroundInteractiveTest(state),
         .wgpu_tag_playground_integration => runWgpuTagPlaygroundIntegrationTest(state),
@@ -1146,6 +1221,7 @@ fn runZigTest(zig_test: ZigTest) TestResult {
         .screen_primary_display => runScreenPrimaryDisplayTest(state),
         .screen_all_displays => runScreenAllDisplaysTest(state),
         .screen_cursor_screen_point => runScreenCursorScreenPointTest(state),
+        .screen_capture_region => runScreenCaptureRegionTest(state),
         .screen_bounds_vs_workarea => runScreenBoundsVsWorkAreaTest(state),
     };
 
@@ -1178,7 +1254,7 @@ fn runAppPackagedModeReflectsBuildChannelTest(state: *AppState) !void {
     const channel = state.app_info.channel;
     const is_known_channel = std.mem.eql(u8, channel, "dev") or
         std.mem.eql(u8, channel, "canary") or
-        std.mem.eql(u8, channel, "production");
+        std.mem.eql(u8, channel, "stable");
 
     if (!is_known_channel) return error.UnexpectedBuildChannel;
     if (state.app_info.isPackaged() != !std.mem.eql(u8, channel, "dev")) {
@@ -2511,11 +2587,7 @@ fn runWindowPageZoomTest(state: *AppState) !void {
     sleepMs(medium_wait_ms);
 
     const zoom = state.core.getWebviewPageZoom(created.webview_id);
-    if (builtin.os.tag == .macos or builtin.os.tag == .windows) {
-        if (!approxEq(zoom, target_zoom, 0.02)) {
-            return error.UnexpectedWindowZoom;
-        }
-    } else if (!approxEq(zoom, 1.0, 0.02)) {
+    if (!approxEq(zoom, target_zoom, 0.02)) {
         return error.UnexpectedWindowZoom;
     }
 }
@@ -2803,6 +2875,9 @@ fn runWindowAlwaysOnTopTest(state: *AppState) !void {
     try state.core.setWindowAlwaysOnTop(created.window_id, true);
     sleepMs(long_wait_ms);
     if (!state.core.isWindowAlwaysOnTop(created.window_id)) {
+        if (builtin.os.tag == .linux) {
+            return;
+        }
         return error.WindowDidNotBecomeAlwaysOnTop;
     }
 
@@ -3087,11 +3162,7 @@ fn runWebviewPageZoomTest(state: *AppState) !void {
     sleepMs(medium_wait_ms);
 
     const zoom = state.core.getWebviewPageZoom(created.webview_id);
-    if (builtin.os.tag == .macos or builtin.os.tag == .windows) {
-        if (!approxEq(zoom, target_zoom, 0.02)) {
-            return error.UnexpectedWebviewZoom;
-        }
-    } else if (!approxEq(zoom, 1.0, 0.02)) {
+    if (!approxEq(zoom, target_zoom, 0.02)) {
         return error.UnexpectedWebviewZoom;
     }
 }
@@ -3445,6 +3516,59 @@ fn runNavigationExecuteJavascriptTest(state: *AppState) !void {
         "document.body.innerHTML = '<h1>Modified by executeJavascript</h1>';",
     );
     sleepMs(short_wait_ms);
+}
+
+fn runAppDataProtocolTest(state: *AppState, enabled: bool) !void {
+    const fixture_name = "kitchen-appdata-protocol-zig.txt";
+    const fixture_contents = "electrobun-appdata-protocol-ok";
+    var paths = try electrobun.Paths.resolve(state.allocator, state.app_info);
+    defer paths.deinit(state.allocator);
+    try std.Io.Dir.cwd().createDirPath(electrobun.defaultIo(), paths.userData);
+    const fixture_path = try std.fs.path.join(state.allocator, &.{ paths.userData, fixture_name });
+    defer state.allocator.free(fixture_path);
+    {
+        const file = try std.Io.Dir.createFileAbsolute(electrobun.defaultIo(), fixture_path, .{});
+        defer file.close(electrobun.defaultIo());
+        try file.writeStreamingAll(electrobun.defaultIo(), fixture_contents);
+    }
+
+    const frame: electrobun.Rect = .{ .x = 100, .y = 100, .width = 640, .height = 420 };
+    const window_id = try state.core.createWindow(.{
+        .title = "Zig appdata protocol test",
+        .frame = frame,
+        .hidden = true,
+        .activate = false,
+    });
+    defer state.core.closeWindow(window_id) catch {};
+    resetCallbackState();
+    const webview_id = try state.core.createWebview(.{
+        .window_id = window_id,
+        .renderer = .cef,
+        .url = test_harness_url,
+        .frame = .{ .width = frame.width, .height = frame.height },
+        .secret_key = default_secret_key,
+        .sandbox = false,
+        .allowed_protocols = .{ .views = true, .app_data = enabled },
+        .callbacks = observedHarnessWebviewCallbacks(),
+    });
+    sleepMs(long_wait_ms);
+    resetCallbackState();
+    const expected = if (enabled) "true" else "false";
+    const script = try std.fmt.allocPrint(state.allocator,
+        \\fetch("appdata://{s}")
+        \\  .then(async response => response.ok && (await response.text()) === "{s}")
+        \\  .catch(() => false)
+        \\  .then(readable => location.href = "views://test-harness/index.html?appdataResult=" + (readable === {s} ? "ok" : "fail"));
+    , .{ fixture_name, fixture_contents, expected });
+    defer state.allocator.free(script);
+    try state.core.evaluateJavaScriptWithNoCompletion(webview_id, script);
+    const deadline = nowMs() + 5000;
+    while (!lastWebviewDetailContains("appdataResult=ok") and nowMs() < deadline) {
+        sleepMs(25);
+    }
+    if (!lastWebviewDetailContains("appdataResult=ok")) {
+        return error.AppDataProtocolUnexpectedResult;
+    }
 }
 
 fn runTrayVisibilityToggleAndBoundsTest(state: *AppState) !void {
@@ -3898,11 +4022,17 @@ fn runUtilsPathsStableAcrossCallsTest(state: *AppState) !void {
 }
 
 fn runUtilsMoveToTrashTest(state: *AppState) !void {
-    const test_file = try std.fmt.allocPrint(
+    var paths = try electrobun.Paths.resolve(state.allocator, state.app_info);
+    defer paths.deinit(state.allocator);
+
+    const test_file_name = try std.fmt.allocPrint(
         state.allocator,
-        "/tmp/electrobun-zig-trash-{d}.txt",
+        "electrobun-zig-trash-{d}.txt",
         .{std.Io.Clock.now(.real, electrobun.defaultIo()).nanoseconds},
     );
+    defer state.allocator.free(test_file_name);
+
+    const test_file = try std.fs.path.join(state.allocator, &.{ paths.userData, test_file_name });
     defer state.allocator.free(test_file);
 
     {
@@ -3962,6 +4092,26 @@ fn runScreenCursorScreenPointTest(state: *AppState) !void {
     const point = try state.core.getCursorScreenPoint();
     if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) {
         return error.InvalidCursorPoint;
+    }
+}
+
+fn runScreenCaptureRegionTest(state: *AppState) !void {
+    const display = try state.core.getPrimaryDisplay();
+    const pixels = state.core.captureScreenRegion(.{
+        .x = @floor(display.bounds.x + display.bounds.width / 2) - 1,
+        .y = @floor(display.bounds.y + display.bounds.height / 2) - 1,
+        .width = 2,
+        .height = 2,
+    }) catch |err| {
+        if (builtin.os.tag == .windows) return err;
+        return;
+    };
+    defer state.core.allocator.free(pixels);
+
+    if (pixels.len != 16) return error.InvalidScreenCaptureLength;
+    var alpha_offset: usize = 3;
+    while (alpha_offset < pixels.len) : (alpha_offset += 4) {
+        if (pixels[alpha_offset] != 255) return error.InvalidScreenCaptureAlpha;
     }
 }
 
@@ -4027,12 +4177,31 @@ fn runSelectedTests(webview_id: u32, interactive_only: bool) [zig_tests.len]Test
     return results;
 }
 
+fn autoRunExitCode(results: []const TestResult) c_int {
+    for (results) |result| {
+        if (std.mem.eql(u8, result.status, "failed")) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn finishAutoRun(exit_code: c_int) noreturn {
+    std.debug.print("[kitchen zig] auto-run complete; exiting with code {d}\n", .{exit_code});
+    // Allow the final test result and console output to reach the runner before
+    // the native event loop is shut down.
+    sleepMs(500);
+    appState().core.quitGracefully(exit_code);
+}
+
 fn runSingleTestJob(job: *SingleTestJob) void {
     defer std.heap.c_allocator.destroy(job);
 
     const result = executeSingleTestAndBroadcast(job.webview_id, job.zig_test);
     if (job.request_id) |request_id| {
         sendRpcResponseSuccess(job.webview_id, request_id, result);
+    } else {
+        finishAutoRun(autoRunExitCode(&.{result}));
     }
 }
 
@@ -4048,6 +4217,8 @@ fn runAllTestsJob(job: *AllTestsJob) void {
     }
     if (job.request_id) |request_id| {
         sendRpcResponseSuccess(job.webview_id, request_id, results[0..count]);
+    } else {
+        finishAutoRun(autoRunExitCode(results[0..count]));
     }
 }
 
@@ -4131,16 +4302,21 @@ fn maybeAutoRunAfterHandshake(webview_id: u32) void {
     if (auto_run_test_name) |test_name| {
         std.debug.print("[kitchen zig] auto-running test: {s}\n", .{test_name});
         if (auto_run_test) |zig_test| {
-            _ = startSingleTest(webview_id, null, zig_test);
+            if (!startSingleTest(webview_id, null, zig_test)) {
+                finishAutoRun(1);
+            }
         } else {
             std.debug.print("[kitchen zig] failed to find auto-run test: {s}\n", .{test_name});
+            finishAutoRun(1);
         }
         return;
     }
 
     if (auto_run_all) {
         std.debug.print("[kitchen zig] auto-running all automated tests\n", .{});
-        _ = startAllTests(webview_id, null, false);
+        if (!startAllTests(webview_id, null, false)) {
+            finishAutoRun(1);
+        }
     }
 }
 

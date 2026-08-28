@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
+import { parseStrictSemVer } from "../package/src/shared/strict-semver.js";
 
 export const TEMPLATE_SCHEMA = 1;
 export const TEMPLATE_BUCKET = "electrobun-artifacts";
@@ -27,24 +29,25 @@ const repositoryRoot = dirname(dirname(scriptPath));
 const templatesRoot = join(repositoryRoot, "templates");
 const packageRoot = join(repositoryRoot, "package");
 const outputRoot = join(repositoryRoot, ".template-release");
-const skippedFiles = new Set([
-	"bun.lock",
-	"bun.lockb",
-	"package-lock.json",
-	"pnpm-lock.yaml",
-	"yarn.lock",
-	".DS_Store",
-]);
+const skippedFiles = new Set([".DS_Store"]);
+const electrobunProductConfigPattern =
+	/(?:^|[{,]\s*)(?:electrobun|["']electrobun["'])\s*:/s;
 
 function fail(message) {
 	throw new Error(`Electrobun templates: ${message}`);
 }
 
-export function releaseChannel(version) {
-	if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-		fail(`invalid release version ${JSON.stringify(version)}`);
+function exactSemVer(value, label) {
+	const parsed = parseStrictSemVer(value);
+	if (!parsed) {
+		fail(`${label} must be an exact SemVer 2.0.0 version, got ${JSON.stringify(value)}`);
 	}
-	return version.includes("-") ? "canary" : "production";
+	return { version: value, parsed };
+}
+
+export function releaseChannel(version) {
+	const { parsed } = exactSemVer(version, "invalid release version");
+	return parsed.prerelease === null ? "stable" : "beta";
 }
 
 export function templateArtifactKey(checksum) {
@@ -53,15 +56,15 @@ export function templateArtifactKey(checksum) {
 }
 
 export function templateChannelKey(channel) {
-	if (channel !== "production" && channel !== "canary") {
+	if (channel !== "stable" && channel !== "beta") {
 		fail(`invalid template channel ${JSON.stringify(channel)}`);
 	}
 	return `${TEMPLATE_PREFIX}/channels/${channel}.json`;
 }
 
-export function parseDashPragma(source) {
-	const line = source.match(/^\/\/\s*@dash\s+([^\r\n]+)$/m)?.[1];
-	if (!line) fail("package/dash.config.ts is missing its // @dash pragma");
+export function parseHutchPragma(source) {
+	const line = source.match(/^\/\/\s*@hutch\s+([^\r\n]+)$/m)?.[1];
+	if (!line) fail("package/hutch.config.ts is missing its // @hutch pragma");
 	const values = Object.fromEntries(
 		line
 			.trim()
@@ -69,25 +72,111 @@ export function parseDashPragma(source) {
 			.map((entry) => entry.split("=", 2)),
 	);
 	if (!values.cli || !values.cottontail) {
-		fail("package/dash.config.ts must pin cli and cottontail");
+		fail("package/hutch.config.ts must pin cli and cottontail");
 	}
+	exactSemVer(values.cli, "Hutch CLI pin");
+	exactSemVer(values.cottontail, "Cottontail pin");
 	return { hutch: values.cli, cottontail: values.cottontail };
 }
 
-export function pinElectrobunDependency(manifest, version) {
-	let found = false;
-	for (const field of [
-		"dependencies",
-		"devDependencies",
-		"optionalDependencies",
-	]) {
-		if (manifest[field]?.electrobun !== undefined) {
-			manifest[field].electrobun = version;
-			found = true;
-		}
+// Repository templates deliberately carry neither release-toolchain metadata
+// nor a product pin. Local development supplies the exact unpublished devkit
+// out of band; publication turns this canonical source form into a standalone,
+// exact-pinned project only in the staging directory.
+export function assertRepositoryTemplateConfig(templateId, source) {
+	if (/^\/\/\s*@hutch\b/m.test(source)) {
+		fail(
+			`${templateId} repository hutch.config.ts must not carry a // @hutch pragma`,
+		);
 	}
-	if (!found) fail(`${manifest.name ?? "template"} does not depend on electrobun`);
-	return manifest;
+	if (electrobunProductConfigPattern.test(source)) {
+		fail(
+			`${templateId} repository hutch.config.ts must not select electrobun; publication adds the release pin`,
+		);
+	}
+	const config = evaluateCanonicalTemplateConfig(templateId, source);
+	if (propertyExistsWithoutReading(config, "electrobun")) {
+		fail(
+			`${templateId} repository hutch.config.ts must not select electrobun; publication adds the release pin`,
+		);
+	}
+}
+
+function evaluateCanonicalTemplateConfig(templateId, source) {
+	// Keep the supported source shape intentionally narrow. This is a release
+	// transform, so an unfamiliar or ambiguous config must stop publication
+	// rather than receive a best-effort textual rewrite.
+	const exports = [...source.matchAll(/^export default \{(\r?\n)/gm)];
+	if (exports.length !== 1 || exports[0].index !== 0) {
+		fail(
+			`${templateId} repository hutch.config.ts must begin with exactly one top-level "export default {" line; found ${exports.length}`,
+		);
+	}
+
+	const newline = exports[0][1];
+	if (!source.endsWith(`};${newline}`)) {
+		fail(
+			`${templateId} repository hutch.config.ts must end with a top-level "};" line`,
+		);
+	}
+
+	const expression = source.slice(
+		"export default ".length,
+		-(`;${newline}`).length,
+	);
+	let config;
+	try {
+		config = runInNewContext(`(${expression})`, Object.create(null), {
+			timeout: 1_000,
+		});
+	} catch (error) {
+		fail(
+			`${templateId} repository hutch.config.ts must be a self-contained object literal: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (config === null || typeof config !== "object" || Array.isArray(config)) {
+		fail(`${templateId} repository hutch.config.ts default export must be an object`);
+	}
+	return config;
+}
+
+function propertyExistsWithoutReading(value, key) {
+	let current = value;
+	while (current !== null) {
+		if (Object.getOwnPropertyDescriptor(current, key)) return true;
+		current = Object.getPrototypeOf(current);
+	}
+	return false;
+}
+
+export function pinPublishedTemplateConfig(templateId, source, version) {
+	exactSemVer(version, `${templateId} published Electrobun version`);
+	assertRepositoryTemplateConfig(templateId, source);
+
+	const newline = source.startsWith("export default {\r\n") ? "\r\n" : "\n";
+	const insertion = [
+		"\telectrobun: {",
+		`\t\tversion: ${JSON.stringify(version)},`,
+		"\t},",
+	].join(newline);
+	const closing = `};${newline}`;
+	const pinned = `${source.slice(0, -closing.length)}${insertion}${newline}${closing}`;
+	const config = evaluateCanonicalTemplateConfig(templateId, pinned);
+	const descriptor = Object.getOwnPropertyDescriptor(config, "electrobun");
+	if (
+		!descriptor ||
+		!("value" in descriptor) ||
+		descriptor.value === null ||
+		typeof descriptor.value !== "object" ||
+		Array.isArray(descriptor.value) ||
+		Object.keys(descriptor.value).length !== 1 ||
+		descriptor.value.version !== version
+	) {
+		fail(
+			`${templateId} published hutch.config.ts does not resolve to the exact Electrobun version ${JSON.stringify(version)}`,
+		);
+	}
+	return pinned;
 }
 
 function sha256(value) {
@@ -95,14 +184,17 @@ function sha256(value) {
 }
 
 function gitRevision() {
-	const revision =
-		process.env.GITHUB_SHA ??
-		execFileSync("git", ["rev-parse", "HEAD"], {
+	let revision;
+	try {
+		revision = execFileSync("git", ["rev-parse", "HEAD"], {
 			cwd: repositoryRoot,
 			encoding: "utf8",
 		}).trim();
+	} catch {
+		fail("could not resolve the checked-out Git revision");
+	}
 	if (!/^[0-9a-f]{40}$/.test(revision)) {
-		fail(`invalid Git revision ${JSON.stringify(revision)}`);
+		fail(`invalid checked-out Git revision ${JSON.stringify(revision)}`);
 	}
 	return revision;
 }
@@ -131,6 +223,23 @@ function titleFromId(id) {
 		.split("-")
 		.map((part) => names.get(part) ?? `${part[0].toUpperCase()}${part.slice(1)}`)
 		.join(" ");
+}
+
+export function templateMetadata(templateId, manifest = {}) {
+	const name = titleFromId(templateId);
+	const descriptions = new Map([
+		[
+			"all",
+			"Install, build, and launch every other Electrobun beta template from one QA dashboard",
+		],
+	]);
+	return {
+		name,
+		description:
+			manifest.description ??
+			descriptions.get(templateId) ??
+			`${name} Electrobun template`,
+	};
 }
 
 function templateMainProcess(source) {
@@ -165,49 +274,43 @@ function createTemplateArchive(templateId, sourceRoot, archivePath) {
 	}
 }
 
-function stageTemplate({ templateId, version, pins, stageRoot, archiveRoot }) {
+function stageTemplate({ templateId, version, stageRoot, archiveRoot }) {
 	const destination = join(stageRoot, templateId);
 	mkdirSync(destination, { recursive: true });
 	copyTrackedTemplate(templateId, destination);
 
 	const manifestPath = join(destination, "package.json");
-	if (!existsSync(manifestPath)) fail(`${templateId} is missing package.json`);
-	const manifest = pinElectrobunDependency(
-		JSON.parse(readFileSync(manifestPath, "utf8")),
-		version,
-	);
-	writeFileSync(manifestPath, `${JSON.stringify(manifest, null, "\t")}\n`);
+	const manifest = existsSync(manifestPath)
+		? JSON.parse(readFileSync(manifestPath, "utf8"))
+		: {};
 
 	const configPath = join(destination, "electrobun.config.ts");
 	if (!existsSync(configPath)) fail(`${templateId} is missing electrobun.config.ts`);
-	const mainProcess = templateMainProcess(readFileSync(configPath, "utf8"));
-	const dashConfigPath = join(destination, "dash.config.ts");
-	if (existsSync(dashConfigPath)) {
-		const source = readFileSync(dashConfigPath, "utf8");
-		const pragma = `// @dash cli=${pins.hutch} cottontail=${pins.cottontail}`;
-		const updated = /^\/\/\s*@dash[^\r\n]*$/m.test(source)
-			? source.replace(/^\/\/\s*@dash[^\r\n]*$/m, pragma)
-			: `${pragma}\n${source}`;
-		writeFileSync(dashConfigPath, updated);
-	} else {
-		writeFileSync(
-			dashConfigPath,
-			`// @dash cli=${pins.hutch} cottontail=${pins.cottontail}\nexport default {};\n`,
-		);
+	const configSource = readFileSync(configPath, "utf8");
+	const mainProcess = templateMainProcess(configSource);
+	if (electrobunProductConfigPattern.test(configSource)) {
+		fail(`${templateId} electrobun.config.ts must not select the product version`);
 	}
+
+	const hutchConfigPath = join(destination, "hutch.config.ts");
+	if (!existsSync(hutchConfigPath)) fail(`${templateId} is missing hutch.config.ts`);
+	const hutchSource = readFileSync(hutchConfigPath, "utf8");
+	writeFileSync(
+		hutchConfigPath,
+		pinPublishedTemplateConfig(templateId, hutchSource, version),
+	);
 
 	const archivePath = join(archiveRoot, `${templateId}.tar.gz`);
 	createTemplateArchive(templateId, stageRoot, archivePath);
 	const archive = readFileSync(archivePath);
 	const checksum = sha256(archive);
 	const artifactKey = templateArtifactKey(checksum);
+	const metadata = templateMetadata(templateId, manifest);
 
 	return {
 		catalogEntry: {
 			id: templateId,
-			name: titleFromId(templateId),
-			description:
-				manifest.description ?? `${titleFromId(templateId)} Electrobun template`,
+			...metadata,
 			mainProcess,
 			archive: {
 				url: `${TEMPLATE_PUBLIC_BASE_URL}/${artifactKey}`,
@@ -225,7 +328,7 @@ function templateIds() {
 		.filter(
 			(entry) =>
 				entry.isDirectory() &&
-				existsSync(join(templatesRoot, entry.name, "package.json")),
+				existsSync(join(templatesRoot, entry.name, "electrobun.config.ts")),
 		)
 		.map((entry) => entry.name)
 		.sort();
@@ -319,8 +422,8 @@ export async function publishTemplates({ dryRun = false, channel: requestedChann
 		fail(`release ${version} belongs to ${channel}, not ${requestedChannel}`);
 	}
 	const revision = gitRevision();
-	const pins = parseDashPragma(
-		readFileSync(join(packageRoot, "dash.config.ts"), "utf8"),
+	const pins = parseHutchPragma(
+		readFileSync(join(packageRoot, "hutch.config.ts"), "utf8"),
 	);
 
 	rmSync(outputRoot, { recursive: true, force: true });
@@ -330,7 +433,7 @@ export async function publishTemplates({ dryRun = false, channel: requestedChann
 	mkdirSync(archiveRoot, { recursive: true });
 
 	const staged = templateIds().map((templateId) =>
-		stageTemplate({ templateId, version, pins, stageRoot, archiveRoot }),
+		stageTemplate({ templateId, version, stageRoot, archiveRoot }),
 	);
 	if (staged.length === 0) fail("no templates were found");
 
