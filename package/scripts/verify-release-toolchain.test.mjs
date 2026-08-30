@@ -115,6 +115,25 @@ test("pin:latest bootstraps through the old self-update verb before repinning", 
 	assert.doesNotMatch(config, /\bhutch cottontail update\b/);
 });
 
+test("release provenance probes the exact Hutch engine's compiled Cottontail pair", () => {
+	const verifier = readFileSync(
+		new URL("./verify-release-toolchain.mjs", import.meta.url),
+		"utf8",
+	);
+	assert.match(
+		verifier,
+		/run\(hutchExecutable, \["cottontail", "version"\], repositoryRoot\)/,
+	);
+	assert.match(
+		verifier,
+		/run\(hutchExecutable, \["cottontail", "path"\], repositoryRoot\)/,
+	);
+	assert.doesNotMatch(
+		verifier,
+		/run\("hutch", \["cottontail", "(?:version|path)", expectedCottontailChannel\]/,
+	);
+});
+
 test("release CI verifies provenance before all four Kitchen builds", () => {
 	// Normalize CRLF -> LF: on Windows runners Git checks the workflow out with
 	// CRLF, which breaks the explicit `\n` line separators in the regexes below.

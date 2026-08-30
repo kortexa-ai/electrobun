@@ -18,6 +18,17 @@ From a clean `main` checkout, run the release task in `package`:
 hutch push:beta
 ```
 
+For a complete pre-release pass on each desktop VM, run this from `package`:
+
+```sh
+hutch test:vm
+```
+
+It runs the Kitchen automated tests with the Cottontail main process and system
+webview, runs the complete install/update/uninstall lifecycle, and then runs
+`check:release`. All three stages run even if an earlier stage fails; the task
+prints a combined failure summary and exits nonzero at the end.
+
 The updater lifecycle is intentionally a local desktop-VM test and does not run
 as part of `check:release`, the `push:*` tasks, or release CI. When working on
 installer, updater, or uninstaller code, run `hutch test:updater-lifecycle` from

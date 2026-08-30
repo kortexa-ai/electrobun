@@ -236,27 +236,26 @@ export function verifyReleaseToolchain(environment = process.env) {
 		expectedHutch,
 		`${expectedHutchChannel} Hutch channel`,
 	);
-	assertEqual(
-		singleLine(
-			run("hutch", ["cottontail", "version", expectedCottontailChannel], repositoryRoot),
-			"paired Cottontail version",
-		),
-		expectedCottontail,
-		"paired Cottontail release",
-	);
-
 	const hutchExecutable = canonicalPath(
 		run("hutch", ["self", "path", expectedHutchChannel], repositoryRoot),
 		`${expectedHutchChannel} Hutch path`,
-	);
-	const cottontailExecutable = canonicalPath(
-		run("hutch", ["cottontail", "path", expectedCottontailChannel], repositoryRoot),
-		"paired Cottontail path",
 	);
 	assertEqual(
 		singleLine(run(hutchExecutable, ["--version"], repositoryRoot), "Hutch executable version"),
 		expectedHutch,
 		"Hutch executable",
+	);
+	assertEqual(
+		singleLine(
+			run(hutchExecutable, ["cottontail", "version"], repositoryRoot),
+			"paired Cottontail version",
+		),
+		expectedCottontail,
+		"paired Cottontail release",
+	);
+	const cottontailExecutable = canonicalPath(
+		run(hutchExecutable, ["cottontail", "path"], repositoryRoot),
+		"paired Cottontail path",
 	);
 	assertEqual(
 		singleLine(

@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createDevCommands, parseDevArgs } from "./dev.ts";
 import { createMatrixDevCommands } from "./dev-matrix.ts";
+import { createVmTestCommands, runVmTestCommands } from "./test-vm.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
@@ -12,6 +14,15 @@ function assertArray(actual: string[], expected: string[], message: string) {
 		`${message}: expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)}`,
 	);
 }
+
+const hutchConfig = readFileSync(
+	new URL("../hutch.config.ts", import.meta.url),
+	"utf8",
+);
+assert(
+	/"test:vm":\s*\["hutch", "scripts\/test-vm\.ts"\]/.test(hutchConfig),
+	"test:vm should use the failure-collecting VM test runner",
+);
 
 const packageDir = join("C:\\work tree", "electrobun", "package");
 const kitchenDir = join("C:\\work tree", "electrobun", "kitchen");
@@ -128,5 +139,43 @@ assert(
 		join(packageDir, "dist"),
 	"Kitchen matrix should preserve the local Electrobun devkit override",
 );
+
+const vmTestCommands = createVmTestCommands({ hutchBinary, packageDir });
+assert(vmTestCommands.length === 3, "VM test plan should have three stages");
+assertArray(
+	vmTestCommands[0]?.args ?? [],
+	["dev:matrix", "--with=cottontail:system"],
+	"Kitchen automated test argv",
+);
+assert(
+	vmTestCommands[0]?.env?.AUTO_RUN === "1",
+	"Kitchen automated tests should receive AUTO_RUN=1",
+);
+assertArray(
+	vmTestCommands[1]?.args ?? [],
+	["test:updater-lifecycle"],
+	"Updater lifecycle argv",
+);
+assertArray(
+	vmTestCommands[2]?.args ?? [],
+	["check:release"],
+	"Release check argv",
+);
+
+const attemptedVmStages: string[] = [];
+const vmFailures = await runVmTestCommands(
+	vmTestCommands,
+	async (command) => {
+		attemptedVmStages.push(command.label);
+		if (command !== vmTestCommands[2]) throw new Error(`${command.label} failed`);
+	},
+	() => {},
+);
+assertArray(
+	attemptedVmStages,
+	vmTestCommands.map((command) => command.label),
+	"VM runner should attempt every stage after failures",
+);
+assert(vmFailures.length === 2, "VM runner should collect every stage failure");
 
 console.log("Electrobun dev command plan passed");

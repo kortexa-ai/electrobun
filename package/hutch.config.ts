@@ -1,4 +1,4 @@
-// @hutch cli=0.26.0-canary.8 cottontail=0.6.0-canary.12
+// @hutch cli=0.26.0 cottontail=0.6.0
 export default {
 	packageManager: "npm",
 	scripts: {
@@ -14,6 +14,7 @@ export default {
 		"dev:matrix": ["hutch", "scripts/dev-matrix.ts"],
 		"dev:test":
 			"hutch scripts/dev.test.ts && hutch scripts/dev-template.test.ts && node --test scripts/clean-template-artifacts.test.mjs",
+		"test:vm": ["hutch", "scripts/test-vm.ts"],
 		"clean:templates": ["node", "scripts/clean-template-artifacts.mjs"],
 		"preview:installer-ui": "node scripts/preview-installer-ui.mjs",
 		"preview:installer-ui:error":
