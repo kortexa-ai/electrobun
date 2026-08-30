@@ -1240,6 +1240,33 @@ private:
         g_signal_connect(webView, "decide-policy", G_CALLBACK(&WpeBackend::onDecidePolicyStatic), impl);
         g_signal_connect(webView, "load-changed",  G_CALLBACK(&WpeBackend::onLoadChangedStatic),  impl);
         g_signal_connect(webView, "load-failed",   G_CALLBACK(&WpeBackend::onLoadFailedStatic),   impl);
+        // A bare kiosk has no browser chrome capable of presenting WebKit's
+        // camera/microphone permission prompt. Grant device media only to
+        // trusted application views; screen capture and untrusted views keep
+        // WebKit's default denial behavior.
+        g_signal_connect(webView, "permission-request",
+            G_CALLBACK(+[](WebKitWebView*, WebKitPermissionRequest* request,
+                           gpointer userData) -> gboolean {
+                auto* view = static_cast<WpeWebViewImpl*>(userData);
+                if (!view || !view->trusted_ ||
+                    !WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
+                    return FALSE;
+                }
+                auto* media = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
+                const bool audio =
+                    webkit_user_media_permission_is_for_audio_device(media);
+                const bool video =
+                    webkit_user_media_permission_is_for_video_device(media);
+                const bool display =
+                    webkit_user_media_permission_is_for_display_device(media);
+                if (display || (!audio && !video)) return FALSE;
+                webkit_permission_request_allow(request);
+                fprintf(stderr,
+                        "[WpeBackend] allowed trusted user media (%s%s)\n",
+                        audio ? "audio" : "",
+                        video ? (audio ? "+video" : "video") : "");
+                return TRUE;
+            }), impl);
 
         // Pre-load about:blank so the WebProcess is alive and the view is
         // ready to render the moment createWebview swaps in the user's URL.
