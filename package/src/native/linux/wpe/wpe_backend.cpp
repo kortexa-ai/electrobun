@@ -1540,7 +1540,11 @@ private:
         }
         static std::atomic<int> n{0};
         const int i = ++n;
-        if (i <= 3 || (i % 60) == 0) {
+        // Per-frame diagnostics turn into continuous storage writes when a
+        // kiosk captures stderr in journald. The first few exports are enough
+        // to prove that presentation started; steady-state health belongs in
+        // an intentionally rate-limited monitor.
+        if (i <= 3) {
             fprintf(stderr,
                     "[WpeBackend] onExportEgl #%d "
                     "(view %p, webviewId=%u, image=%ux%u)\n",
