@@ -507,7 +507,9 @@ struct EglReadback::Impl {
         }
 
         frameCount++;
-        if (frameCount == 1 || (frameCount % 120) == 0) {
+        // Avoid steady-state compositor logging. On an appliance this stream
+        // may be persisted and would otherwise create needless flash writes.
+        if (frameCount == 1) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - started);
             fprintf(stderr,
