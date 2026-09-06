@@ -671,7 +671,6 @@ public:
             activeViews_.end());
         primaryView_ = activeViews_.empty() ? nullptr : activeViews_.back();
         if (recycledHostPrimary && recycledHostWindow) {
-            hiddenWindows_.erase(recycledHostWindow);
             windowRestoreFrames_.erase(recycledHostWindow);
             windowChromeRestoreFrames_.erase(recycledHostWindow);
             primaryBoundFor_.erase(recycledHostWindow);
@@ -726,6 +725,16 @@ public:
     }
 
     // IDisplayBackend
+
+    void forgetWindow(void* window) override {
+        dispatchSyncMain([this, window] {
+            // Visibility belongs to the window, not to any pooled view.
+            // Keep it across view replacement, clear it before handle reuse.
+            hiddenWindows_.erase(window);
+            windowRestoreFrames_.erase(window);
+            windowChromeRestoreFrames_.erase(window);
+        });
+    }
 
     void setWindowVisible(void* window, bool visible) override {
         dispatchSyncMain([this, window, visible] {
