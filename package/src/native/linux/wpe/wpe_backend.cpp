@@ -171,39 +171,7 @@ static bool viewsLogEnabled() {
     return enabled;
 }
 
-static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
-    auto* view = webkit_uri_scheme_request_get_web_view(request);
-    if (!view || !g_object_get_data(G_OBJECT(view), "electrobun-allow-views")) {
-        fprintf(stderr, "[wpe views://] denied request for view=%p\n", (void*)view);
-        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "views:// is disabled for this view");
-        webkit_uri_scheme_request_finish_error(request, error);
-        g_error_free(error);
-        return;
-    }
-    const char* uri = webkit_uri_scheme_request_get_uri(request);
-    if (viewsLogEnabled()) {
-        fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
-    }
-    // Strip ?query and #fragment from the URL before resolving against
-    // ASAR / disk — a request like `views://main/index.html?t=12345` should
-    // serve `main/index.html`. (The GTK handler in nativeWrapper.cpp has the
-    // same omission; tracked in §17 follow-ups.)
-    std::string pathBuf;
-    const char* fullPath = "index.html";
-    if (uri && std::strncmp(uri, "views://", 8) == 0) {
-        pathBuf = uri + 8;
-        size_t cut = pathBuf.find_first_of("?#");
-        if (cut != std::string::npos) pathBuf.resize(cut);
-        fullPath = pathBuf.c_str();
-    }
-    if (!electrobun::wpe::safeViewsPath(fullPath)) {
-        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "Invalid views:// path");
-        webkit_uri_scheme_request_finish_error(request, error);
-        g_error_free(error);
-        return;
-    }
-    const auto* customRoot = static_cast<const char*>(g_object_get_data(G_OBJECT(view), "electrobun-views-root"));
-
+static bool loadViewAsset(const char* fullPath, const char* customRoot, gchar*& fileContents, gsize& fileSize) {
     // Resolved once — cwd doesn't change after launch, and this handler runs
     // per asset fetch.
     static gchar* resourcesDir = nullptr;
@@ -216,8 +184,6 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
         g_free(cwd);
     });
 
-    gchar* fileContents = nullptr;
-    gsize  fileSize = 0;
     bool   foundFile = false;
 
     if (!customRoot && g_file_test(asarPath, G_FILE_TEST_EXISTS)) {
@@ -260,6 +226,46 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
         g_free(viewsDir);
         g_free(filePath);
     }
+
+    return foundFile;
+}
+
+static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
+    auto* view = webkit_uri_scheme_request_get_web_view(request);
+    if (!view || !g_object_get_data(G_OBJECT(view), "electrobun-allow-views")) {
+        fprintf(stderr, "[wpe views://] denied request for view=%p\n", (void*)view);
+        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "views:// is disabled for this view");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    if (viewsLogEnabled()) {
+        fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
+    }
+    // Strip ?query and #fragment from the URL before resolving against
+    // ASAR / disk — a request like `views://main/index.html?t=12345` should
+    // serve `main/index.html`. (The GTK handler in nativeWrapper.cpp has the
+    // same omission; tracked in §17 follow-ups.)
+    std::string pathBuf;
+    const char* fullPath = "index.html";
+    if (uri && std::strncmp(uri, "views://", 8) == 0) {
+        pathBuf = uri + 8;
+        size_t cut = pathBuf.find_first_of("?#");
+        if (cut != std::string::npos) pathBuf.resize(cut);
+        fullPath = pathBuf.c_str();
+    }
+    if (!electrobun::wpe::safeViewsPath(fullPath)) {
+        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "Invalid views:// path");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    const auto* customRoot = static_cast<const char*>(g_object_get_data(G_OBJECT(view), "electrobun-views-root"));
+
+    gchar* fileContents = nullptr;
+    gsize fileSize = 0;
+    const bool foundFile = loadViewAsset(fullPath, customRoot, fileContents, fileSize);
 
     if (foundFile && fileContents) {
         std::string mime = electrobun::getMimeTypeFromUrl(fullPath);
@@ -1047,25 +1053,7 @@ public:
         }
     }
 
-    std::shared_ptr<AbstractView> createWebviewOnMain(const WebviewSpec& spec) {
-        const bool isInternalChrome =
-            !spec.sandboxed && spec.partition == "__electrobun_chrome__";
-        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
-                (long)syscall(SYS_gettid), spec.webviewId,
-                isInternalChrome ? "<internal-chrome>" : spec.url.c_str(),
-                spec.trust.c_str()); fflush(stderr);
-
-        // Trust class drives WebProcess sharing (Stage 2). "" defaults to
-        // "trusted" — same-origin app + chrome views share one WebProcess via
-        // the related-view link captured on the seed view. "untrusted" gets a
-        // fresh WebProcess for the OAuth-popup / external-content case.
-        const bool wantTrusted = !spec.sandboxed && spec.trust != "untrusted";
-
-        WpeWebViewImpl* impl = acquirePooledView(spec, wantTrusted);
-        if (!impl) return nullptr;
-        impl->inFreePool_ = false;
-
-        impl->webviewId = spec.webviewId;
+    void bindViewPolicy(WpeWebViewImpl* impl, const WebviewSpec& spec, bool isInternalChrome) {
         // The framework-owned chrome document has no user navigation
         // surface. Keeping it off the generic callback path also avoids
         // copying its base64 data URL through Bun FFI event strings.
@@ -1101,6 +1089,28 @@ public:
         impl->hostWindow_           = spec.hostWindow;
         impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
         impl->customPreloadScript_     = spec.customPreloadScript;
+    }
+
+    std::shared_ptr<AbstractView> createWebviewOnMain(const WebviewSpec& spec) {
+        const bool isInternalChrome =
+            !spec.sandboxed && spec.partition == "__electrobun_chrome__";
+        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
+                (long)syscall(SYS_gettid), spec.webviewId,
+                isInternalChrome ? "<internal-chrome>" : spec.url.c_str(),
+                spec.trust.c_str()); fflush(stderr);
+
+        // Trust class drives WebProcess sharing (Stage 2). "" defaults to
+        // "trusted" — same-origin app + chrome views share one WebProcess via
+        // the related-view link captured on the seed view. "untrusted" gets a
+        // fresh WebProcess for the OAuth-popup / external-content case.
+        const bool wantTrusted = !spec.sandboxed && spec.trust != "untrusted";
+
+        WpeWebViewImpl* impl = acquirePooledView(spec, wantTrusted);
+        if (!impl) return nullptr;
+        impl->inFreePool_ = false;
+
+        impl->webviewId = spec.webviewId;
+        bindViewPolicy(impl, spec, isInternalChrome);
         configureViewGeometry(impl, spec, isInternalChrome);
         // Tell WPE to render at the view's bounds size — the SHM buffer it
         // exports will match this exactly, which the composite blit copies
