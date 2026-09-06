@@ -2405,7 +2405,7 @@ fn installEmbeddedPortalConfig(allocator: std.mem.Allocator) !void {
     defer allocator.free(portal_dir);
     try std.Io.Dir.cwd().createDirPath(g_io, portal_dir);
 
-    const portal_path = try std.fs.path.join(allocator, &.{ portal_dir, "portals.conf" });
+    const portal_path = try std.fs.path.join(allocator, &.{ portal_dir, "electrobun-portals.conf" });
     defer allocator.free(portal_path);
     const portal_text =
         \\[preferred]
@@ -2417,11 +2417,8 @@ fn installEmbeddedPortalConfig(allocator: std.mem.Allocator) !void {
     try portal_file.writeStreamingAll(g_io, portal_text);
     std.debug.print("✓ wrote headless portal config: {s}\n", .{portal_path});
 
-    runBestEffort(
-        allocator,
-        &.{ "systemctl", "--user", "restart", "xdg-desktop-portal.service" },
-        "systemctl --user restart xdg-desktop-portal",
-    );
+    // Never replace the account-wide portal policy or restart services used
+    // by unrelated desktop applications. This profile is kiosk-specific.
 }
 
 // Phase A: linux-wpe kiosk install.
@@ -2439,22 +2436,21 @@ fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metad
     // stable path so a later OTA only needs to replace the symlink.
     const current_link = try std.fs.path.join(allocator, &.{ app_base_dir, "current" });
     defer allocator.free(current_link);
-    std.Io.Dir.cwd().deleteFile(g_io, current_link) catch {};
-    std.Io.Dir.cwd().symLink(g_io, app_dir_name, current_link, .{}) catch |err| {
-        std.debug.print("Warning: could not create current symlink at {s}: {}\n", .{ current_link, err });
-        return;
-    };
+    const next_link = try std.fmt.allocPrint(allocator, "{s}.new-{d}", .{ current_link, std.c.getpid() });
+    defer allocator.free(next_link);
+    try std.Io.Dir.cwd().symLink(g_io, app_dir_name, next_link, .{});
+    defer std.Io.Dir.cwd().deleteFile(g_io, next_link) catch {};
+    try std.Io.Dir.cwd().rename(next_link, std.Io.Dir.cwd(), current_link, g_io);
 
-    try installEmbeddedPortalConfig(allocator);
-
-    // --no-kiosk keeps the extracted files, current link, and portal config,
-    // but skips systemd integration.
+    // --no-kiosk only selects the extracted files; no account configuration.
     if (g_skip_kiosk) {
         const launcher_hint = try std.fs.path.join(allocator, &.{ app_base_dir, "current", "bin", "launcher" });
         defer allocator.free(launcher_hint);
         std.debug.print("Installed without kiosk service. Run manually: {s}\n", .{launcher_hint});
         return;
     }
+
+    try installEmbeddedPortalConfig(allocator);
 
     const home = getEnvOwned(allocator, "HOME") catch {
         std.debug.print("Warning: HOME not set; skipping systemd unit install\n", .{});
@@ -2477,14 +2473,15 @@ fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metad
         \\[Unit]
         \\Description={s} (Electrobun kiosk)
         \\After=graphical-session.target
+        \\StartLimitIntervalSec=30
+        \\StartLimitBurst=3
         \\
         \\[Service]
         \\Type=simple
         \\ExecStart={s}
+        \\Environment=XDG_CURRENT_DESKTOP=electrobun
         \\Restart=on-failure
         \\RestartSec=2
-        \\StartLimitIntervalSec=30
-        \\StartLimitBurst=3
         \\TimeoutStopSec=5
         \\
         \\[Install]
