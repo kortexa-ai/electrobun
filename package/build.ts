@@ -72,6 +72,8 @@ const { values: args } = parseArgs({
 		"core-only": {
 			type: "boolean",
 		},
+		"reuse-vendors": { type: "boolean" },
+		serial: { type: "boolean" },
 		npm: {
 			type: "boolean",
 		},
@@ -83,6 +85,7 @@ const { values: args } = parseArgs({
 const CHANNEL: "debug" | "release" = args.release ? "release" : "debug";
 const IS_NPM_BUILD = args.npm || false;
 const CORE_ONLY_BUILD = args["core-only"] || false;
+const REUSE_VENDORS = args["reuse-vendors"] || false;
 const OS: "win" | "linux" | "macos" = getPlatform();
 const ARCH: "arm64" | "x64" = getArch();
 
@@ -211,7 +214,7 @@ try {
 		console.log("Building for npm (JS/TS files only)...");
 		await buildForNpm();
 	} else {
-		await setup();
+		if (!REUSE_VENDORS) await setup();
 		await build();
 		await copyToDist();
 	}
@@ -342,6 +345,7 @@ async function runZigBuild(
 ) {
 	const optimizeArgs =
 		CHANNEL === "release" ? [`-Doptimize=${releaseOptimize}`] : [];
+	if (args.serial) zigArgs = [...zigArgs, "-j2"];
 	if (OS === "win") {
 		runInherited(
 			PATH.zig.BIN,
@@ -670,7 +674,7 @@ async function setup() {
 
 async function build() {
 	await createDistFolder();
-	await installPackageDependencies();
+	if (!REUSE_VENDORS) await installPackageDependencies();
 
 	// await buildAsar(); // Now using vendored binaries from zig-asar releases
 	await buildNative(); // zig depends on this for linking symbols
@@ -679,12 +683,12 @@ async function build() {
 	console.log("Building preload script...");
 	await buildPreload();
 
-	await Promise.all([
-		buildSelfExtractor(),
-		buildCore(),
-		buildLauncher(),
-		buildMainJs(),
-	]);
+	const stages = [buildSelfExtractor, buildCore, buildLauncher, buildMainJs];
+	if (args.serial) {
+		for (const stage of stages) await stage();
+	} else {
+		await Promise.all(stages.map((stage) => stage()));
+	}
 }
 
 async function buildForNpm() {
@@ -945,7 +949,7 @@ async function copyToDist() {
 		}
 
 		// CEF binaries for Linux - copy to cef/ subdirectory
-		if (existsSync(join(process.cwd(), "vendors", "cef", "Release"))) {
+		if (hasGtkWrapper && existsSync(join(process.cwd(), "vendors", "cef", "Release"))) {
 			console.log("Copying CEF files for Linux...");
 			await $`mkdir -p dist/cef`;
 
