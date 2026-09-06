@@ -134,15 +134,15 @@ fn isDevBuild(allocator: std.mem.Allocator, exe_dir: []const u8) bool {
 fn fadviseWillneed(path: []const u8) void {
     const file = std.Io.Dir.cwd().openFile(g_io, path, .{}) catch return;
     defer file.close(g_io);
-    // A length of zero asks Linux to advise from offset zero to EOF.
-    _ = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.WILLNEED);
+    // Bound speculative I/O; unused assets must not evict the first screen.
+    _ = std.os.linux.fadvise(file.handle, 0, 8 * 1024 * 1024, std.os.linux.POSIX_FADV.WILLNEED);
 }
 
-fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8) void {
+fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8, main_process: MainProcess) void {
     if (builtin.os.tag != .linux) return;
 
     const relative_candidates = [_][]const u8{
-        "bun",
+        if (main_process == .cottontail) "cottontail" else if (main_process == .bun) "bun" else "main",
         "libNativeWrapper.so",
         "libNativeWrapper_wpe.so",
         "libElectrobunCore.so",
@@ -161,6 +161,9 @@ fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8) void
 // parallel with the app runtime's cold start.
 fn preheatNativeWrapper(allocator: std.mem.Allocator, exe_dir: []const u8) void {
     if (builtin.os.tag != .linux) return;
+    // Opt in for cold-start experiments; warm launches need no extra process.
+    const enabled = std.c.getenv("ELECTROBUN_PREHEAT_WRAPPER") orelse return;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return;
 
     const wrapper_path = std.fs.path.joinZ(allocator, &.{ exe_dir, "libNativeWrapper.so" }) catch return;
     defer allocator.free(wrapper_path);
@@ -509,8 +512,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     preheatNativeWrapper(arena_alloc, exe_dir);
-    readaheadStartupFiles(arena_alloc, exe_dir);
     const main_process = detectMainProcess(arena_alloc, exe_dir);
+    readaheadStartupFiles(arena_alloc, exe_dir, main_process);
 
     // Platform-specific paths
     var argv: []const []const u8 = undefined;
