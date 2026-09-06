@@ -24,6 +24,7 @@
 #include "egl_readback.h"
 #include "input.h"
 #include "compositor_policy.h"
+#include "views_path.h"
 
 #include <wpe/wpe.h>
 #include <wpe/fdo.h>
@@ -195,6 +196,13 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
         if (cut != std::string::npos) pathBuf.resize(cut);
         fullPath = pathBuf.c_str();
     }
+    if (!electrobun::wpe::safeViewsPath(fullPath)) {
+        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "Invalid views:// path");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    const auto* customRoot = static_cast<const char*>(g_object_get_data(G_OBJECT(view), "electrobun-views-root"));
 
     // Resolved once — cwd doesn't change after launch, and this handler runs
     // per asset fetch.
@@ -212,7 +220,7 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
     gsize  fileSize = 0;
     bool   foundFile = false;
 
-    if (g_file_test(asarPath, G_FILE_TEST_EXISTS)) {
+    if (!customRoot && g_file_test(asarPath, G_FILE_TEST_EXISTS)) {
         std::call_once(g_asarInitFlag, []() {
             // asarPath has static storage now — referenced directly, not captured.
             g_asarArchive = asar_open(asarPath);
@@ -236,7 +244,7 @@ static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*use
 
     if (!foundFile) {
         // Flat-file fallback: Resources/app/views/<fullPath>
-        gchar* viewsDir = g_build_filename(resourcesDir, "app", "views", nullptr);
+        gchar* viewsDir = customRoot ? g_strdup(customRoot) : g_build_filename(resourcesDir, "app", "views", nullptr);
         gchar* filePath = g_build_filename(viewsDir, fullPath, nullptr);
         if (g_file_test(filePath, G_FILE_TEST_EXISTS)) {
             GError* error = nullptr;
@@ -657,6 +665,7 @@ public:
             activeViews_.end());
         primaryView_ = activeViews_.empty() ? nullptr : activeViews_.back();
         if (recycledHostPrimary && recycledHostWindow) {
+            hiddenWindows_.erase(recycledHostWindow);
             windowRestoreFrames_.erase(recycledHostWindow);
             windowChromeRestoreFrames_.erase(recycledHostWindow);
             primaryBoundFor_.erase(recycledHostWindow);
@@ -684,6 +693,7 @@ public:
             if (slot.view == impl) slot = {};
         }
         g_object_set_data(G_OBJECT(impl->webView_), "electrobun-allow-views", nullptr);
+        g_object_set_data(G_OBJECT(impl->webView_), "electrobun-views-root", nullptr);
         impl->isRemoved      = false;
         impl->alwaysTopmost_ = false;
         impl->webviewId      = 0;
@@ -1076,6 +1086,8 @@ public:
         impl->setTransparent(spec.startTransparent);
         impl->setPassthrough(spec.startPassthrough);
         g_object_set_data(G_OBJECT(impl->webView_), "electrobun-allow-views", GINT_TO_POINTER(spec.allowViews));
+        g_object_set_data_full(G_OBJECT(impl->webView_), "electrobun-views-root",
+            spec.viewsRoot.empty() ? nullptr : g_strdup(spec.viewsRoot.c_str()), g_free);
         for (const char* name : {"bunBridge", "internalBridge", "electrobunChrome"}) {
             webkit_user_content_manager_unregister_script_message_handler(impl->userContentManager_, name, nullptr);
         }

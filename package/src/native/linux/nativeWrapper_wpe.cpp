@@ -458,12 +458,12 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             bool transparent,
                                             bool sandbox) {
     (void)autoResize;
-    (void)viewsRoot; (void)transparent;
     WebviewSpec spec{};
     spec.startTransparent = transparent || g_nextStartTransparent.exchange(false);
     g_nextStartTransparent.store(false);
     spec.startPassthrough = g_nextStartPassthrough.exchange(false);
     spec.allowViews = g_nextAllowViews;
+    spec.viewsRoot = viewsRoot ? viewsRoot : "";
     g_nextAllowViews = true;
     spec.webviewId            = webviewId;
     spec.hostWindow           = window;
