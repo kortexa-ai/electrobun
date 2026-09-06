@@ -57,6 +57,7 @@ struct WebviewSpec {
     std::string renderer;          // "webkit", "cef", or future "wpe"
     bool sandboxed = false;
     bool allowViews = true;
+    std::string viewsRoot;
     bool startTransparent = false;
     bool startPassthrough = false;
     std::string partition;
