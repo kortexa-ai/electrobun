@@ -135,6 +135,7 @@ public:
         (void)window;
         (void)visible;
     }
+    virtual void forgetWindow(void* window) { (void)window; }
 };
 
 // Webview backend: produces HTML pixels into a window created by an

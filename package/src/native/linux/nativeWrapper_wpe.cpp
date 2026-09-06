@@ -123,6 +123,7 @@ static void closeWpeWindow(void* window) {
         entry = std::move(it->second);
         g_windows.erase(it);
     }
+    currentDisplayBackend().forgetWindow(window);
     if (entry && entry->closeCallback) {
         entry->closeCallback(entry->windowId);
     }
