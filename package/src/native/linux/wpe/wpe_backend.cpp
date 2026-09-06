@@ -23,6 +23,7 @@
 #include "drm_display.h"
 #include "egl_readback.h"
 #include "input.h"
+#include "compositor_policy.h"
 
 #include <wpe/wpe.h>
 #include <wpe/fdo.h>
@@ -74,12 +75,6 @@ class WpeBackend;  // fwd
 static std::atomic<long> g_mainThreadTid{-1};
 
 static inline bool onMainThread() {
-    // The launcher and ElectrobunCore can both run the shared default GLib
-    // context from different threads. A callback already executing inside
-    // that context is safe to run inline regardless of which runner acquired
-    // it; dispatching synchronously from there would wait on ourselves.
-    if (g_main_context_is_owner(g_main_context_default())) return true;
-
     long t = g_mainThreadTid.load(std::memory_order_relaxed);
     return t > 0 && (long)syscall(SYS_gettid) == t;
 }
@@ -96,8 +91,8 @@ static void dispatchSyncMain(std::function<void()> fn) {
 
     g_idle_add_full(G_PRIORITY_DEFAULT, +[](gpointer ud) -> gboolean {
         auto* p = static_cast<Pack*>(ud);
-        try { (*p->fn)(); } catch (...) {}
-        p->done->set_value();
+        try { (*p->fn)(); p->done->set_value(); }
+        catch (...) { p->done->set_exception(std::current_exception()); }
         return G_SOURCE_REMOVE;
     }, pack, +[](gpointer ud) {
         auto* p = static_cast<Pack*>(ud);
@@ -105,7 +100,7 @@ static void dispatchSyncMain(std::function<void()> fn) {
         delete p;
     });
 
-    fut.wait();
+    fut.get();
 }
 
 struct PendingWindowChromeAction {
@@ -176,6 +171,13 @@ static bool viewsLogEnabled() {
 }
 
 static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
+    auto* view = webkit_uri_scheme_request_get_web_view(request);
+    if (!view || !g_object_get_data(G_OBJECT(view), "electrobun-allow-views")) {
+        GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "views:// is disabled for this view");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
     const char* uri = webkit_uri_scheme_request_get_uri(request);
     if (viewsLogEnabled()) {
         fprintf(stderr, "[wpe views://] request uri=%s\n", uri ? uri : "(null)"); fflush(stderr);
@@ -318,6 +320,7 @@ public:
     }
 
     void requestWindowChromeAction(WindowChromeAction action) {
+        if (!alwaysTopmost_ || sandboxed_ || inFreePool_) return;
         queueWindowChromeAction(windowChromeActionHandler_, hostWindow_, action);
     }
 
@@ -488,6 +491,17 @@ public:
     //   untrusted → constructed without related-view, so WPE spawns a
     //               fresh WPEWebProcess for this view.
     bool trusted_     = true;
+    bool sandboxed_ = true;
+    bool hidden_ = false;
+    bool windowHidden_ = false;
+    bool transparent_ = false;
+    bool visible() const { return !inFreePool_ && !hidden_ && !windowHidden_; }
+    void setHidden(bool hidden) override;
+    void setTransparent(bool transparent) override {
+        transparent_ = transparent;
+        WebKitColor color{1.0, 1.0, 1.0, transparent ? 0.0 : 1.0};
+        if (webView_) webkit_web_view_set_background_color(webView_, &color);
+    }
     Rect frame_ = {};            // bounds within the rotated landscape space
 
     // Most-recent frame this view exported. EGL is the normal GPU path; SHM
@@ -658,6 +672,17 @@ public:
         impl->isHostPrimary_ = false;
         impl->electrobunPreloadScript_.clear();
         impl->customPreloadScript_.clear();
+        impl->navigationRules.clear();
+        impl->maskJSON.clear();
+        impl->isMousePassthroughEnabled = false;
+        impl->mirrorModeEnabled = false;
+        impl->hidden_ = impl->windowHidden_ = false;
+        impl->sandboxed_ = true;
+        impl->firstFrameAfterLoadPending_ = false;
+        for (auto& slot : touchSlots_) {
+            if (slot.view == impl) slot = {};
+        }
+        g_object_set_data(G_OBJECT(impl->webView_), "electrobun-allow-views", nullptr);
         impl->isRemoved      = false;
         impl->alwaysTopmost_ = false;
         impl->webviewId      = 0;
@@ -684,6 +709,19 @@ public:
     }
 
     // IDisplayBackend
+
+    void setWindowVisible(void* window, bool visible) override {
+        dispatchSyncMain([this, window, visible] {
+            if (visible) hiddenWindows_.erase(window);
+            else hiddenWindows_.insert(window);
+            for (auto* view : activeViews_) {
+                if (view->hostWindow_ == window) view->windowHidden_ = !visible;
+            }
+            scheduleCompose();
+        });
+    }
+
+    void visibilityChanged() { scheduleCompose(); }
 
     void setWindowMaximized(void* window, bool maximized) override {
         if (!window) return;
@@ -799,6 +837,14 @@ public:
     }
 
     void runEventLoop() override {
+        // Keep the default context on the thread that creates WebKit objects.
+        // Other runtime loop pumps may try to acquire it; they must not run
+        // WebKit callbacks on a different OS thread between iterations.
+        GMainContext* context = g_main_context_default();
+        if (!g_main_context_acquire(context)) {
+            fprintf(stderr, "[wpe] default GLib context already owned at startup\n");
+            _exit(70);
+        }
         long tid = (long)syscall(SYS_gettid);
         g_mainThreadTid.store(tid, std::memory_order_relaxed);
         fprintf(stderr, "[WpeBackend] runEventLoop: entering on tid=%ld (recorded as main thread)\n", tid); fflush(stderr);
@@ -835,6 +881,7 @@ public:
 
         fprintf(stderr, "[WpeBackend] runEventLoop: g_main_loop_run starting\n"); fflush(stderr);
         g_main_loop_run(mainLoop_);
+        g_main_context_release(context);
         fprintf(stderr, "[WpeBackend] runEventLoop: g_main_loop_run returned\n"); fflush(stderr);
     }
 
@@ -847,19 +894,12 @@ public:
     // IWebviewBackend
 
     std::shared_ptr<AbstractView> createWebview(const WebviewSpec& spec) override {
-        const bool isInternalChrome =
-            spec.partition == "__electrobun_chrome__";
-        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
-                (long)syscall(SYS_gettid), spec.webviewId,
-                isInternalChrome ? "<internal-chrome>" : spec.url.c_str(),
-                spec.trust.c_str()); fflush(stderr);
+        std::shared_ptr<AbstractView> result;
+        dispatchSyncMain([&] { result = createWebviewOnMain(spec); });
+        return result;
+    }
 
-        // Trust class drives WebProcess sharing (Stage 2). "" defaults to
-        // "trusted" — same-origin app + chrome views share one WebProcess via
-        // the related-view link captured on the seed view. "untrusted" gets a
-        // fresh WebProcess for the OAuth-popup / external-content case.
-        const bool wantTrusted = (spec.trust != "untrusted");
-
+    WpeWebViewImpl* acquirePooledView(const WebviewSpec& spec, bool wantTrusted) {
         // Find a recyclable view in the free pool that matches the requested
         // trust class. The pool is small (seed + lazy-grown views), so a
         // linear walk is cheap.
@@ -904,26 +944,10 @@ public:
             fprintf(stderr, "[WpeBackend] createWebview: lazy-grew pool to %zu views (%s)\n",
                     views_.size(), wantTrusted ? "trusted/shared" : "untrusted/own-process"); fflush(stderr);
         }
-        impl->inFreePool_ = false;
+        return impl;
+    }
 
-        impl->webviewId = spec.webviewId;
-        // The framework-owned chrome document has no user navigation
-        // surface. Keeping it off the generic callback path also avoids
-        // copying its base64 data URL through Bun FFI event strings.
-        impl->navigationCallback_   = isInternalChrome
-            ? nullptr
-            : (DecideNavigationCallback)spec.navigationHandler;
-        impl->eventHandler_         = isInternalChrome
-            ? nullptr
-            : (WebviewEventHandler)spec.webviewEventHandler;
-        impl->bunBridgeHandler_     = (HandlePostMessage)spec.bunBridgeHandler;
-        impl->internalBridgeHandler_= (HandlePostMessage)spec.internalBridgeHandler;
-        impl->eventBridgeHandler_   = (HandlePostMessage)spec.eventBridgeHandler;
-        impl->windowChromeActionHandler_ =
-            (WindowChromeActionHandler)spec.windowChromeActionHandler;
-        impl->hostWindow_           = spec.hostWindow;
-        impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
-        impl->customPreloadScript_     = spec.customPreloadScript;
+    void configureViewGeometry(WpeWebViewImpl* impl, const WebviewSpec& spec, bool isInternalChrome) {
         impl->frame_                = spec.frame;
         // Bare-DRM has no window manager. The first BrowserWindow is fitted to
         // the physical panel. With framework-owned composited chrome its app
@@ -976,20 +1000,9 @@ public:
             impl->visualBounds = impl->frame_;
         }
 
-        // Tell WPE to render at the view's bounds size — the SHM buffer it
-        // exports will match this exactly, which the composite blit copies
-        // into compositeBuffer_ at (frame.x, frame.y).
-        if (auto* vb = impl->viewBackend()) {
-            wpe_view_backend_dispatch_set_size(vb,
-                (uint32_t)impl->frame_.width,
-                (uint32_t)impl->frame_.height);
-        }
-        if (!spec.electrobunPreloadScript.empty()) {
-            impl->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
-        }
-        if (!spec.customPreloadScript.empty()) {
-            impl->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
-        }
+    }
+
+    void insertActiveView(WpeWebViewImpl* impl) {
         // Keep each BrowserWindow's views as one z-order group. A newer
         // BrowserWindow (e.g. About) sits above the complete older group,
         // while the magic chrome view stays above app views in its own group.
@@ -1021,6 +1034,76 @@ public:
                 activeViews_.insert(insertAt, impl);
             }
         }
+    }
+
+    std::shared_ptr<AbstractView> createWebviewOnMain(const WebviewSpec& spec) {
+        const bool isInternalChrome =
+            !spec.sandboxed && spec.partition == "__electrobun_chrome__";
+        fprintf(stderr, "[WpeBackend] createWebview: FFI entry tid=%ld webviewId=%u url='%s' trust='%s'\n",
+                (long)syscall(SYS_gettid), spec.webviewId,
+                isInternalChrome ? "<internal-chrome>" : spec.url.c_str(),
+                spec.trust.c_str()); fflush(stderr);
+
+        // Trust class drives WebProcess sharing (Stage 2). "" defaults to
+        // "trusted" — same-origin app + chrome views share one WebProcess via
+        // the related-view link captured on the seed view. "untrusted" gets a
+        // fresh WebProcess for the OAuth-popup / external-content case.
+        const bool wantTrusted = !spec.sandboxed && spec.trust != "untrusted";
+
+        WpeWebViewImpl* impl = acquirePooledView(spec, wantTrusted);
+        if (!impl) return nullptr;
+        impl->inFreePool_ = false;
+
+        impl->webviewId = spec.webviewId;
+        // The framework-owned chrome document has no user navigation
+        // surface. Keeping it off the generic callback path also avoids
+        // copying its base64 data URL through Bun FFI event strings.
+        impl->navigationCallback_   = isInternalChrome
+            ? nullptr
+            : (DecideNavigationCallback)spec.navigationHandler;
+        impl->eventHandler_         = isInternalChrome
+            ? nullptr
+            : (WebviewEventHandler)spec.webviewEventHandler;
+        impl->sandboxed_ = spec.sandboxed;
+        impl->bunBridgeHandler_     = spec.sandboxed ? nullptr : (HandlePostMessage)spec.bunBridgeHandler;
+        impl->internalBridgeHandler_= spec.sandboxed ? nullptr : (HandlePostMessage)spec.internalBridgeHandler;
+        impl->eventBridgeHandler_   = (HandlePostMessage)spec.eventBridgeHandler;
+        impl->windowChromeActionHandler_ =
+            isInternalChrome ? (WindowChromeActionHandler)spec.windowChromeActionHandler : nullptr;
+        impl->hidden_ = false;
+        impl->windowHidden_ = hiddenWindows_.count(spec.hostWindow) != 0;
+        impl->setTransparent(spec.startTransparent);
+        impl->setPassthrough(spec.startPassthrough);
+        g_object_set_data(G_OBJECT(impl->webView_), "electrobun-allow-views", GINT_TO_POINTER(spec.allowViews));
+        for (const char* name : {"bunBridge", "internalBridge", "electrobunChrome"}) {
+            webkit_user_content_manager_unregister_script_message_handler(impl->userContentManager_, name, nullptr);
+        }
+        if (!spec.sandboxed) {
+            webkit_user_content_manager_register_script_message_handler(impl->userContentManager_, "bunBridge", nullptr);
+            webkit_user_content_manager_register_script_message_handler(impl->userContentManager_, "internalBridge", nullptr);
+        }
+        if (isInternalChrome) {
+            webkit_user_content_manager_register_script_message_handler(impl->userContentManager_, "electrobunChrome", nullptr);
+        }
+        impl->hostWindow_           = spec.hostWindow;
+        impl->electrobunPreloadScript_ = spec.electrobunPreloadScript;
+        impl->customPreloadScript_     = spec.customPreloadScript;
+        configureViewGeometry(impl, spec, isInternalChrome);
+        // Tell WPE to render at the view's bounds size — the SHM buffer it
+        // exports will match this exactly, which the composite blit copies
+        // into compositeBuffer_ at (frame.x, frame.y).
+        if (auto* vb = impl->viewBackend()) {
+            wpe_view_backend_dispatch_set_size(vb,
+                (uint32_t)impl->frame_.width,
+                (uint32_t)impl->frame_.height);
+        }
+        if (!spec.electrobunPreloadScript.empty()) {
+            impl->addPreloadScriptToWebView(spec.electrobunPreloadScript.c_str());
+        }
+        if (!spec.customPreloadScript.empty()) {
+            impl->addPreloadScriptToWebView(spec.customPreloadScript.c_str());
+        }
+        insertActiveView(impl);
         // primaryView_ tracks the topmost active view for back-compat with
         // commit 1's still-single-source rendering (commit 2 replaces this
         // with a real composite walk over activeViews_).
@@ -1248,7 +1331,7 @@ private:
             G_CALLBACK(+[](WebKitWebView*, WebKitPermissionRequest* request,
                            gpointer userData) -> gboolean {
                 auto* view = static_cast<WpeWebViewImpl*>(userData);
-                if (!view || !view->trusted_ ||
+                if (!view || !view->trusted_ || view->sandboxed_ || view->inFreePool_ ||
                     !WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
                     return FALSE;
                 }
@@ -1420,11 +1503,8 @@ private:
     // nativeWrapper.cpp:2630-2715 has an extra `_get_js_value` step that
     // we skip here.
     //
-    // Lifetime: same deferred-free contract as GTK (the Bun JSCallback may
-    // still be using the string asynchronously when the signal handler
-    // returns), but WITHOUT the thread-per-message + 1s sleep GTK uses —
-    // that's a thread spawn per RPC message. A low-priority GLib timeout on
-    // the already-running main loop frees the buffers instead.
+    // Core owns an independent copy before its synchronous trampoline
+    // returns; asynchronous runtime callbacks release that copy explicitly.
     static void forwardBridgeMessage(HandlePostMessage handler,
                                      uint32_t webviewId,
                                      JSCValue* value) {
@@ -1432,35 +1512,23 @@ private:
         if (!JSC_IS_VALUE(value) || !jsc_value_is_string(value)) return;
         gchar* str_value = jsc_value_to_string(value);
         if (!str_value) return;
-        size_t len = strlen(str_value);
-        char* message_copy = new char[len + 1];
-        std::memcpy(message_copy, str_value, len + 1);
-        handler(webviewId, message_copy);
-
-        struct DeferredFree { char* copy; gchar* str; };
-        auto* deferred = new DeferredFree{message_copy, str_value};
-        g_timeout_add_seconds_full(G_PRIORITY_LOW, 1,
-            +[](gpointer) -> gboolean { return G_SOURCE_REMOVE; },
-            deferred,
-            +[](gpointer ud) {
-                auto* d = static_cast<DeferredFree*>(ud);
-                delete[] d->copy;
-                g_free(d->str);
-                delete d;
-            });
+        // Core's synchronous trampolines copy into their owned queues before
+        // returning. No per-message heap copy or deferred-free timer is needed.
+        handler(webviewId, str_value);
+        g_free(str_value);
     }
     static void onBunBridgeMessageStatic(WebKitUserContentManager*,
                                          JSCValue* value,
                                          gpointer user_data) {
         auto* impl = static_cast<WpeWebViewImpl*>(user_data);
-        if (!impl) return;
+        if (!impl || impl->sandboxed_ || impl->inFreePool_) return;
         forwardBridgeMessage(impl->bunBridgeHandler_, impl->webviewId, value);
     }
     static void onInternalBridgeMessageStatic(WebKitUserContentManager*,
                                               JSCValue* value,
                                               gpointer user_data) {
         auto* impl = static_cast<WpeWebViewImpl*>(user_data);
-        if (!impl) return;
+        if (!impl || impl->sandboxed_ || impl->inFreePool_) return;
         forwardBridgeMessage(impl->internalBridgeHandler_, impl->webviewId, value);
     }
     static void onEventBridgeMessageStatic(WebKitUserContentManager*,
@@ -1588,7 +1656,7 @@ private:
         }
         static std::atomic<int> n{0};
         int i = ++n;
-        if (i <= 3 || (i % 60) == 0) {
+        if (i <= 3) {
             fprintf(stderr, "[WpeBackend] onExportShm #%d (view %p, webviewId=%u)\n",
                     i, (void*)impl, impl ? impl->webviewId : 0u); fflush(stderr);
         }
@@ -1665,7 +1733,7 @@ private:
     // take the direct-blit fast path. wl_shm_buffer_get_width/height do not
     // require begin_access.
     bool viewCoversComposite(WpeWebViewImpl* v) const {
-        if (!v || (!v->pendingEgl_ && !v->pendingShm_)) return false;
+        if (!v || !v->visible() || v->transparent_ || (!v->pendingEgl_ && !v->pendingShm_)) return false;
         if (v->frame_.x != 0 || v->frame_.y != 0 ||
             v->frame_.width  < (int)landscapeW_ ||
             v->frame_.height < (int)landscapeH_) return false;
@@ -1705,10 +1773,10 @@ private:
         DrmFrame dst = display_->acquire();  // non-blocking (no flip pending)
 
         if (eglReadback_) {
-            std::vector<EglLayer> layers;
-            layers.reserve(activeViews_.size());
+            auto& layers = compositeLayers_;
+            layers.clear();
             for (auto* view : activeViews_) {
-                if (!view || !view->pendingEgl_) continue;
+                if (!view || !view->visible() || !view->pendingEgl_) continue;
                 layers.push_back(EglLayer{
                     .image = wpe_fdo_egl_exported_image_get_egl_image(
                         view->pendingEgl_),
@@ -1716,6 +1784,7 @@ private:
                     .y = view->frame_.y,
                     .width = view->frame_.width,
                     .height = view->frame_.height,
+                    .transparent = view->transparent_,
                 });
             }
             if (eglReadback_->canComposeToScanout()) {
@@ -1725,10 +1794,14 @@ private:
                         dst.pitch,
                         dst.width,
                         dst.height)) {
+                    retryComposition(eglReadback_->lastError());
                     return;
                 }
             } else {
-                if (!eglReadback_->compose(layers)) return;
+                if (!eglReadback_->compose(layers)) {
+                    retryComposition(eglReadback_->lastError());
+                    return;
+                }
                 blitWithRotation(
                     eglReadback_->pixels(), eglReadback_->stride(),
                     landscapeW_, landscapeH_,
@@ -1770,7 +1843,7 @@ private:
                 const uint32_t compStride = landscapeW_ * 4;
 
                 for (auto* view : activeViews_) {
-                    if (!view || !view->pendingShm_) continue;
+                    if (!view || !view->visible() || !view->pendingShm_) continue;
                     struct wl_shm_buffer* shm =
                         wpe_fdo_shm_exported_buffer_get_shm_buffer(
                             view->pendingShm_);
@@ -1801,13 +1874,13 @@ private:
                     });
                     if (blitW > 0 && blitH > 0) {
                         for (int r = 0; r < blitH; r++) {
-                            std::memcpy(
+                            compositeRow(
                                 compositeBuffer_.data() +
                                     (size_t)(dstY0 + r) * compStride +
                                     (size_t)dstX0 * 4,
                                 src + (size_t)(srcY0 + r) * srcStride +
                                     (size_t)srcX0 * 4,
-                                (size_t)blitW * 4);
+                                (size_t)blitW, view->transparent_);
                         }
                     }
                     wl_shm_buffer_end_access(shm);
@@ -1820,7 +1893,11 @@ private:
             }
         }
 
-        display_->present();
+        if (!display_->present()) {
+            retryComposition(display_->getLastError());
+            return;
+        }
+        compositionFailures_ = 0;
         framesRendered_++;
 
         // The flip that includes every held frame is queued — release the
@@ -1831,6 +1908,23 @@ private:
                 wpe_view_backend_exportable_fdo_dispatch_frame_complete(view->exportable());
             }
         }
+    }
+
+    void retryComposition(const std::string& error) {
+        // Keep exported buffers owned until successful composition. Never
+        // release an EGLImage that a failed render may still be sampling.
+        // A bounded retry either acknowledges the frame on success or lets
+        // the kiosk supervisor recover the entire failed graphics context.
+        fprintf(stderr, "[wpe] composition failed (%u/3): %s\n", ++compositionFailures_, error.c_str());
+        if (compositionFailures_ >= 3) _exit(70);
+        if (composeScheduled_) return;
+        composeScheduled_ = true;
+        g_timeout_add(16, +[](gpointer data) -> gboolean {
+            auto* self = static_cast<WpeBackend*>(data);
+            self->composeScheduled_ = false;
+            self->composeAndPresent();
+            return G_SOURCE_REMOVE;
+        }, this);
     }
 
     // rotationQuarters_ of 0 = no rotation (straight copy), respect pitches.
@@ -1929,7 +2023,7 @@ private:
         auto hitTest = [&](int32_t lx, int32_t ly) -> WpeWebViewImpl* {
             for (auto it = activeViews_.rbegin(); it != activeViews_.rend(); ++it) {
                 WpeWebViewImpl* v = *it;
-                if (!v) continue;
+                if (!v || !v->visible() || v->isMousePassthroughEnabled || !v->isReceivingInput) continue;
                 const Rect& f = v->frame_;
                 if (lx >= f.x && lx < f.x + f.width &&
                     ly >= f.y && ly < f.y + f.height) {
@@ -1971,8 +2065,8 @@ private:
             if (!v) return;
             auto* vb = v->viewBackend();
             if (!vb) return;
-            std::vector<struct wpe_input_touch_event_raw> points;
-            points.reserve(16);
+            struct wpe_input_touch_event_raw points[16] = {};
+            size_t pointCount = 0;
             for (int s = 0; s < 16; ++s) {
                 if (touchSlots_[s].view != v) continue;
                 struct wpe_input_touch_event_raw r = {};
@@ -1983,11 +2077,11 @@ private:
                 r.id   = s;
                 r.x    = touchSlots_[s].x;
                 r.y    = touchSlots_[s].y;
-                points.push_back(r);
+                points[pointCount++] = r;
             }
             struct wpe_input_touch_event te = {};
-            te.touchpoints        = points.empty() ? nullptr : points.data();
-            te.touchpoints_length = points.size();
+            te.touchpoints        = pointCount ? points : nullptr;
+            te.touchpoints_length = pointCount;
             te.type               = triggerType;
             te.id                 = triggerSlot;
             te.time               = ev.timeMs;
@@ -1999,7 +2093,7 @@ private:
             case InputEventType::TouchDown: {
                 int s = std::max(0, std::min(15, ev.touchSlot));
                 WpeWebViewImpl* target = hitTest(landX, landY);
-                if (!target) target = activeViews_.back();  // fallback: topmost
+                if (!target) break;
                 const int32_t viewX = landX - target->frame_.x;
                 const int32_t viewY = landY - target->frame_.y;
                 touchSlots_[s].view = target;
@@ -2089,6 +2183,7 @@ private:
     // Tracks which hostWindows have already had their primary (BrowserWindow's
     // implicit) view bound. Entries are removed when that primary is recycled.
     std::unordered_set<void*>                  primaryBoundFor_;
+    std::unordered_set<void*>                  hiddenWindows_;
     // Presence means maximized; value is the primary view's compositor frame
     // to restore. This makes secondary windows expand across the actual panel
     // instead of merely hiding decorations inside their old rectangle.
@@ -2104,6 +2199,8 @@ private:
     // composeAndPresent walk copies all active views into here, then a single
     // blitWithRotation pushes the result to DRM. ~3.7MB at 1920x480.
     std::vector<uint8_t>                       compositeBuffer_;
+    std::vector<EglLayer>                      compositeLayers_;
+    unsigned                                  compositionFailures_ = 0;
     bool                                       composeScheduled_ = false;
     // Set when composeAndPresent found a flip still in flight; the DRM-fd
     // watch (drmFdWatchId_) re-runs the compose when the flip completes.
@@ -2142,6 +2239,11 @@ inline void WpeWebViewImpl::remove() {
     if (backend_) backend_->recyclePooledView(this);
 }
 
+inline void WpeWebViewImpl::setHidden(bool hidden) {
+    hidden_ = hidden;
+    if (backend_) backend_->visibilityChanged();
+}
+
 } // namespace wpe
 
 // Singleton accessors. Linked into libNativeWrapper_wpe.so only.
@@ -2157,6 +2259,10 @@ IWebviewBackend& currentWebviewBackend() { return wpeBackendInstance(); }
 
 AbstractView* wpeFindViewById(uint32_t webviewId) {
     return wpeBackendInstance().findViewById(webviewId);
+}
+
+void wpeDispatchSync(std::function<void()> fn) {
+    wpe::dispatchSyncMain(std::move(fn));
 }
 
 } // namespace electrobun
