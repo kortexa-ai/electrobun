@@ -438,7 +438,9 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 				},
 				windowId: this.id,
 				autoResize: false,
-				sandbox: true,
+				// Framework-owned chrome uses its dedicated native action bridge.
+				// Sandboxed application views never receive that bridge.
+				sandbox: false,
 				trust: "trusted",
 			});
 			this.chromeWebviewId = chrome.id;

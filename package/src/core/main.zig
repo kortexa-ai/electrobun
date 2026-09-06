@@ -1618,30 +1618,40 @@ fn ensureNativeWrapperLoaded() bool {
     return true;
 }
 
+fn NativeSymbolCache(comptime name: [:0]const u8) type {
+    return struct {
+        // Capture the name in the type itself. Otherwise Zig can intern the
+        // identical anonymous structs for different symbols of the same type.
+        const symbol_name = name;
+        var address = std.atomic.Value(usize).init(0);
+    };
+}
+
+test "native symbol caches are distinct even for identical function signatures" {
+    const Flags = NativeSymbolCache("setNextWebviewFlags");
+    const Protocols = NativeSymbolCache("setNextWebviewAllowedProtocols");
+    try std.testing.expect(Flags != Protocols);
+    Flags.address.store(42, .release);
+    defer Flags.address.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 0), Protocols.address.load(.acquire));
+}
+
 fn lookupNativeSymbol(comptime T: type, comptime name: [:0]const u8) ?T {
     if (!ensureNativeWrapperLoaded()) {
         return null;
     }
 
-    // Per-(T, name) cache: each comptime instantiation gets its own static
-    // slot, so repeat calls skip the dlsym hash lookup — this sits on
-    // per-message paths (evaluateJavaScriptWithNoCompletion, loadURL, ...).
-    // The wrapper library is dlopen'ed once and never unloaded, so cached
-    // pointers stay valid for the process lifetime. A concurrent first call
-    // may resolve twice; both writes store the same pointer, so the race is
-    // benign. Failed lookups aren't cached (each call reports the error).
-    const Cache = struct {
-        var symbol: ?T = null;
-    };
-    if (Cache.symbol) |cached| {
-        return cached;
+    const Cache = NativeSymbolCache(name);
+    const cached = Cache.address.load(.acquire);
+    if (cached != 0) {
+        return @ptrFromInt(cached);
     }
 
     const resolved = native_wrapper_state.lib.lookup(T, name) orelse {
         setLastError("Native wrapper is missing {s}", .{name});
         return null;
     };
-    Cache.symbol = resolved;
+    Cache.address.store(@intFromPtr(resolved), .release);
     return resolved;
 }
 

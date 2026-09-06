@@ -173,6 +173,7 @@ static bool viewsLogEnabled() {
 static void handleViewsURIScheme(WebKitURISchemeRequest* request, gpointer /*userData*/) {
     auto* view = webkit_uri_scheme_request_get_web_view(request);
     if (!view || !g_object_get_data(G_OBJECT(view), "electrobun-allow-views")) {
+        fprintf(stderr, "[wpe views://] denied request for view=%p\n", (void*)view);
         GError* error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "views:// is disabled for this view");
         webkit_uri_scheme_request_finish_error(request, error);
         g_error_free(error);
