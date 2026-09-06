@@ -83,7 +83,7 @@ class Electroview<T extends RPCWithTransport> {
 		// Note: Using ws:// for loopback is intentional - all RPC messages are
 		// encrypted with per-webview AES-GCM keys, making TLS redundant
 		const socket = new WebSocket(
-			`ws://127.0.0.1:${HOST_SOCKET_PORT}/socket?webviewId=${WEBVIEW_ID}`,
+			`ws://127.0.0.1:${HOST_SOCKET_PORT}/socket?webviewId=${WEBVIEW_ID}&binary=1`,
 		);
 		// The host sends binary packets (iv | ciphertext | tag); arraybuffer
 		// avoids the async Blob→buffer hop per message.
@@ -100,9 +100,10 @@ class Electroview<T extends RPCWithTransport> {
 			const message = event.data;
 			if (message instanceof ArrayBuffer) {
 				try {
-					const decrypted = await window.__electrobun_decrypt_binary!(message);
+					const decodedMessage = window.__electrobun_decrypt_binary!(message)
+						.then((decrypted) => JSON.parse(decrypted));
 					this.hostSocketCanSend = true;
-					this.rpcHandler?.(JSON.parse(decrypted));
+					this.queueLinuxHostSocketDispatch(decodedMessage);
 				} catch (err) {
 					console.error("Error decrypting bun message:", err);
 				}

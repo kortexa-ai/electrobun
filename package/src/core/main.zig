@@ -200,6 +200,7 @@ const WebviewState = struct {
     socket_handle: ?std.posix.socket_t,
     transport_ready: bool,
     plaintext_transport: bool,
+    binary_transport: bool = false,
 };
 
 const WgpuViewState = struct {
@@ -707,7 +708,7 @@ fn closeAndClearWebviewSocketHandle(webview_id: u32) void {
     }
 }
 
-fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t) bool {
+fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t, binary: bool) bool {
     var handle_to_close: ?std.posix.socket_t = null;
 
     webview_registry_mutex.lockUncancelable(coreIo());
@@ -721,6 +722,7 @@ fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t) bool {
         }
     }
     state.socket_handle = handle;
+    state.binary_transport = binary;
     state.transport_ready = false;
     webview_registry_mutex.unlock(coreIo());
 
@@ -736,6 +738,7 @@ const WebviewTransportContext = struct {
     socket_handle: ?std.posix.socket_t,
     transport_ready: bool,
     plaintext_transport: bool,
+    binary_transport: bool,
 };
 
 fn lookupWebviewTransportContext(webview_id: u32) ?WebviewTransportContext {
@@ -745,6 +748,7 @@ fn lookupWebviewTransportContext(webview_id: u32) ?WebviewTransportContext {
         .socket_handle = state.socket_handle,
         .transport_ready = state.transport_ready,
         .plaintext_transport = state.plaintext_transport,
+        .binary_transport = state.binary_transport,
     };
 }
 
@@ -1254,6 +1258,35 @@ fn dispatchHostTransportMessage(webview_id: u32, encrypted_packet: []const u8) v
     enqueueHostTransportPlaintext(webview_id, context, plaintext);
 }
 
+fn targetRequestsBinary(target: []const u8) bool {
+    const query = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    var fields = std.mem.splitScalar(u8, target[query + 1 ..], '&');
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field, "binary=1")) return true;
+    }
+    return false;
+}
+
+fn binaryPacketToText(packet: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const nonce = packet[0..Aes256Gcm.nonce_length];
+    const tag = packet[packet.len - Aes256Gcm.tag_length ..];
+    const ciphertext = packet[Aes256Gcm.nonce_length .. packet.len - Aes256Gcm.tag_length];
+    const data = try allocator.alloc(u8, encoder.calcSize(ciphertext.len));
+    defer allocator.free(data);
+    var iv: [16]u8 = undefined;
+    var tag_base64: [24]u8 = undefined;
+    return std.fmt.allocPrint(allocator,
+        "{{\"encryptedData\":\"{s}\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}",
+        .{ encoder.encode(data, ciphertext), encoder.encode(&iv, nonce), encoder.encode(&tag_base64, tag) });
+}
+
+test "binary transport requires explicit renderer capability" {
+    try std.testing.expect(!targetRequestsBinary("/socket?webviewId=1"));
+    try std.testing.expect(!targetRequestsBinary("/socket?webviewId=1&binary=10"));
+    try std.testing.expect(targetRequestsBinary("/socket?webviewId=1&binary=1"));
+}
+
 fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
     const io = coreIo();
     incrementHostTransportDebug("connections");
@@ -1294,7 +1327,7 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
 
     writeWebSocketHandshake(out, websocket_key) catch return;
 
-    if (!attachWebviewSocketHandle(webview_id, stream.socket.handle)) {
+    if (!attachWebviewSocketHandle(webview_id, stream.socket.handle, targetRequestsBinary(request.head.target))) {
         return;
     }
 
@@ -1481,6 +1514,16 @@ fn buildElectrobunPreload(
 }
 
 export fn configureWebviewRuntime(
+    rpc_port: u32,
+    preload_script: [*:0]const u8,
+    preload_script_sandboxed: [*:0]const u8,
+) bool {
+    return configureWebviewRuntimeV2(rpc_port, preload_script, preload_script_sandboxed, false);
+}
+
+// Preserve the published ABI used by the native-language SDKs. New optional
+// capabilities must never add arguments to an existing C entrypoint.
+export fn configureWebviewRuntimeV2(
     rpc_port: u32,
     preload_script: [*:0]const u8,
     preload_script_sandboxed: [*:0]const u8,
@@ -1989,7 +2032,7 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         null;
     defer if (rules_json) |allocated| allocator.free(allocated);
 
-    const webview_id = createWebview(
+    const webview_id = createWebviewV2(
         window_id,
         host_webview_id,
         renderer_z.ptr,
@@ -2982,6 +3025,38 @@ export fn createWebview(
     navigation_callback: ?DecideNavigationHandler,
     webview_event_handler: ?WebviewEventHandler,
     event_bridge_handler: ?WebviewPostMessageHandler,
+    host_bridge_handler: ?WebviewPostMessageHandler,
+    internal_bridge_handler: ?WebviewPostMessageHandler,
+    secret_key: [*:0]const u8,
+    custom_preload_script: [*:0]const u8,
+    views_root: [*:0]const u8,
+    sandbox: bool,
+    start_transparent: bool,
+    start_passthrough: bool,
+    spell_check: bool,
+) u32 {
+    return createWebviewV2(window_id, host_webview_id, renderer, url,
+        x, y, width, height, auto_resize, partition_identifier,
+        navigation_callback, webview_event_handler, event_bridge_handler,
+        host_bridge_handler, internal_bridge_handler, secret_key,
+        custom_preload_script, views_root, sandbox, start_transparent,
+        start_passthrough, spell_check, if (sandbox) "untrusted" else "trusted");
+}
+
+export fn createWebviewV2(
+    window_id: u32,
+    host_webview_id: u32,
+    renderer: [*:0]const u8,
+    url: [*:0]const u8,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    auto_resize: bool,
+    partition_identifier: [*:0]const u8,
+    navigation_callback: ?DecideNavigationHandler,
+    webview_event_handler: ?WebviewEventHandler,
+    event_bridge_handler: ?WebviewPostMessageHandler,
     _host_bridge_handler: ?WebviewPostMessageHandler,
     _internal_bridge_handler: ?WebviewPostMessageHandler,
     secret_key: [*:0]const u8,
@@ -3429,7 +3504,15 @@ export fn sendHostMessageToWebviewViaTransport(webview_id: u32, message_json: [*
         return false;
     };
 
-    return enqueueHostTransportSend(webview_id, socket_handle, 0x2, encrypted_packet);
+    if (context.binary_transport) {
+        return enqueueHostTransportSend(webview_id, socket_handle, 0x2, encrypted_packet);
+    }
+    defer allocator.free(encrypted_packet);
+    const text_packet = binaryPacketToText(encrypted_packet) catch |err| {
+        setLastError("Failed to encode legacy host transport packet: {s}", .{@errorName(err)});
+        return false;
+    };
+    return enqueueHostTransportSend(webview_id, socket_handle, 0x1, text_packet);
 }
 
 export fn sendPreEncryptedHostMessageToWebviewViaTransport(

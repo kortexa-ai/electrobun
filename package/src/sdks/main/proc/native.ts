@@ -6,7 +6,6 @@ import {
 	BrowserView,
 	emitWebviewTagBrowserViewCreated,
 } from "../core/BrowserView";
-import { BrowserWindow, BrowserWindowMap } from "../core/BrowserWindow";
 import { WGPUView } from "../core/WGPUView";
 import {
 	preloadScript,
@@ -157,7 +156,7 @@ function ensureWebviewRuntimeConfigured() {
 		return;
 	}
 
-	const configured = core?.symbols.configureWebviewRuntime(
+	const configured = core?.symbols.configureWebviewRuntimeV2(
 		0,
 		toCString(preloadScript),
 		toCString(preloadScriptSandboxed),
@@ -338,7 +337,7 @@ const core = (() => {
 				args: [FFIType.u32, FFIType.ptr, FFIType.ptr],
 				returns: FFIType.void,
 			},
-			configureWebviewRuntime: {
+			configureWebviewRuntimeV2: {
 				args: [
 					FFIType.u32,
 					FFIType.cstring,
@@ -347,7 +346,7 @@ const core = (() => {
 				],
 				returns: FFIType.bool,
 			},
-			createWebview: {
+			createWebviewV2: {
 				args: [
 					FFIType.u32,
 					FFIType.u32,
@@ -1987,7 +1986,7 @@ const _ffiImpl = {
 				allowedProtocols.appData,
 			);
 
-			const webviewId = core_.symbols.createWebview(
+			const webviewId = core_.symbols.createWebviewV2(
 				windowId,
 				hostWebviewId || 0,
 				toCString(renderer),
@@ -3449,6 +3448,7 @@ function closeEmbeddedChromeWindow(windowId?: number) {
 	// Inline require to avoid pulling Utils into the module-init cycle
 	// (BrowserWindow → events → Utils path is already touchy).
 	const { quit } = require("../core/Utils");
+	const { BrowserWindow, BrowserWindowMap } = require("../core/BrowserWindow");
 	const remainingWindows = Object.keys(BrowserWindowMap).length;
 	if (windowId != null && remainingWindows > 1) {
 		const win = BrowserWindow.getById(windowId);
