@@ -409,9 +409,7 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextStartPassthrough.store(startPassthrough);
 }
 
-// Keep ABI parity with desktop wrappers. WPE currently exposes views:// to
-// application views and has no appdata:// backend, so this is advisory until
-// the embedded scheme handler gains per-view protocol policy.
+// Per-view views:// policy. appdata:// is not implemented by WPE.
 ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
     g_nextAllowViews = allowViews;
     (void)allowAppData;
