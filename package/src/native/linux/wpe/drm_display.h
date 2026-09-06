@@ -69,7 +69,7 @@ public:
     // Submit the acquired frame for scanout. Non-blocking; returns when the
     // page-flip is queued (not when it completes). A subsequent acquire()
     // waits for completion.
-    void present();
+    bool present();
 
     // DRM device fd. Watch it for readability (page-flip completion events)
     // and call handleEvents() to drain them, so presentation never blocks

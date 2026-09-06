@@ -395,6 +395,12 @@ struct EglReadback::Impl {
 
         for (const auto& layer : layers) {
             if (!layer.image || layer.width <= 0 || layer.height <= 0) continue;
+            if (layer.transparent) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                glDisable(GL_BLEND);
+            }
             if (directScanout) {
                 switch (rotationQuarters) {
                     case 0:

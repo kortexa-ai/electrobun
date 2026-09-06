@@ -40,11 +40,17 @@ describe("bridge callback payload ownership", () => {
 			"HRESULT PostMessage(BSTR message)",
 			"};\n\n// Dispatch IDs",
 		);
+		const wpeHandler = between(
+			read("native/linux/wpe/wpe_backend.cpp"),
+			"static void forwardBridgeMessage(",
+			"static void onBunBridgeMessageStatic(",
+		);
 
-		for (const handler of [macosHandler, linuxHandlers, windowsHandler]) {
+		for (const handler of [macosHandler, linuxHandlers, windowsHandler, wpeHandler]) {
 			expect(handler).not.toContain("sleep_for");
 			expect(handler).not.toContain("dispatch_after");
 			expect(handler).not.toContain("messageCopy");
+			expect(handler).not.toContain("g_timeout_add");
 		}
 	});
 });

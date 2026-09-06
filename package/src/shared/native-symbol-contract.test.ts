@@ -18,6 +18,7 @@ const sources = {
 	wrappers: {
 		darwin: readSource("native/macos/nativeWrapper.mm"),
 		linux: readSource("native/linux/nativeWrapper.cpp"),
+		wpe: readSource("native/linux/nativeWrapper_wpe.cpp"),
 		win32: readSource("native/win/nativeWrapper.cpp"),
 	},
 };
@@ -271,6 +272,7 @@ describe("TypeScript to NativeWrapper ABI", () => {
 	test.each([
 		["darwin", uniqueSorted([...directWrapperCommonSymbols, ...directWrapperDarwinSymbols])],
 		["linux", directWrapperCommonSymbols],
+		["wpe", directWrapperCommonSymbols],
 		["win32", uniqueSorted([...directWrapperCommonSymbols, ...directWrapperWindowsSymbols])],
 	] as const)("every %s descriptor has a wrapper definition", (platform, symbols) => {
 		const missing = symbols.filter(
@@ -285,7 +287,7 @@ describe("ElectrobunCore to NativeWrapper ABI", () => {
 		expect(coreBootstrapWrapperSymbols).toEqual(["forceExit", "startEventLoop"]);
 	});
 
-	test.each(["darwin", "linux", "win32"] as const)(
+	test.each(["darwin", "linux", "wpe", "win32"] as const)(
 		"every %s Core lookup has a wrapper definition",
 		(platform) => {
 			const missing = allCoreWrapperSymbols.filter(

@@ -31,6 +31,7 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <functional>
 
 using namespace electrobun;
 
@@ -74,7 +75,11 @@ QuitRequestedHandler wpeGetQuitRequestedHandler() { return g_quitRequestedHandle
 // the given webviewId, or nullptr if it hasn't been created yet. Used by the
 // FFI exports below that take only a webviewId (no AbstractView*) to dispatch
 // to the impl.
-namespace electrobun { AbstractView* wpeFindViewById(uint32_t webviewId); }
+namespace electrobun {
+    AbstractView* wpeFindViewById(uint32_t webviewId);
+    void wpeDispatchSync(std::function<void()> fn);
+}
+extern "C" void requestWindowClose(void* window);
 
 // ---------------------------------------------------------------------------
 // Multi-window emulation on bare-DRM. The kiosk has exactly one DRM scanout,
@@ -93,6 +98,7 @@ struct WpeWindowEntry {
     WindowCloseCallback closeCallback;
     WindowShouldCloseHandler shouldCloseCallback;
     bool                usesCompositedChrome;
+    bool                visible = true;
 };
 
 static std::mutex                                              g_windowsMutex;
@@ -125,7 +131,7 @@ static void closeWpeWindow(void* window) {
 static void handleWindowChromeAction(void* window, WindowChromeAction action) {
     switch (action) {
         case WindowChromeAction::Close:
-            closeWpeWindow(window);
+            requestWindowClose(window);
             break;
         case WindowChromeAction::Maximize:
             currentDisplayBackend().setWindowMaximized(window, true);
@@ -257,10 +263,31 @@ ELECTROBUN_EXPORT uint32_t getWindowStyle(bool borderless, bool titled, bool clo
 }
 
 ELECTROBUN_EXPORT void setWindowTitle(void* window, const char* title) { (void)window; (void)title; }
-ELECTROBUN_EXPORT void showWindow(void* window, bool activate)         { (void)window; (void)activate; }
+ELECTROBUN_EXPORT void showWindow(void* window, bool activate) {
+    (void)activate;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_windows.find(window);
+        if (it == g_windows.end()) return;
+        it->second->visible = true;
+    }
+    currentDisplayBackend().setWindowVisible(window, true);
+}
 ELECTROBUN_EXPORT void activateWindow(void* window)                    { (void)window; }
-ELECTROBUN_EXPORT void hideWindow(void* window)                        { (void)window; }
-ELECTROBUN_EXPORT bool isWindowVisible(void* window)                   { (void)window; return true; }
+ELECTROBUN_EXPORT void hideWindow(void* window) {
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_windows.find(window);
+        if (it == g_windows.end()) return;
+        it->second->visible = false;
+    }
+    currentDisplayBackend().setWindowVisible(window, false);
+}
+ELECTROBUN_EXPORT bool isWindowVisible(void* window) {
+    std::lock_guard<std::mutex> lock(g_windowsMutex);
+    auto it = g_windows.find(window);
+    return it != g_windows.end() && it->second->visible;
+}
 ELECTROBUN_EXPORT void closeWindow(void* window) {
     closeWpeWindow(window);
 }
@@ -279,9 +306,9 @@ ELECTROBUN_EXPORT void requestWindowClose(void* window) {
     else closeWpeWindow(window);
 }
 
-ELECTROBUN_EXPORT void minimizeWindow(void* window)                  { (void)window; }
-ELECTROBUN_EXPORT void restoreWindow(void* window)                   { (void)window; }
-ELECTROBUN_EXPORT bool isWindowMinimized(void* window)               { (void)window; return false; }
+ELECTROBUN_EXPORT void minimizeWindow(void* window) { hideWindow(window); }
+ELECTROBUN_EXPORT void restoreWindow(void* window) { showWindow(window, true); }
+ELECTROBUN_EXPORT bool isWindowMinimized(void* window) { return !isWindowVisible(window); }
 ELECTROBUN_EXPORT void maximizeWindow(void* window) {
     currentDisplayBackend().setWindowMaximized(window, true);
 }
@@ -373,8 +400,9 @@ ELECTROBUN_EXPORT bool captureScreenRegion(double x, double y, uint32_t width, u
 
 // Storage for setNextWebviewFlags; consumed on next initWebview.
 // TODO(phase2.next): thread through WebviewSpec if wpe actually uses these.
-static std::atomic<bool> g_nextStartTransparent{false};
-static std::atomic<bool> g_nextStartPassthrough{false};
+static thread_local std::atomic<bool> g_nextStartTransparent{false};
+static thread_local std::atomic<bool> g_nextStartPassthrough{false};
+static thread_local bool g_nextAllowViews = true;
 
 ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPassthrough) {
     g_nextStartTransparent.store(startTransparent);
@@ -385,7 +413,7 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
 // application views and has no appdata:// backend, so this is advisory until
 // the embedded scheme handler gains per-view protocol policy.
 ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
-    (void)allowViews;
+    g_nextAllowViews = allowViews;
     (void)allowAppData;
 }
 
@@ -393,7 +421,7 @@ ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allo
 // shares the WPEWebProcess of the seed via related-view), 1 = untrusted
 // (view gets its own WPEWebProcess). Mirrors the setNextWebviewFlags
 // pattern to avoid bloating initWebview's already-long FFI signature.
-static std::atomic<int> g_nextTrust{0};
+static thread_local std::atomic<int> g_nextTrust{0};
 
 ELECTROBUN_EXPORT void setNextWebviewTrust(const char* trust) {
     g_nextTrust.store((trust && std::strcmp(trust, "untrusted") == 0) ? 1 : 0);
@@ -405,8 +433,8 @@ ELECTROBUN_EXPORT void setNextWebviewTrust(const char* trust) {
 // hardcoded to (0, 0) by BrowserWindow.init for cross-target portability,
 // so this is how we communicate "where on the panel does the BrowserWindow
 // belong" without changing the cross-target API.
-static std::atomic<int32_t> g_nextWindowFrameX{0};
-static std::atomic<int32_t> g_nextWindowFrameY{0};
+static thread_local std::atomic<int32_t> g_nextWindowFrameX{0};
+static thread_local std::atomic<int32_t> g_nextWindowFrameY{0};
 
 ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t x, int32_t y) {
     g_nextWindowFrameX.store(x);
@@ -433,10 +461,12 @@ ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                                             bool sandbox) {
     (void)autoResize;
     (void)viewsRoot; (void)transparent;
-    g_nextStartTransparent.store(false);
-    g_nextStartPassthrough.store(false);
-
     WebviewSpec spec{};
+    spec.startTransparent = transparent || g_nextStartTransparent.exchange(false);
+    g_nextStartTransparent.store(false);
+    spec.startPassthrough = g_nextStartPassthrough.exchange(false);
+    spec.allowViews = g_nextAllowViews;
+    g_nextAllowViews = true;
     spec.webviewId            = webviewId;
     spec.hostWindow           = window;
     spec.frame                = Rect{(int)x, (int)y, (int)width, (int)height};
@@ -472,32 +502,40 @@ ELECTROBUN_EXPORT AbstractView* initWGPUView(uint32_t webviewId,
 }
 
 ELECTROBUN_EXPORT void loadURLInWebView(AbstractView* v, const char* url) {
-    if (v && url) v->loadURL(url);
+    wpeDispatchSync([&] { if (v && url) v->loadURL(url); });
 }
 
 ELECTROBUN_EXPORT void loadHTMLInWebView(AbstractView* v, const char* html) {
-    if (v && html) v->loadHTML(html);
+    wpeDispatchSync([&] { if (v && html) v->loadHTML(html); });
 }
 
-ELECTROBUN_EXPORT void webviewGoBack(AbstractView* v)    { if (v) v->goBack(); }
-ELECTROBUN_EXPORT void webviewGoForward(AbstractView* v) { if (v) v->goForward(); }
-ELECTROBUN_EXPORT void webviewReload(AbstractView* v)    { if (v) v->reload(); }
-ELECTROBUN_EXPORT void webviewRemove(AbstractView* v)    { if (v) v->remove(); }
-ELECTROBUN_EXPORT bool webviewCanGoBack(AbstractView* v)    { return v && v->canGoBack(); }
-ELECTROBUN_EXPORT bool webviewCanGoForward(AbstractView* v) { return v && v->canGoForward(); }
+ELECTROBUN_EXPORT void webviewGoBack(AbstractView* v)    { wpeDispatchSync([&] { if (v) v->goBack(); }); }
+ELECTROBUN_EXPORT void webviewGoForward(AbstractView* v) { wpeDispatchSync([&] { if (v) v->goForward(); }); }
+ELECTROBUN_EXPORT void webviewReload(AbstractView* v)    { wpeDispatchSync([&] { if (v) v->reload(); }); }
+ELECTROBUN_EXPORT void webviewRemove(AbstractView* v)    { wpeDispatchSync([&] { if (v) v->remove(); }); }
+ELECTROBUN_EXPORT bool webviewCanGoBack(AbstractView* v) {
+    bool result = false;
+    wpeDispatchSync([&] { result = v && v->canGoBack(); });
+    return result;
+}
+ELECTROBUN_EXPORT bool webviewCanGoForward(AbstractView* v) {
+    bool result = false;
+    wpeDispatchSync([&] { result = v && v->canGoForward(); });
+    return result;
+}
 
 ELECTROBUN_EXPORT void resizeWebview(AbstractView* v, double x, double y, double width, double height, const char* masksJson) {
     if (!v) return;
     Rect frame{(int)x, (int)y, (int)width, (int)height};
-    v->resize(frame, masksJson);
+    wpeDispatchSync([&] { v->resize(frame, masksJson); });
 }
 
 ELECTROBUN_EXPORT void evaluateJavaScriptWithNoCompletion(AbstractView* v, const char* js) {
-    if (v && js) v->evaluateJavaScriptWithNoCompletion(js);
+    wpeDispatchSync([&] { if (v && js) v->evaluateJavaScriptWithNoCompletion(js); });
 }
 
 ELECTROBUN_EXPORT void setWebviewNavigationRules(AbstractView* v, const char* rulesJson) {
-    if (v) v->setNavigationRulesFromJSON(rulesJson);
+    wpeDispatchSync([&] { if (v) v->setNavigationRulesFromJSON(rulesJson); });
 }
 
 ELECTROBUN_EXPORT void webviewFindInPage(AbstractView* v, const char* searchText, bool forward, bool matchCase) {
@@ -514,19 +552,21 @@ ELECTROBUN_EXPORT double webviewGetPageZoom(AbstractView* v)              { (voi
 
 ELECTROBUN_EXPORT void updatePreloadScriptToWebView(AbstractView* v, const char* scriptIdentifier, const char* scriptContent, bool forMainFrameOnly) {
     (void)scriptIdentifier; (void)forMainFrameOnly;
-    if (v && scriptContent) v->updateCustomPreloadScript(scriptContent);
+    wpeDispatchSync([&] { if (v && scriptContent) v->updateCustomPreloadScript(scriptContent); });
 }
 
 ELECTROBUN_EXPORT void addPreloadScriptToWebView(AbstractView* v, const char* scriptContent, bool forMainFrameOnly) {
     (void)forMainFrameOnly;
-    if (v && scriptContent) v->addPreloadScriptToWebView(scriptContent);
+    wpeDispatchSync([&] { if (v && scriptContent) v->addPreloadScriptToWebView(scriptContent); });
 }
 
 ELECTROBUN_EXPORT void callAsyncJavaScript(const char* messageId, const char* jsString, uint32_t webviewId, uint32_t hostWebviewId, void* completionHandler) {
+    wpeDispatchSync([&] {
     AbstractView* v = wpeFindViewById(webviewId);
     if (!v || !jsString || !completionHandler) return;
     v->callAsyncJavascript(messageId ? messageId : "", jsString,
                            webviewId, hostWebviewId, completionHandler);
+    });
 }
 
 // ===========================================================================
@@ -687,15 +727,15 @@ ELECTROBUN_EXPORT void testFFI2(void (*callback)()) {
 }
 
 ELECTROBUN_EXPORT void webviewSetTransparent(AbstractView* v, bool transparent) {
-    if (v) v->setTransparent(transparent);
+    wpeDispatchSync([&] { if (v) v->setTransparent(transparent); });
 }
 
 ELECTROBUN_EXPORT void webviewSetPassthrough(AbstractView* v, bool enable) {
-    if (v) v->setPassthrough(enable);
+    wpeDispatchSync([&] { if (v) v->setPassthrough(enable); });
 }
 
 ELECTROBUN_EXPORT void webviewSetHidden(AbstractView* v, bool hidden) {
-    if (v) v->setHidden(hidden);
+    wpeDispatchSync([&] { if (v) v->setHidden(hidden); });
 }
 ELECTROBUN_EXPORT bool webviewSetSpellCheck(AbstractView* v, bool enabled) {
     (void)v; (void)enabled;

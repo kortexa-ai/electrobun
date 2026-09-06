@@ -56,6 +56,9 @@ struct WebviewSpec {
     std::string url;
     std::string renderer;          // "webkit", "cef", or future "wpe"
     bool sandboxed = false;
+    bool allowViews = true;
+    bool startTransparent = false;
+    bool startPassthrough = false;
     std::string partition;
     void* navigationHandler = nullptr;
     void* webviewEventHandler = nullptr;   // WebviewEventHandler (3 args): fires for navigation/load events from native code
@@ -126,6 +129,10 @@ public:
     }
     virtual void revealWindowChrome(void* window) {
         (void)window;
+    }
+    virtual void setWindowVisible(void* window, bool visible) {
+        (void)window;
+        (void)visible;
     }
 };
 

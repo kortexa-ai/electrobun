@@ -308,7 +308,7 @@ DrmFrame DrmDisplay::acquire() {
     };
 }
 
-void DrmDisplay::present() {
+bool DrmDisplay::present() {
     impl_->pageFlipPending = true;
     int rc = drmModePageFlip(impl_->fd, impl_->crtcId,
                              impl_->buffers[impl_->backBuffer].fbId,
@@ -316,10 +316,11 @@ void DrmDisplay::present() {
                              &impl_->pageFlipPending);
     if (rc != 0) {
         impl_->pageFlipPending = false;
-        impl_->setError(std::string("drmModePageFlip: ") + strerror(-rc));
-        return;
+        impl_->setError(std::string("drmModePageFlip: ") + strerror(errno));
+        return false;
     }
     std::swap(impl_->frontBuffer, impl_->backBuffer);
+    return true;
 }
 
 const std::string& DrmDisplay::getLastError() const { return impl_->lastError; }
