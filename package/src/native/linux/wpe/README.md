@@ -58,6 +58,24 @@ Deployment-specific facts stay runtime-selected:
 - The display mode comes from the connected output unless a preferred mode is
   configured.
 
+## App-owned WebProcess extensions
+
+Set `ELECTROBUN_WPE_WEB_PROCESS_EXTENSIONS_DIR` before launching an embedded
+app to load its native WPE WebProcess extensions. The value must be an existing
+absolute directory; an unset/empty value keeps the normal behavior, and invalid
+values are logged and ignored. Only point it at trusted application-owned native
+modules. This does not change WebKit's own injected bundle.
+
+The backend configures WebKit on its UI thread before creating the first pooled
+view. Application JavaScript runs too late for that initialization. Extensions
+and their settings belong to the application; Electrobun does not set audio
+buffering or alter GStreamer clocks. Other platform backends ignore this WPE-only
+option. Remove the variable to disable loading on the next launch.
+
+The configuration-boundary test uses only GLib and never opens a WebView, audio
+device or display. Compile `web_process_extensions.test.cpp` with C++17 and
+the `glib-2.0` pkg-config flags, then run the resulting temporary executable.
+
 ## Prerequisites (verified in Phase 0)
 
 - `apt install cog libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libwpe-1.0-dev libwpebackend-fdo-1.0-dev libinput-dev libudev-dev libdrm-dev libgbm-dev libvulkan-dev xdg-desktop-portal`

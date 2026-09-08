@@ -25,6 +25,7 @@
 #include "input.h"
 #include "compositor_policy.h"
 #include "views_path.h"
+#include "web_process_extensions.h"
 
 #include <wpe/wpe.h>
 #include <wpe/fdo.h>
@@ -874,6 +875,17 @@ public:
         long tid = (long)syscall(SYS_gettid);
         g_mainThreadTid.store(tid, std::memory_order_relaxed);
         fprintf(stderr, "[WpeBackend] runEventLoop: entering on tid=%ld (recorded as main thread)\n", tid); fflush(stderr);
+
+        // Pooled views can launch a WebProcess before app JavaScript runs.
+        // Configure app-owned native extensions here, on WebKit's UI thread.
+        const auto extensions = configureWebProcessExtensions(
+            g_getenv("ELECTROBUN_WPE_WEB_PROCESS_EXTENSIONS_DIR"), [](const char* directory) {
+                webkit_web_context_set_web_process_extensions_directory(webkit_web_context_get_default(), directory);
+            });
+        if (extensions == WebProcessExtensions::InvalidDirectory)
+            fprintf(stderr, "[wpe] ignoring invalid WebProcess extension directory (requires an existing absolute directory)\n");
+        else if (extensions == WebProcessExtensions::Configured)
+            fprintf(stderr, "[wpe] WebProcess extensions configured before pooled view startup\n");
 
         // WPE-FDO requires its wayland-server source AND the WebKitWebView to
         // exist before g_main_loop_run starts iterating. Setting these up
