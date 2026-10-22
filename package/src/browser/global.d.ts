@@ -29,6 +29,10 @@ declare global {
     __electrobunPendingHostMessages?: unknown[];
     __electrobun_encrypt: (msg: string) => Promise<ElectrobunEncryptResult>;
     __electrobun_decrypt: (encryptedData: string, iv: string, tag: string) => Promise<string>;
+    // Binary packet variants (iv(12) | ciphertext | tag(16)) used by the
+    // host WebSocket transport. Optional: older preloads don't set them.
+    __electrobun_encrypt_binary?: (plaintext: string) => Promise<ArrayBuffer>;
+    __electrobun_decrypt_binary?: (packet: ArrayBuffer) => Promise<string>;
     __electrobunInternalBridge?: MessageHandler;
     __electrobunHostBridge?: MessageHandler;
     __electrobunBunBridge?: MessageHandler;

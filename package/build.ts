@@ -58,6 +58,10 @@ import {
 	serializeNativeCompileFlags,
 	type NativeCompilePlatform,
 } from "./src/shared/native-compile-flags";
+import {
+	createRuntimeManifest,
+	RUNTIME_MANIFEST_FILENAME,
+} from "./src/shared/runtime-manifest";
 
 console.log("building...", platform(), arch());
 
@@ -80,6 +84,8 @@ const { values: args } = parseArgs({
 			type: "boolean",
 		},
 		arch: { type: "string" },
+		"reuse-vendors": { type: "boolean" },
+		serial: { type: "boolean" },
 		npm: {
 			type: "boolean",
 		},
@@ -91,6 +97,7 @@ const { values: args } = parseArgs({
 const CHANNEL: "debug" | "release" = args.release ? "release" : "debug";
 const IS_NPM_BUILD = args.npm || false;
 const CORE_ONLY_BUILD = args["core-only"] || false;
+const REUSE_VENDORS = args["reuse-vendors"] || false;
 const OS: "win" | "linux" | "macos" = getPlatform();
 const ARCH: "arm64" | "x64" = getArch();
 const HOST_ARCH = resolveBuildArch(arch());
@@ -238,7 +245,7 @@ try {
 		console.log("Building for npm (JS/TS files only)...");
 		await buildForNpm();
 	} else {
-		await setup();
+		if (!REUSE_VENDORS) await setup();
 		await build();
 		await copyToDist();
 	}
@@ -369,6 +376,7 @@ async function runZigBuild(
 ) {
 	const optimizeArgs =
 		CHANNEL === "release" ? [`-Doptimize=${releaseOptimize}`] : [];
+	if (args.serial) zigArgs = [...zigArgs, "-j2"];
 	if (OS === "win") {
 		runInherited(
 			PATH.zig.BIN,
@@ -698,7 +706,7 @@ async function setup() {
 
 async function build() {
 	await createDistFolder();
-	await installPackageDependencies();
+	if (!REUSE_VENDORS) await installPackageDependencies();
 
 	// await buildAsar(); // Now using vendored binaries from zig-asar releases
 	await buildNative(); // zig depends on this for linking symbols
@@ -707,12 +715,12 @@ async function build() {
 	console.log("Building preload script...");
 	await buildPreload();
 
-	await Promise.all([
-		buildSelfExtractor(),
-		buildCore(),
-		buildLauncher(),
-		buildMainJs(),
-	]);
+	const stages = [buildSelfExtractor, buildCore, buildLauncher, buildMainJs];
+	if (args.serial) {
+		for (const stage of stages) await stage();
+	} else {
+		await Promise.all(stages.map((stage) => stage()));
+	}
 }
 
 async function buildForNpm() {
@@ -940,29 +948,35 @@ async function copyToDist() {
 		cpSync("src/native/build/process_helper.exe", "dist/process_helper.exe", { force: true });
 	} else if (OS === "linux") {
 		// Copy both GTK-only and CEF native wrappers for flexible deployment
-		if (
-			existsSync(
-				join(process.cwd(), "src", "native", "build", "libNativeWrapper.so"),
-			)
-		) {
+		const nativeBuildDir = join(process.cwd(), "src", "native", "build");
+		const gtkWrapper = join(nativeBuildDir, "libNativeWrapper.so");
+		const cefWrapper = join(nativeBuildDir, "libNativeWrapper_cef.so");
+		const wpeWrapper = join(nativeBuildDir, "libNativeWrapper_wpe.so");
+		const hasGtkWrapper = existsSync(gtkWrapper);
+		const hasWpeWrapper = existsSync(wpeWrapper);
+
+		if (hasGtkWrapper) {
 			await $`cp src/native/build/libNativeWrapper.so dist/libNativeWrapper.so`;
 		}
-		if (
-			existsSync(
-				join(
-					process.cwd(),
-					"src",
-					"native",
-					"build",
-					"libNativeWrapper_cef.so",
-				),
-			)
-		) {
+		if (existsSync(cefWrapper)) {
 			await $`cp src/native/build/libNativeWrapper_cef.so dist/libNativeWrapper_cef.so`;
+		}
+		if (hasWpeWrapper) {
+			await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper_wpe.so`;
+
+			// Hutch packages the canonical wrapper name. On an embedded-only
+			// host, make the WPE wrapper available under that name too. Schema 1
+			// also requires a CEF wrapper path even when this devkit cannot build
+			// GTK/CEF; use the same ABI-compatible wrapper so Hutch can validate
+			// the WPE-only devkit. Embedded projects keep bundleCEF disabled.
+			if (!hasGtkWrapper) {
+				await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper.so`;
+				await $`cp src/native/build/libNativeWrapper_wpe.so dist/libNativeWrapper_cef.so`;
+			}
 		}
 
 		// CEF binaries for Linux - copy to cef/ subdirectory
-		if (existsSync(join(process.cwd(), "vendors", "cef", "Release"))) {
+		if (hasGtkWrapper && existsSync(join(process.cwd(), "vendors", "cef", "Release"))) {
 			console.log("Copying CEF files for Linux...");
 			await $`mkdir -p dist/cef`;
 
@@ -1023,8 +1037,37 @@ async function copyToDist() {
 	);
 
 	normalizeDistExecutableModes("dist");
+	writeRuntimeManifest(coreLibName);
 	// Create platform-specific dist folder and copy all files
 	await createPlatformDistFolder();
+}
+
+function writeRuntimeManifest(coreLibName: string) {
+	const platformName = `${OS}-${ARCH}`;
+	const manifest = createRuntimeManifest(platformName, {
+		launcher: join("dist", `launcher${binExt}`),
+		extractor: join("dist", `extractor${binExt}`),
+		core: join("dist", coreLibName),
+		"native-wrapper-default": join(
+			"dist",
+			OS === "win"
+				? "libNativeWrapper.dll"
+				: OS === "macos"
+					? "libNativeWrapper.dylib"
+					: "libNativeWrapper.so",
+		),
+		"native-wrapper-cef": join("dist", "libNativeWrapper_cef.so"),
+		"native-wrapper-wpe": join("dist", "libNativeWrapper_wpe.so"),
+		"main-js": join("dist", "main.js"),
+		"preload-full": join("dist", "preload-full.js"),
+		"preload-sandboxed": join("dist", "preload-sandboxed.js"),
+	});
+
+	writeFileSync(
+		join("dist", RUNTIME_MANIFEST_FILENAME),
+		`${JSON.stringify(manifest, null, 2)}\n`,
+	);
+	console.log(`✓ Wrote runtime manifest ${manifest.buildId.slice(0, 12)}`);
 }
 
 function normalizeDistExecutableModes(directory: string) {
@@ -2366,22 +2409,33 @@ async function buildNative() {
 			`link /DLL /MANIFEST:EMBED /OUT:src/native/win/build/libNativeWrapper.dll user32.lib ole32.lib shell32.lib shlwapi.lib advapi32.lib dcomp.lib d2d1.lib d3d12.lib kernel32.lib comctl32.lib ${wgpuLib} "${webview2Lib}" "${cefLib}" "${cefWrapperLib}" delayimp.lib /DELAYLOAD:libcef.dll /DELAYLOAD:webgpu_dawn.dll libcmt.lib /IMPLIB:src/native/win/build/libNativeWrapper.lib src/native/win/build/nativeWrapper.obj`,
 		);
 	} else if (OS === "linux") {
-		// Skip package checks in CI or continue anyway if packages are missing
+		// Pre-flight: is a GTK desktop build possible on this host? Embedded-
+		// only build machines (Pi kiosks with only WPE/DRM installed) skip the
+		// GTK/CEF link steps and only build libNativeWrapper_wpe.so.
+		let gtkAvailable = true;
 		if (!process.env["GITHUB_ACTIONS"]) {
 			try {
-				// Check if required packages are available first
-				await $`pkg-config --exists webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`;
-				console.log("✓ All required packages found via pkg-config");
-			} catch (error) {
+				await $`pkg-config --exists webkit2gtk-4.1 gtk+-3.0`.quiet();
+				console.log("✓ GTK/WebKit dev packages found via pkg-config");
+			} catch {
+				gtkAvailable = false;
 				console.warn(
-					"⚠️  Warning: Some packages might be missing (pkg-config check failed)",
+					"⚠️  GTK/WebKit dev packages missing — skipping libNativeWrapper.so and libNativeWrapper_cef.so",
 				);
 				console.warn(
-					"   Continuing anyway - build may fail if packages are actually missing",
+					"   (Install libgtk-3-dev libwebkit2gtk-4.1-dev to enable desktop-Linux builds)",
 				);
 			}
 		} else {
 			console.log("Running in CI - skipping package checks");
+		}
+
+		if (!gtkAvailable) {
+			// Do not let artifacts from an earlier desktop build mask the WPE
+			// fallback when this host can only build the embedded backend.
+			const nativeBuildDir = join(process.cwd(), "src", "native", "build");
+			rmSync(join(nativeBuildDir, "libNativeWrapper.so"), { force: true });
+			rmSync(join(nativeBuildDir, "libNativeWrapper_cef.so"), { force: true });
 		}
 
 		try {
@@ -2421,26 +2475,30 @@ async function buildNative() {
 				);
 			}
 
-			// Get pkg-config flags, falling back to manual flags if not available
-			let pkgConfigCflags = "";
-			let pkgConfigLibs = "";
-			let hasAppIndicator = false;
-			let pipewireCflags = "";
-			let hasWaylandScreenCapture = false;
+			// asarLib is needed by both GTK and WPE link steps below.
+			await $`mkdir -p src/native/build`;
+			const asarLib = join(process.cwd(), "vendors", "zig-asar", "libasar.so");
 
-			try {
-				// Try to get flags for all packages
-				const cflagsResult =
-					await $`pkg-config --cflags webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
-				pkgConfigCflags = cflagsResult.stdout.toString().trim();
-				const libsResult =
-					await $`pkg-config --libs webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
-				pkgConfigLibs = libsResult.stdout.toString().trim();
-				hasAppIndicator = true;
-				console.log("Successfully retrieved pkg-config flags");
-			} catch {
-				// If that fails, try without ayatana-appindicator3
+			if (gtkAvailable) {
+				// Get pkg-config flags, falling back to manual flags if not available
+				let pkgConfigCflags = "";
+				let pkgConfigLibs = "";
+				let hasAppIndicator = false;
+				let pipewireCflags = "";
+				let hasWaylandScreenCapture = false;
+
 				try {
+					// Try to get flags for all packages
+					const cflagsResult =
+						await $`pkg-config --cflags webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
+					pkgConfigCflags = cflagsResult.stdout.toString().trim();
+					const libsResult =
+						await $`pkg-config --libs webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
+					pkgConfigLibs = libsResult.stdout.toString().trim();
+					hasAppIndicator = true;
+					console.log("Successfully retrieved pkg-config flags");
+				} catch {
+					// If that fails, try without ayatana-appindicator3
 					const cflagsResult =
 						await $`pkg-config --cflags webkit2gtk-4.1 gtk+-3.0`.quiet();
 					pkgConfigCflags = cflagsResult.stdout.toString().trim();
@@ -2449,134 +2507,184 @@ async function buildNative() {
 					pkgConfigLibs = libsResult.stdout.toString().trim();
 					console.warn("⚠️  Using pkg-config without ayatana-appindicator3-0.1");
 					console.log("   cflags:", pkgConfigCflags.substring(0, 100) + "...");
-				} catch (error) {
-					// Fallback to manual flags if pkg-config fails entirely
-					console.warn("⚠️  pkg-config failed, using fallback flags");
-					console.warn("   Error:", error);
-					// Detect architecture for correct glib path
-					const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
-					pkgConfigCflags = `-I/usr/include/gtk-3.0 -I/usr/include/webkit2gtk-4.1 -I/usr/include/glib-2.0 -I/usr/lib/${arch}-linux-gnu/glib-2.0/include -I/usr/include/pango-1.0 -I/usr/include/cairo -I/usr/include/gdk-pixbuf-2.0 -I/usr/include/atk-1.0`;
-					pkgConfigLibs = "-lgtk-3 -lwebkit2gtk-4.1 -lglib-2.0 -lgobject-2.0";
 				}
-			}
 
-			try {
-				const cflagsResult =
-					await $`pkg-config --cflags libpipewire-0.3`.quiet();
-				pipewireCflags = cflagsResult.stdout.toString().trim();
-				hasWaylandScreenCapture = true;
-				console.log("Wayland screen capture enabled via PipeWire");
-			} catch {
-				console.warn(
-					"⚠️  Wayland screen capture disabled: PipeWire development headers not found",
-				);
-			}
+				try {
+					const cflagsResult =
+						await $`pkg-config --cflags libpipewire-0.3`.quiet();
+					pipewireCflags = cflagsResult.stdout.toString().trim();
+					hasWaylandScreenCapture = true;
+					console.log("Wayland screen capture enabled via PipeWire");
+				} catch {
+					console.warn(
+						"⚠️  Wayland screen capture disabled: PipeWire development headers not found",
+					);
+				}
 
-			// Compile the main wrapper with WebKitGTK, AppIndicator, and CEF headers
-			await $`mkdir -p src/native/linux/build`;
-			console.log(
-				"Compiling with flags:",
-				pkgConfigCflags ? "pkg-config flags present" : "NO FLAGS!",
-			);
-
-			// Build the complete g++ command as an array to avoid shell interpolation issues
-			const compileFlags = [
-				"-std=c++20",
-				"-fPIC",
-				...pkgConfigCflags.split(/\s+/).filter((f) => f),
-				...pipewireCflags.split(/\s+/).filter((f) => f),
-				`-I${cefInclude}`,
-				...(existsSync(wgpuIncludeDir) ? [`-I${wgpuIncludeDir}`] : []),
-				...(hasAppIndicator ? [] : ["-DNO_APPINDICATOR"]),
-				...(hasWaylandScreenCapture
-					? ["-DELECTROBUN_ENABLE_WAYLAND_SCREEN_CAPTURE"]
-					: []),
-			];
-			writeNativeCompileFlags("linux", compileFlags);
-			const compileCmd = [
-				"g++",
-				"-c",
-				...compileFlags,
-				"-o",
-				"src/native/linux/build/nativeWrapper.o",
-				"src/native/linux/nativeWrapper.cpp",
-			];
-
-			await $`${compileCmd}`;
-
-			const waylandCaptureCompileCmd = [
-				"g++",
-				"-c",
-				...compileFlags,
-				"-o",
-				"src/native/linux/build/wayland_screen_capture.o",
-				"src/native/linux/wayland_screen_capture.cpp",
-			];
-			await $`${waylandCaptureCompileCmd}`;
-
-			const waylandPipeWireCaptureCompileCmd = [
-				"g++",
-				"-c",
-				...compileFlags,
-				"-o",
-				"src/native/linux/build/wayland_pipewire_capture.o",
-				"src/native/linux/wayland_pipewire_capture.cpp",
-			];
-			await $`${waylandPipeWireCaptureCompileCmd}`;
-
-			// Link with WebKitGTK, AppIndicator, and optionally CEF libraries using weak linking
-			await $`mkdir -p src/native/build`;
-
-			// Build both GTK-only and CEF versions for Linux
-			const asarLib = join(process.cwd(), "vendors", "zig-asar", "libasar.so");
-
-			console.log("Building GTK-only version (libNativeWrapper.so)");
-			const linkCmd = [
-				"g++",
-				"-shared",
-				"-o",
-				"src/native/build/libNativeWrapper.so",
-				"src/native/linux/build/nativeWrapper.o",
-				"src/native/linux/build/wayland_screen_capture.o",
-				"src/native/linux/build/wayland_pipewire_capture.o",
-				asarLib,
-				...pkgConfigLibs.split(/\s+/).filter((f) => f),
-				"-ldl",
-				"-lpthread",
-			];
-			await $`${linkCmd}`;
-
-			if (cefLibsExist) {
-				console.log("Compiling CEF loader...");
-				await $`g++ -c -std=c++20 -fPIC -I${cefInclude} -o src/native/linux/build/cef_loader.o src/native/linux/cef_loader.cpp`;
-
+				// Compile the main wrapper with WebKitGTK, AppIndicator, and CEF headers
+				await $`mkdir -p src/native/linux/build`;
 				console.log(
-					"Building CEF version (libNativeWrapper_cef.so) with weak linking",
+					"Compiling with flags:",
+					pkgConfigCflags ? "pkg-config flags present" : "NO FLAGS!",
 				);
-				const linkCefCmd = [
+
+				// Build the complete g++ command as an array to avoid shell interpolation issues.
+				const compileFlags = [
+					"-std=c++20",
+					// No -O flag means -O0: measured 3.4x slower on the WPE
+					// compositor blit loops (Pi 5). -O2 across all channels.
+					"-O2",
+					"-fPIC",
+					...pkgConfigCflags.split(/\s+/).filter((f) => f),
+					...pipewireCflags.split(/\s+/).filter((f) => f),
+					`-I${cefInclude}`,
+					...(existsSync(wgpuIncludeDir) ? [`-I${wgpuIncludeDir}`] : []),
+					...(hasAppIndicator ? [] : ["-DNO_APPINDICATOR"]),
+					...(hasWaylandScreenCapture
+						? ["-DELECTROBUN_ENABLE_WAYLAND_SCREEN_CAPTURE"]
+						: []),
+				];
+				writeNativeCompileFlags("linux", compileFlags);
+				const compileCmd = [
+					"g++",
+					"-c",
+					...compileFlags,
+					"-o",
+					"src/native/linux/build/nativeWrapper.o",
+					"src/native/linux/nativeWrapper.cpp",
+				];
+
+				await $`${compileCmd}`;
+
+				const waylandCaptureCompileCmd = [
+					"g++",
+					"-c",
+					...compileFlags,
+					"-o",
+					"src/native/linux/build/wayland_screen_capture.o",
+					"src/native/linux/wayland_screen_capture.cpp",
+				];
+				await $`${waylandCaptureCompileCmd}`;
+
+				const waylandPipeWireCaptureCompileCmd = [
+					"g++",
+					"-c",
+					...compileFlags,
+					"-o",
+					"src/native/linux/build/wayland_pipewire_capture.o",
+					"src/native/linux/wayland_pipewire_capture.cpp",
+				];
+				await $`${waylandPipeWireCaptureCompileCmd}`;
+
+				console.log("Building GTK-only version (libNativeWrapper.so)");
+				const linkCmd = [
 					"g++",
 					"-shared",
 					"-o",
-					"src/native/build/libNativeWrapper_cef.so",
+					"src/native/build/libNativeWrapper.so",
 					"src/native/linux/build/nativeWrapper.o",
 					"src/native/linux/build/wayland_screen_capture.o",
 					"src/native/linux/build/wayland_pipewire_capture.o",
-					"src/native/linux/build/cef_loader.o",
 					asarLib,
 					...pkgConfigLibs.split(/\s+/).filter((f) => f),
-					"-Wl,--whole-archive",
-					cefWrapperLib,
-					"-Wl,--no-whole-archive",
 					"-ldl",
 					"-lpthread",
-					"-Wl,-rpath,$ORIGIN:$ORIGIN/cef",
 				];
-				await $`${linkCefCmd}`;
+				await $`${linkCmd}`;
+
+				if (cefLibsExist) {
+					console.log("Compiling CEF loader...");
+					await $`g++ -c -std=c++20 -O2 -fPIC -I${cefInclude} -o src/native/linux/build/cef_loader.o src/native/linux/cef_loader.cpp`;
+
+					console.log(
+						"Building CEF version (libNativeWrapper_cef.so) with weak linking",
+					);
+					const linkCefCmd = [
+						"g++",
+						"-shared",
+						"-o",
+						"src/native/build/libNativeWrapper_cef.so",
+						"src/native/linux/build/nativeWrapper.o",
+						"src/native/linux/build/wayland_screen_capture.o",
+						"src/native/linux/build/wayland_pipewire_capture.o",
+						"src/native/linux/build/cef_loader.o",
+						asarLib,
+						...pkgConfigLibs.split(/\s+/).filter((f) => f),
+						"-Wl,--whole-archive",
+						cefWrapperLib,
+						"-Wl,--no-whole-archive",
+						"-ldl",
+						"-lpthread",
+						"-Wl,-rpath,$ORIGIN:$ORIGIN/cef",
+					];
+					await $`${linkCefCmd}`;
+					console.log(
+						"Built both GTK-only and CEF versions for flexible deployment",
+					);
+				} else {
+					console.log("CEF libraries not found - only GTK version built");
+				}
+			}
+
+			// WPE/DRM build for bare-Linux embedded target (Raspberry Pi kiosks,
+			// no compositor). Fully independent of the GTK/CEF build above —
+			// compiles nativeWrapper_wpe.cpp (parallel FFI surface) plus the
+			// wpe/ backend classes into libNativeWrapper_wpe.so.
+			//
+			// Gated on pkg-config: skipped silently on dev machines that don't
+			// have libwpe/libwpewebkit/libdrm/libinput installed. Installs on
+			// Raspberry Pi OS via:
+			//   sudo apt install libwpewebkit-2.0-dev libwpebackend-fdo-1.0-dev \
+			//                    libdrm-dev libinput-dev libudev-dev libwayland-dev
+			let wpeAvailable = false;
+			try {
+				await $`pkg-config --exists wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
+				wpeAvailable = true;
+			} catch {
 				console.log(
-					"Built both GTK-only and CEF versions for flexible deployment",
+					"WPE/DRM deps not found - skipping libNativeWrapper_wpe.so (install libwpewebkit-2.0-dev et al. to enable the embedded target)",
 				);
-			} else {
-				console.log("CEF libraries not found - only GTK version built");
+			}
+
+			if (wpeAvailable) {
+				console.log(
+					"Building WPE/DRM version (libNativeWrapper_wpe.so) for bare-Linux embedded target",
+				);
+				const wpeCflagsResult =
+					await $`pkg-config --cflags wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
+				const wpeLibsResult =
+					await $`pkg-config --libs wpe-1.0 wpebackend-fdo-1.0 wpe-webkit-2.0 wayland-server libdrm libinput libudev glib-2.0 gio-unix-2.0 gbm egl glesv2`.quiet();
+				const wpeCflags = wpeCflagsResult.stdout.toString().trim();
+				const wpeLibs = wpeLibsResult.stdout.toString().trim();
+
+				const wpeLinkCmd = [
+					"g++",
+					"-std=c++20",
+					// Do not depend on the host Cottontail executable exporting GCC's
+					// out-of-line AArch64 atomic helpers.
+					...(ARCH === "arm64" ? ["-mno-outline-atomics"] : []),
+					// The compositor hot path (per-frame blit + rotation) lives
+					// here; -O0 measured 6.7ms/frame vs 2.0ms at -O2 on Pi 5.
+					"-O2",
+					"-fPIC",
+					"-shared",
+					...wpeCflags.split(/\s+/).filter((f) => f),
+					"-o",
+					"src/native/build/libNativeWrapper_wpe.so",
+					"src/native/linux/nativeWrapper_wpe.cpp",
+					"src/native/linux/wpe/wpe_backend.cpp",
+					"src/native/linux/wpe/drm_display.cpp",
+					"src/native/linux/wpe/egl_readback.cpp",
+					"src/native/linux/wpe/input.cpp",
+					asarLib, // views:// scheme handler reads from ASAR archives
+					...wpeLibs.split(/\s+/).filter((f) => f),
+					"-ldl",
+					"-lpthread",
+					// Sibling-lookup for libasar.so (next to libNativeWrapper.so in bin/)
+					"-Wl,-rpath,$ORIGIN",
+				];
+				await $`${wpeLinkCmd}`;
+				console.log("Built libNativeWrapper_wpe.so for embedded target");
 			}
 
 			console.log("Native wrapper built successfully");

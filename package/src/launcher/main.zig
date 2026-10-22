@@ -130,6 +130,64 @@ fn isDevBuild(allocator: std.mem.Allocator, exe_dir: []const u8) bool {
     return false;
 }
 
+// Linux cold-start: the launcher is the first process in the chain, and
+// everything after it is I/O-bound — bun (~100MB) pages in on exec, then the
+// app's dlopen pages in libWPEWebKit/libwebkit2gtk (~116MB) from the system
+// dir. posix_fadvise(WILLNEED) is asynchronous kernel readahead: one cheap
+// syscall per file here lets those reads run in parallel with bun's own boot
+// instead of serializing behind it. No-op when files are already page-cached
+// (warm restarts) or on other platforms.
+fn fadviseWillneed(path: []const u8) void {
+    const file = std.Io.Dir.cwd().openFile(g_io, path, .{}) catch return;
+    defer file.close(g_io);
+    // Bound speculative I/O; unused assets must not evict the first screen.
+    _ = std.os.linux.fadvise(file.handle, 0, 8 * 1024 * 1024, std.os.linux.POSIX_FADV.WILLNEED);
+}
+
+fn readaheadStartupFiles(allocator: std.mem.Allocator, exe_dir: []const u8, main_process: MainProcess) void {
+    if (builtin.os.tag != .linux) return;
+
+    const relative_candidates = [_][]const u8{
+        if (main_process == .cottontail) "cottontail" else if (main_process == .bun) "bun" else "main",
+        "libNativeWrapper.so",
+        "libNativeWrapper_wpe.so",
+        "libElectrobunCore.so",
+        "../Resources/main.js",
+        "../Resources/app.asar",
+    };
+    for (relative_candidates) |relative_path| {
+        const path = std.fs.path.join(allocator, &.{ exe_dir, relative_path }) catch continue;
+        defer allocator.free(path);
+        fadviseWillneed(path);
+    }
+}
+
+// Preheat the web engine by dlopen'ing the native wrapper in a throwaway
+// grandchild. This warms the wrapper's shared-library dependency pages in
+// parallel with the app runtime's cold start.
+fn preheatNativeWrapper(allocator: std.mem.Allocator, exe_dir: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+    // Opt in for cold-start experiments; warm launches need no extra process.
+    const enabled = std.c.getenv("ELECTROBUN_PREHEAT_WRAPPER") orelse return;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return;
+
+    const wrapper_path = std.fs.path.joinZ(allocator, &.{ exe_dir, "libNativeWrapper.so" }) catch return;
+    defer allocator.free(wrapper_path);
+    std.Io.Dir.accessAbsolute(g_io, wrapper_path, .{}) catch return;
+
+    const pid = std.c.fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        const grandchild = std.c.fork();
+        if (grandchild == 0) {
+            _ = std.c.dlopen(wrapper_path.ptr, .{ .NOW = true, .GLOBAL = true });
+            std.process.exit(0);
+        }
+        std.process.exit(0);
+    }
+    _ = std.c.waitpid(pid, null, 0);
+}
+
 const main_process_config = @import("main_process.zig");
 const MainProcess = main_process_config.MainProcess;
 
@@ -429,7 +487,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    preheatNativeWrapper(arena_alloc, exe_dir);
     const main_process = detectMainProcess(arena_alloc, exe_dir);
+    readaheadStartupFiles(arena_alloc, exe_dir, main_process);
 
     // Platform-specific paths
     var argv: []const []const u8 = undefined;

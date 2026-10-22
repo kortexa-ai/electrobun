@@ -8404,10 +8404,18 @@ extern "C" void setNextWebviewFlags(bool startTransparent,
   g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
-extern "C" void setNextWebviewAllowedProtocols(bool allowViews,
-                                               bool allowAppData) {
-  g_nextWebviewAllowedProtocols.views = allowViews;
-  g_nextWebviewAllowedProtocols.appData = allowAppData;
+// Stub for FFI symbol parity with the WPE backend. WKWebView already gives
+// every view its own Web Content process, so trust class is a no-op here.
+extern "C" void setNextWebviewTrust(const char* /*trust*/) {}
+
+// Stub for FFI symbol parity with the WPE backend. macOS's window server
+// places NSWindows; the inner WKWebView fills its window, so the parent
+// BrowserWindow's frame x/y is a no-op here.
+extern "C" void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
+
+extern "C" void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
+    g_nextWebviewAllowedProtocols.views = allowViews;
+    g_nextWebviewAllowedProtocols.appData = allowAppData;
 }
 
 extern "C" AbstractView *initWebview(

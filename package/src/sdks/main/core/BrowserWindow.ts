@@ -1,4 +1,4 @@
-import { ffi } from "../proc/native";
+import { ffi, isLinuxEmbedded } from "../proc/native";
 import electrobunEventEmitter from "../events/eventEmitter";
 import { BrowserView } from "./BrowserView";
 import { type Pointer } from "bun:ffi";
@@ -53,6 +53,9 @@ export type WindowOptionsType<T = undefined> = {
 	// Use for untrusted content (remote URLs) to prevent malicious sites from
 	// accessing internal APIs, creating OOPIFs, or communicating with Bun
 	sandbox: boolean;
+	// Trust class for the window's primary BrowserView. See
+	// BrowserViewOptions.trust. Default "trusted".
+	trust: "trusted" | "untrusted";
 };
 
 const defaultOptions: WindowOptionsType = {
@@ -74,7 +77,135 @@ const defaultOptions: WindowOptionsType = {
 	hidden: false,
 	navigationRules: null,
 	sandbox: false,
+	trust: "trusted",
 };
+
+const EMBEDDED_CHROME_HEIGHT = 60;
+
+function embeddedChromeHTML(title: string) {
+	const escapedTitle = title
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#39;");
+	const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; margin: 0; overflow: hidden;
+    font-family: sans-serif; color: #fff5e6;
+    -webkit-user-select: none; user-select: none;
+  }
+  #bar {
+    width: 100%; height: 100%; display: flex; align-items: center;
+    justify-content: space-between; padding-left: 16px;
+    background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #title {
+    min-width: 0; flex: 1; line-height: 60px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 16px; font-weight: 600; letter-spacing: .5px; opacity: .85;
+  }
+  #actions {
+    height: 100%; flex: none; display: flex; align-items: center; gap: 5px;
+  }
+  button {
+    appearance: none; -webkit-appearance: none; border: 0;
+    width: 68px; height: 60px; padding: 0; border-radius: 10px;
+    background: transparent; color: #fff5e6;
+    position: relative; cursor: pointer; touch-action: manipulation;
+  }
+  button:active { background: rgba(255,255,255,.12); transform: scale(.92); }
+  #close { color: #cc3300; font-weight: 700; }
+  #close::before, #close::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 29px; height: 4px; border-radius: 2px;
+    background: currentColor;
+  }
+  #close::before { transform: translate(-50%,-50%) rotate(45deg); }
+  #close::after { transform: translate(-50%,-50%) rotate(-45deg); }
+  #maximize::before, #maximize::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 24px; height: 18px; border: 3px solid currentColor;
+    border-radius: 2px;
+    transform: translate(-50%,-50%);
+  }
+  #maximize::after { display: none; }
+  #maximize.restore::before {
+    transform: translate(calc(-50% - 4px),calc(-50% + 4px));
+  }
+  #maximize.restore::after {
+    display: block; background: #1a1a1a;
+    transform: translate(calc(-50% + 4px),calc(-50% - 4px));
+  }
+  #handle {
+    display: none; width: 100%; height: 100%; border-radius: 0 0 10px 10px;
+    align-items: center; justify-content: center;
+    background: rgba(26,26,26,.88);
+  }
+  #handle::before {
+    content: ""; width: 0; height: 0;
+    border-left: 10px solid transparent;
+    border-right: 10px solid transparent;
+    border-top: 11px solid currentColor;
+  }
+  @media (max-height: 40px) {
+    #bar { display: none; }
+    #handle { display: flex; }
+  }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <div id="title">${escapedTitle}</div>
+    <div id="actions">
+      <button id="maximize" type="button" aria-label="Maximize window"></button>
+      <button id="close" type="button" aria-label="Close window"></button>
+    </div>
+  </div>
+  <button id="handle" type="button" aria-label="Reveal window controls"></button>
+<script>
+  (() => {
+    const bridge = window.webkit?.messageHandlers?.electrobunChrome;
+    const maximize = document.getElementById("maximize");
+    let maximized = false;
+    const post = (action) => bridge?.postMessage(action);
+    const update = () => {
+      maximize.classList.toggle("restore", maximized);
+      maximize.setAttribute(
+        "aria-label",
+        maximized ? "Restore window" : "Maximize window",
+      );
+    };
+    window.__electrobunSetChromeMaximized = (value) => {
+      maximized = Boolean(value);
+      update();
+    };
+    maximize.addEventListener("click", () => {
+      maximized = !maximized;
+      update();
+      post(maximized ? "maximize" : "restore");
+    });
+    document.getElementById("close").addEventListener("click", () => post("close"));
+    document.getElementById("handle").addEventListener("click", () => post("reveal"));
+    update();
+  })();
+</script>
+</body>
+</html>`;
+	return html;
+}
+
+function embeddedChromeURL(title: string) {
+	return `data:text/html;charset=utf-8;base64,${Buffer.from(
+		embeddedChromeHTML(title),
+	).toString("base64")}`;
+}
 
 export const BrowserWindowMap: {
 	[id: number]: BrowserWindow<RPCWithTransport>;
@@ -125,6 +256,12 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	navigationRules: string | null = null;
 	// Sandbox mode disables RPC and only allows event emission (for untrusted content)
 	sandbox: boolean = false;
+	// See WindowOptionsType.trust. Forwarded to the window's primary BrowserView.
+	trust: "trusted" | "untrusted" = "trusted";
+	// Stored so the webview's preload pipeline can decide whether to inject
+	// the auto-chrome bar (§18 in linux-wpe.md). Read by proc/native.ts when
+	// building the dynamic preload prefix per webview.
+	titleBarStyle: "default" | "hidden" | "hiddenInset" = "default";
 	frame: {
 		x: number;
 		y: number;
@@ -138,6 +275,7 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 	};
 	// todo (yoav): make this an array of ids or something
 	webviewId!: number;
+	chromeWebviewId?: number;
 
 	get ptr(): Pointer | null {
 		return ffi.request.getWindowPointer({ winId: this.id }) as Pointer | null;
@@ -173,6 +311,8 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		};
 		this.navigationRules = options.navigationRules || null;
 		this.sandbox = options.sandbox ?? false;
+		this.trust = options.trust ?? "trusted";
+		this.titleBarStyle = options.titleBarStyle ?? "default";
 
 		this.init(options, centered);
 	}
@@ -244,6 +384,9 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 		}
 
 		BrowserWindowMap[this.id] = this;
+		const usesEmbeddedChrome =
+			isLinuxEmbedded && this.titleBarStyle === "default";
+		const contentY = usesEmbeddedChrome ? EMBEDDED_CHROME_HEIGHT : 0;
 
 		// todo (yoav): user should be able to override this and pass in their
 		// own webview instance, or instances for attaching to the window.
@@ -255,14 +398,17 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			html: this.html,
 			preload: this.preload,
 			viewsRoot: this.viewsRoot,
+			partition: usesEmbeddedChrome
+				? "__electrobun_content_with_chrome__"
+				: null,
 			allowedProtocols: this.allowedProtocols,
 			// frame: this.frame,
 			renderer: this.renderer,
 			frame: {
 				x: 0,
-				y: 0,
+				y: contentY,
 				width: this.frame.width,
-				height: this.frame.height,
+				height: Math.max(1, this.frame.height - contentY),
 			},
 			rpc,
 			// todo: we need to send the window here and attach it in one go
@@ -272,11 +418,35 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			windowId: this.id,
 			navigationRules: this.navigationRules,
 			sandbox: this.sandbox,
+			trust: this.trust,
 			startPassthrough: this.passthrough,
 			spellCheck: this.spellCheck,
 		});
 
 		this.webviewId = webview.id;
+
+		if (usesEmbeddedChrome) {
+			const chrome = new BrowserView({
+				url: embeddedChromeURL(this.title),
+				html: null,
+				renderer: this.renderer,
+				partition: "__electrobun_chrome__",
+				frame: {
+					x: 0,
+					y: 0,
+					width: this.frame.width,
+					height: EMBEDDED_CHROME_HEIGHT,
+				},
+				windowId: this.id,
+				autoResize: false,
+				// Core selects an event-only preload for this reserved partition.
+				// The trusted framework view retains its native window-action bridge;
+				// sandboxed application views never receive that bridge.
+				sandbox: false,
+				trust: "trusted",
+			});
+			this.chromeWebviewId = chrome.id;
+		}
 	}
 
 	get webview() {

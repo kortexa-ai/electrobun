@@ -33,8 +33,27 @@ declare global {
 			iv: string,
 			tag: string,
 		) => Promise<string>;
+		// Binary packet variants (iv(12) | ciphertext | tag(16)) used by the
+		// host WebSocket transport. Optional: older preloads don't set them.
+		__electrobun_encrypt_binary?: (plaintext: string) => Promise<ArrayBuffer>;
+		__electrobun_decrypt_binary?: (packet: ArrayBuffer) => Promise<string>;
 		__electrobunSendToHost: (message: unknown) => void;
 		__electrobunPendingHostMessages?: unknown[];
+		// titleBarStyle from BrowserWindow options. The page reads it only for
+		// informational purposes (e.g. an app's own custom chrome could behave
+		// differently in inset mode) — the auto-inject decision is made in
+		// __electrobunAutoInjectChrome below.
+		__electrobunTitleBarStyle?: "default" | "hidden" | "hiddenInset";
+		// Computed from (platform, build target, titleBarStyle). True
+		// only when the framework should inject its own chrome bar — i.e. on
+		// linux-embedded with titleBarStyle "default", where there is no OS
+		// chrome to fall back on. chrome.ts reads only this boolean and stays
+		// platform-agnostic itself.
+		__electrobunAutoInjectChrome?: boolean;
+		// WPE's default decorations live in a separate compositor view. App
+		// pages use this flag only to install the top-edge reveal gesture.
+		__electrobunCompositedChrome?: boolean;
+		__electrobunSetChromeMaximized?: (maximized: boolean) => void;
 		__electrobun: {
 			receiveMessageFromHost: (msg: unknown) => void;
 			receiveInternalMessageFromHost: (msg: unknown) => void;

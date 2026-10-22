@@ -8925,6 +8925,15 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
+// Stub for FFI symbol parity with the WPE backend. WebView2 manages its own
+// process model, so trust class is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
+
+// Stub for FFI symbol parity with the WPE backend. The Windows window
+// manager places windows; primary views fill their host window, so the
+// parent BrowserWindow's frame x/y is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
+
 ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
     g_nextAllowedProtocols = {allowViews, allowAppData};
 }

@@ -6,6 +6,10 @@ const linuxWrapper = readFileSync(
 	join(import.meta.dirname, "../native/linux/nativeWrapper.cpp"),
 	"utf8",
 );
+const abstractViewHeader = readFileSync(
+	join(import.meta.dirname, "../native/linux/abstract_view.h"),
+	"utf8",
+);
 const overlaySync = readFileSync(
 	join(import.meta.dirname, "../preload/overlaySync.ts"),
 	"utf8",
@@ -24,7 +28,7 @@ function sectionFrom(source: string, marker: string, length = 5_000) {
 
 describe("Linux CEF child-view DPI bounds", () => {
 	it("keeps fractional overlay geometry in DIPs until the native boundary", () => {
-		const abstractView = sectionFrom(linuxWrapper, "class AbstractView {", 9_000);
+		const abstractView = sectionFrom(abstractViewHeader, "class AbstractView {", 9_000);
 		const resizeExport = sectionFrom(
 			linuxWrapper,
 			"ELECTROBUN_EXPORT void resizeWebview",

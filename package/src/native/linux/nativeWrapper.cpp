@@ -46,6 +46,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "dawn/webgpu.h"
+#include "backend.h"
+#include "abstract_view.h"
 
 // Shared cross-platform utilities
 #include "../shared/glob_match.h"
@@ -77,6 +79,11 @@
 #include "window_resize_handles.h"
 
 using namespace electrobun;
+
+// Rect ↔ GdkRectangle conversion helpers. Cross-backend code uses Rect;
+// GTK/X11 APIs keep GdkRectangle at the platform boundary.
+static inline Rect toRect(const GdkRectangle& g) { return Rect{g.x, g.y, g.width, g.height}; }
+static inline GdkRectangle toGdkRect(const Rect& r) { return GdkRectangle{r.x, r.y, r.width, r.height}; }
 
 // Global ASAR archive handle (lazy-loaded) with thread-safe initialization
 // ASAR C FFI declarations are in shared/asar.h
@@ -456,7 +463,9 @@ bool isPointInMask(double x, double y, const std::vector<MaskRect>& masks) {
 // Note: X11 window extraction removed - WebKit now uses GTK-native input shape masking
 
 // Forward declarations
-class AbstractView;
+// (AbstractView comes from abstract_view.h via `using namespace electrobun`;
+// re-forward-declaring it in the global namespace makes every unqualified
+// use ambiguous once the GTK wrapper actually compiles.)
 
 // Helper function to check navigation rules - defined after AbstractView class
 bool checkNavigationRules(std::shared_ptr<AbstractView> view, const std::string& url);
@@ -2724,154 +2733,8 @@ CefRefPtr<CefClient> create_default_handler() {
 }
 
 
-// AbstractView base class declaration
-class AbstractView {
-public:
-    uint32_t webviewId;
-    GtkWidget* widget = nullptr;
-    bool isMousePassthroughEnabled = false;
-    bool mirrorModeEnabled = false;
-    bool fullSize = false;
-    bool pendingStartTransparent = false;
-    bool pendingStartPassthrough = false;
-    bool isReceivingInput = true;
-    bool isRemoved = false;  // Flag to prevent operations on removed webviews
-    std::string maskJSON;
-    GdkRectangle visualBounds = {};
-    bool creationFailed = false;
-
-    // Pending resize state (cross-thread)
-    std::mutex pendingResizeMutex;
-    std::atomic<uint64_t> pendingResizeGeneration{0};
-    uint64_t appliedResizeGeneration = 0;
-    bool hasPendingResize = false;
-    LogicalRect pendingResizeFrame = {};
-    std::string pendingResizeMasks;
-
-    // Navigation rules for URL filtering
-    std::vector<std::string> navigationRules;
-    
-    // Root directory for views:// protocol resolution
-    std::string viewsRoot;
-
-    AbstractView(uint32_t webviewId) : webviewId(webviewId) {}
-    virtual ~AbstractView() {}
-
-    // Set navigation rules from JSON array string
-    void setNavigationRulesFromJSON(const char* rulesJson) {
-        navigationRules.clear();
-        if (!rulesJson || strlen(rulesJson) == 0) {
-            return;
-        }
-
-        // Simple JSON array parser for string arrays: ["rule1", "rule2", ...]
-        std::string json(rulesJson);
-        size_t pos = json.find('[');
-        if (pos == std::string::npos) return;
-
-        pos++;
-        while (pos < json.length()) {
-            // Find start of string
-            size_t strStart = json.find('"', pos);
-            if (strStart == std::string::npos) break;
-
-            // Find end of string (handle escaped quotes)
-            size_t strEnd = strStart + 1;
-            while (strEnd < json.length()) {
-                if (json[strEnd] == '"' && json[strEnd - 1] != '\\') break;
-                strEnd++;
-            }
-            if (strEnd >= json.length()) break;
-
-            // Extract string value
-            std::string rule = json.substr(strStart + 1, strEnd - strStart - 1);
-            navigationRules.push_back(rule);
-
-            pos = strEnd + 1;
-        }
-    }
-
-    // Check if URL should be allowed based on navigation rules
-    bool shouldAllowNavigationToURL(const std::string& url) {
-        if (navigationRules.empty()) {
-            return true; // Default allow if no rules
-        }
-
-        bool allowed = true; // Default allow if no rules match
-
-        for (const std::string& rule : navigationRules) {
-            bool isBlockRule = !rule.empty() && rule[0] == '^';
-            std::string pattern = isBlockRule ? rule.substr(1) : rule;
-
-            if (electrobun::globMatch(pattern, url)) {
-                allowed = !isBlockRule; // Last match wins
-            }
-        }
-
-        return allowed;
-    }
-    
-    // Pure virtual methods that must be implemented by derived classes
-    virtual void loadURL(const char* urlString) = 0;
-    virtual void loadHTML(const char* htmlString) = 0;
-    virtual void goBack() = 0;
-    virtual void goForward() = 0;
-    virtual void reload() = 0;
-    virtual void remove() = 0;
-    virtual bool canGoBack() = 0;
-    virtual bool canGoForward() = 0;
-    virtual void evaluateJavaScriptWithNoCompletion(const char* jsString) = 0;
-    virtual void callAsyncJavascript(const char* messageId, const char* jsString, uint32_t webviewId, uint32_t hostWebviewId, void* completionHandler) = 0;
-    virtual void addPreloadScriptToWebView(const char* jsString) = 0;
-    virtual void updateCustomPreloadScript(const char* jsString) = 0;
-    virtual void resize(const GdkRectangle& frame, const char* masksJson) = 0;
-    virtual void resizeLogical(const LogicalRect& frame, const char* masksJson) {
-        const GdkRectangle integerFrame = {
-            static_cast<int>(frame.x),
-            static_cast<int>(frame.y),
-            static_cast<int>(frame.width),
-            static_cast<int>(frame.height),
-        };
-        resize(integerFrame, masksJson);
-    }
-    virtual void applyVisualMask() = 0;
-    virtual void removeMasks() = 0;
-    virtual void toggleMirrorMode(bool enable) = 0;
-    
-    // Common methods with default implementation
-    virtual void setTransparent(bool transparent) {}
-    virtual void setPassthrough(bool enable) { isMousePassthroughEnabled = enable; }
-    virtual void setHidden(bool hidden) {}
-
-    // Find in page methods
-    virtual void findInPage(const char* searchText, bool forward, bool matchCase) = 0;
-    virtual void stopFindInPage() = 0;
-
-    // Developer tools methods
-    virtual void openDevTools() = 0;
-    virtual void closeDevTools() = 0;
-    virtual void toggleDevTools() = 0;
-
-    void storePendingResize(const LogicalRect& frame, const char* masksJson) {
-        std::lock_guard<std::mutex> lock(pendingResizeMutex);
-        pendingResizeFrame = frame;
-        pendingResizeMasks = masksJson ? masksJson : "";
-        hasPendingResize = true;
-        pendingResizeGeneration++;
-    }
-
-    bool consumePendingResize(LogicalRect& outFrame, std::string& outMasks) {
-        std::lock_guard<std::mutex> lock(pendingResizeMutex);
-        if (!hasPendingResize) return false;
-        uint64_t gen = pendingResizeGeneration.load();
-        if (gen == appliedResizeGeneration) return false;
-        outFrame = pendingResizeFrame;
-        outMasks = pendingResizeMasks;
-        appliedResizeGeneration = gen;
-        hasPendingResize = false;
-        return true;
-    }
-};
+// AbstractView is declared in abstract_view.h so the WPE backend can derive
+// from it without pulling GTK into its translation unit.
 
 // Pending resize queue (cross-thread)
 static PendingResizeQueue g_pendingResizeQueue;
@@ -3463,7 +3326,7 @@ public:
         }
     }
     
-    void resize(const GdkRectangle& frame, const char* masksJson) override {
+    void resize(const Rect& frame, const char* masksJson) override {
         if (webview) {
             // Check if this webview has a wrapper (OOPIF case)
             GtkWidget* wrapper = (GtkWidget*)g_object_get_data(G_OBJECT(webview), "wrapper");
@@ -4317,7 +4180,7 @@ public:
     void addPreloadScriptToWebView(const char* jsString) override {}
     void updateCustomPreloadScript(const char* jsString) override {}
 
-    void resize(const GdkRectangle& frame, const char* masksJson) override {
+    void resize(const Rect& frame, const char* masksJson) override {
         if (xDisplay && xWindow) {
             XMoveResizeWindow(
                 xDisplay,
@@ -5267,7 +5130,7 @@ public:
         }
     }
     
-    void resize(const GdkRectangle& frame, const char* masksJson) override {
+    void resize(const Rect& frame, const char* masksJson) override {
         resizeLogical(
             {
                 static_cast<double>(frame.x),
@@ -5796,7 +5659,7 @@ public:
             return;
         }
         
-        GdkRectangle frame = { 0, 0, width, height };
+        Rect frame = { 0, 0, width, height };
         
         for (auto& view : abstractViews) {
             // Skip removed webviews
@@ -6982,13 +6845,13 @@ void resizeAutoSizingWebviewsInWindow(uint32_t windowId, int width, int height) 
     for (const auto& webview : fullSizeWebviews) {
         if (webview && webview->fullSize) {
             // Check if the webview is already the right size to avoid infinite resize loops
-            GdkRectangle currentBounds = webview->visualBounds;
+            Rect currentBounds = webview->visualBounds;
             if (currentBounds.width == width && currentBounds.height == height) {
                 continue;
             }
             
             // For auto-resize, typically want to fill the entire window starting from (0,0)
-            GdkRectangle frame = { 0, 0, width, height };
+            Rect frame = { 0, 0, width, height };
             webview->resize(frame, "");
         }
     }
@@ -8044,6 +7907,15 @@ ELECTROBUN_EXPORT void setNextWebviewFlags(bool startTransparent, bool startPass
     g_nextWebviewFlags.startPassthrough = startPassthrough;
 }
 
+// Stub for FFI symbol parity with the WPE backend. WebKitGTK already gives
+// every WebKitWebView its own WebProcess, so trust class is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewTrust(const char* /*trust*/) {}
+
+// Stub for FFI symbol parity with the WPE backend. The OS window manager
+// places GTK windows; primary views are positioned by the window itself,
+// so the parent BrowserWindow's frame x/y is a no-op here.
+ELECTROBUN_EXPORT void setNextWebviewWindowFrame(int32_t /*x*/, int32_t /*y*/) {}
+
 ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allowAppData) {
     g_nextAllowedProtocols = {allowViews, allowAppData};
 }
@@ -8129,7 +8001,7 @@ ELECTROBUN_EXPORT AbstractView* initWGPUView(uint32_t webviewId,
     view->pendingStartPassthrough = startPassthrough;
 
     dispatch_sync_main_void([&]() {
-        GdkRectangle frame = {(int)x, (int)y, (int)width, (int)height};
+        Rect frame = {(int)x, (int)y, (int)width, (int)height};
         if (isCEFAvailable()) {
             X11Window* x11win = static_cast<X11Window*>(window);
             if (!x11win || !x11win->display || !x11win->window) {

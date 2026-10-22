@@ -1,5 +1,5 @@
 import { dirname, join } from "path";
-import { closeSync } from "node:fs";
+import { closeSync, readFileSync } from "node:fs";
 import { Socket } from "node:net";
 import electrobunEventEmitter from "../events/eventEmitter";
 import ElectrobunEvent from "../events/event";
@@ -12,6 +12,39 @@ import {
 	preloadScript,
 	preloadScriptSandboxed,
 } from "../../../preload/.generated/compiled";
+import { OS } from "../../../shared/platform";
+
+// True only when the selected native wrapper is a bare-DRM kiosk backend.
+// Older wrappers use version.json's linuxTarget field. New WPE devkits expose
+// an optional capability so the canonical wrapper path works with Hutch's
+// schema-1 packaging and the same app source also builds against vanilla.
+//
+// Used to decide whether to auto-inject the framework's chrome bar — it
+// only fires on linux-embedded with titleBarStyle "default" because every
+// other target gets OS chrome.
+const IS_LINUX_EMBEDDED: boolean = (() => {
+	if (OS !== "linux") return false;
+	try {
+		const backend = tryDlopenCandidates(`libNativeWrapper.${suffix}`, {
+			isLinuxEmbedded: { args: [], returns: FFIType.bool },
+		});
+		try {
+			return backend.symbols.isLinuxEmbedded();
+		} finally {
+			backend.close();
+		}
+	} catch {
+		// Published desktop wrappers and older WPE builds lack this symbol.
+	}
+	try {
+		const raw = readFileSync(join("..", "Resources", "version.json"), "utf-8");
+		return JSON.parse(raw).linuxTarget === "embedded";
+	} catch {
+		return false;
+	}
+})();
+
+export const isLinuxEmbedded = IS_LINUX_EMBEDDED;
 
 // Menu data reference system to avoid serialization overhead
 const menuDataRegistry = new Map<string, any>();
@@ -137,10 +170,11 @@ function ensureWebviewRuntimeConfigured() {
 		return;
 	}
 
-	const configured = core?.symbols.configureWebviewRuntime(
+	const configured = core?.symbols.configureWebviewRuntimeV2(
 		0,
 		toCString(preloadScript),
 		toCString(preloadScriptSandboxed),
+		IS_LINUX_EMBEDDED,
 	);
 
 	if (!configured) {
@@ -317,15 +351,16 @@ const core = (() => {
 				args: [FFIType.u32, FFIType.ptr, FFIType.ptr],
 				returns: FFIType.void,
 			},
-			configureWebviewRuntime: {
+			configureWebviewRuntimeV2: {
 				args: [
 					FFIType.u32,
 					FFIType.cstring,
 					FFIType.cstring,
+					FFIType.bool,
 				],
 				returns: FFIType.bool,
 			},
-			createWebview: {
+			createWebviewV2: {
 				args: [
 					FFIType.u32,
 					FFIType.u32,
@@ -348,6 +383,8 @@ const core = (() => {
 					FFIType.bool,
 					FFIType.bool,
 					FFIType.bool,
+					FFIType.bool,
+					FFIType.cstring,
 				],
 				returns: FFIType.u32,
 			},
@@ -788,6 +825,28 @@ export const native = (() => {
 				],
 				returns: FFIType.void,
 			},
+			// Pre-set trust class for the next initWebview call. "trusted" (default
+			// or empty) → on WPE, view shares the trusted WebProcess via related-view.
+			// "untrusted" → on WPE, view gets its own WebProcess for OAuth-style
+			// isolation. No-op on macOS/GTK/CEF/Win where each view already has its
+			// own process.
+			setNextWebviewTrust: {
+				args: [
+					FFIType.cstring, // trust
+				],
+				returns: FFIType.void,
+			},
+			// Pre-set parent BrowserWindow frame x/y for the next initWebview call.
+			// Used by WPE to position non-main BrowserWindow primary views (About
+			// dialogs, OAuth popups) at the requested panel coordinates. No-op on
+			// macOS/GTK/CEF/Win where the OS window manager handles placement.
+			setNextWebviewWindowFrame: {
+				args: [
+					FFIType.i32, // x
+					FFIType.i32, // y
+				],
+				returns: FFIType.void,
+			},
 
 			// webviewtag
 			webviewCanGoBack: {
@@ -1161,6 +1220,7 @@ export const native = (() => {
 	} catch (err) {
 		nativeWrapperLoadError = err;
 		// FFI not available — running as a carrot inside Bunny Ears or in a build-only context.
+		console.error("[electrobun] native FFI dlopen failed:", err);
 		return null;
 	}
 })();
@@ -1977,6 +2037,7 @@ const _ffiImpl = {
 			startTransparent: boolean;
 			startPassthrough: boolean;
 			spellCheck: boolean;
+			trust: "trusted" | "untrusted";
 		}): number => {
 			const {
 				windowId,
@@ -1994,6 +2055,7 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				trust,
 			} = params;
 			ensureWebviewRuntimeConfigured();
 			core_.symbols.setNextWebviewAllowedProtocols(
@@ -2001,7 +2063,7 @@ const _ffiImpl = {
 				allowedProtocols.appData,
 			);
 
-			const webviewId = core_.symbols.createWebview(
+			const webviewId = core_.symbols.createWebviewV2(
 				windowId,
 				hostWebviewId || 0,
 				toCString(renderer),
@@ -2024,10 +2086,15 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				toCString(trust),
 			);
 
 			if (!webviewId) {
 				throw getCoreLastError() || "Failed to create webview";
+			}
+
+			if (hostWebviewId) {
+				webviewsWithHost.add(webviewId);
 			}
 
 			return webviewId;
@@ -2078,6 +2145,7 @@ const _ffiImpl = {
 			core_.symbols.webviewReload(params.id);
 		},
 		webviewRemove: (params: { id: number }) => {
+			webviewsWithHost.delete(params.id);
 			core_.symbols.webviewRemove(params.id);
 		},
 		setWebviewHTMLContent: (params: { id: number; html: string }) => {
@@ -3408,33 +3476,78 @@ const webviewDecideNavigation = new JSCallback(
 	},
 );
 
+// Webview ids created with a hostWebviewId (webview-tag OOPIFs). Only these
+// need the dispatchHostWebviewEvent FFI forward on every event — for
+// top-level webviews (the common case) the zig side would just look up a
+// null host and return, so skip the FFI call, both toCString copies, and
+// the registry lock entirely.
+const webviewsWithHost = new Set<number>();
+
+const webviewEventMap: Record<string, string> = {
+	"will-navigate": "willNavigate",
+	"did-navigate": "didNavigate",
+	"did-navigate-in-page": "didNavigateInPage",
+	"did-commit-navigation": "didCommitNavigation",
+	"dom-ready": "domReady",
+	"new-window-open": "newWindowOpen",
+	"host-message": "hostMessage",
+	"download-started": "downloadStarted",
+	"download-progress": "downloadProgress",
+	"download-completed": "downloadCompleted",
+	"download-failed": "downloadFailed",
+	"load-started": "loadStarted",
+	"load-committed": "loadCommitted",
+	"load-finished": "loadFinished",
+};
+
+function closeEmbeddedChromeWindow(windowId?: number) {
+	// Inline require to avoid pulling Utils into the module-init cycle
+	// (BrowserWindow → events → Utils path is already touchy).
+	const { quit } = require("../core/Utils");
+	const { BrowserWindow, BrowserWindowMap } = require("../core/BrowserWindow");
+	const remainingWindows = Object.keys(BrowserWindowMap).length;
+	if (windowId != null && remainingWindows > 1) {
+		const win = BrowserWindow.getById(windowId);
+		if (win) {
+			win.close();
+			return;
+		}
+	}
+	quit();
+}
+
 const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 	BrowserView.ensureWrapped(id);
 
-	core_.symbols.dispatchHostWebviewEvent(
-		id,
-		toCString(eventName),
-		toCString(detail),
-	);
+	if (IS_LINUX_EMBEDDED && eventName === "will-navigate") {
+		try {
+			const navigation = JSON.parse(detail) as { url?: string };
+			if (
+				navigation.url === "electrobun://chrome/close" ||
+				navigation.url === "electrobun://chrome/close/"
+			) {
+				const webview = BrowserView.getById(id);
+				// Navigation events also exist in sandboxed views. Only the
+				// trusted framework preload is allowed to drive window chrome.
+				if (webview?.trust === "trusted") {
+					closeEmbeddedChromeWindow(webview.windowId);
+				}
+				return { success: true };
+			}
+		} catch {
+			// Let malformed navigation details flow through as a normal event.
+		}
+	}
 
-	const eventMap: Record<string, string> = {
-		"will-navigate": "willNavigate",
-		"did-navigate": "didNavigate",
-		"did-navigate-in-page": "didNavigateInPage",
-		"did-commit-navigation": "didCommitNavigation",
-		"dom-ready": "domReady",
-		"new-window-open": "newWindowOpen",
-		"host-message": "hostMessage",
-		"download-started": "downloadStarted",
-		"download-progress": "downloadProgress",
-		"download-completed": "downloadCompleted",
-		"download-failed": "downloadFailed",
-		"load-started": "loadStarted",
-		"load-committed": "loadCommitted",
-		"load-finished": "loadFinished",
-	};
+	if (webviewsWithHost.has(id)) {
+		core_.symbols.dispatchHostWebviewEvent(
+			id,
+			toCString(eventName),
+			toCString(detail),
+		);
+	}
 
-	const mappedName = eventMap[eventName];
+	const mappedName = webviewEventMap[eventName];
 	const handler = mappedName
 		? (electrobunEventEmitter.events.webview as Record<string, unknown>)[
 				mappedName
@@ -3713,12 +3826,18 @@ export function toCString(
 	jsString: string,
 	addNullTerminator: boolean = true,
 ): CString {
-	let appendWith = "";
-
 	if (addNullTerminator && !jsString.endsWith("\0")) {
-		appendWith = "\0";
+		// Single-copy encode: write the utf8 bytes into a buffer sized with
+		// room for the terminator, instead of building `jsString + "\0"`
+		// (a full JS string copy) and then encoding that. This is on the
+		// per-message FFI path.
+		const buff = Buffer.allocUnsafe(Buffer.byteLength(jsString, "utf8") + 1);
+		const written = buff.write(jsString, 0, "utf8");
+		buff[written] = 0;
+		// @ts-ignore - This is valid in Bun
+		return ptr(buff);
 	}
-	const buff = Buffer.from(jsString + appendWith, "utf8");
+	const buff = Buffer.from(jsString, "utf8");
 
 	// @ts-ignore - This is valid in Bun
 	return ptr(buff);
@@ -3825,6 +3944,12 @@ export const internalRpcHandlers = {
 		},
 	},
 	message: {
+		// Compatibility route for older auto-chrome preloads. Current WPE
+		// chrome uses its blocked internal navigation URL because that path
+		// remains synchronous under Cottontail.
+		electrobunChromeQuit: (params?: { windowId?: number }) => {
+			closeEmbeddedChromeWindow(params?.windowId);
+		},
 		webviewTagResize: (params: {
 			id: number;
 			frame: { x: number; y: number; width: number; height: number };

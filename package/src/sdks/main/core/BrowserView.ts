@@ -74,6 +74,10 @@ export type BrowserViewOptions<T = undefined> = {
 	// Enables macOS system spell checking for native WKWebView content.
 	// Unsupported renderers/platforms leave their behavior unchanged.
 	spellCheck: boolean;
+	// Trust class for process isolation. On WPE/Linux-embedded, trusted
+	// views may share a related WebProcess; untrusted views are isolated.
+	// Other platforms ignore this option.
+	trust: "trusted" | "untrusted";
 	// renderer:
 };
 
@@ -138,6 +142,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	startTransparent: boolean = false;
 	startPassthrough: boolean = false;
 	spellCheck: boolean = false;
+	trust: "trusted" | "untrusted" = "trusted";
 	isRemoved: boolean = false;
 
 	get ptr(): Pointer | null {
@@ -176,6 +181,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.startTransparent = options.startTransparent ?? false;
 		this.startPassthrough = options.startPassthrough ?? false;
 		this.spellCheck = options.spellCheck ?? false;
+		this.trust = options.trust ?? "trusted";
 
 		this.id = this.init() as number;
 		BrowserViewMap[this.id] = this;
@@ -215,6 +221,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			startTransparent: this.startTransparent,
 			startPassthrough: this.startPassthrough,
 			spellCheck: this.spellCheck,
+			trust: this.trust,
 			// transparent is looked up from parent window in native.ts
 		});
 	}
@@ -391,7 +398,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 
 	queueHostMessageToWebview(message: unknown): Promise<void> {
 		return new Promise((markSent) => {
-			if (!this.ptr || this.isRemoved) {
+			if (this.isRemoved) {
 				markSent();
 				return;
 			}

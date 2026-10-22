@@ -143,6 +143,8 @@ const AppMetadata = struct {
     name: []const u8,
     channel: []const u8,
     hash: ?[]const u8 = null,
+    // Linux-only; "embedded" selects the WPE/DRM kiosk install path.
+    linuxTarget: ?[]const u8 = null,
     install_root_name: ?[]const u8 = null,
 };
 
@@ -318,6 +320,7 @@ const EmbeddedMetadataJson = struct {
     name: []const u8,
     channel: []const u8,
     hash: ?[]const u8 = null,
+    linuxTarget: ?[]const u8 = null,
 };
 
 const WindowsUninstallManifest = struct {
@@ -1230,7 +1233,9 @@ fn extractAdjacentArchive(
     defer allocator.free(app_base_dir);
     const self_extraction_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "self-extraction" });
     defer allocator.free(self_extraction_dir);
-    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "app" });
+    const app_dir_name = try appInstallDirectoryName(allocator, metadata);
+    defer allocator.free(app_dir_name);
+    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, app_dir_name });
     defer allocator.free(app_dir);
 
     std.debug.print("Extracting to: {s}\n", .{self_extraction_dir});
@@ -1336,6 +1341,7 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
         .name = metadata.name,
         .channel = metadata.channel,
         .hash = backup_hash,
+        .linuxTarget = metadata.linuxTarget,
     };
     if (builtin.os.tag == .windows and
         (!isSafeWindowsComponent(safe_metadata.identifier) or !isBuildChannel(safe_metadata.channel)))
@@ -1359,6 +1365,9 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
         if (metadata.hash) |hash| {
             allocator.free(hash);
         }
+        if (metadata.linuxTarget) |target| {
+            allocator.free(target);
+        }
     }
 
     // Build application support directory path
@@ -1373,8 +1382,9 @@ fn extractFromSelf(allocator: std.mem.Allocator) !bool {
     const self_extraction_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "self-extraction" });
     defer allocator.free(self_extraction_dir);
 
-    // Always use "app" folder instead of hash-based versioning
-    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, "app" });
+    const app_dir_name = try appInstallDirectoryName(allocator, safe_metadata);
+    defer allocator.free(app_dir_name);
+    const app_dir = try std.fs.path.join(allocator, &.{ app_base_dir, app_dir_name });
     defer allocator.free(app_dir);
 
     std.debug.print("Self-extracting archive found at offset {d}\n", .{archive_offset});
@@ -1653,6 +1663,11 @@ fn extractAndInstall(
         try replaceSelfWithLauncher(allocator, exe_path, app_dir);
     }
 
+    if (builtin.os.tag == .linux and isWpeEmbedded(metadata)) {
+        // Bare-DRM kiosk installs run under a systemd user service instead
+        // of creating desktop-environment integration.
+        try installEmbeddedKiosk(allocator, app_dir, metadata);
+    }
     // Save tar file for Updater API on Linux and Windows after everything else is done
     if ((builtin.os.tag == .linux or builtin.os.tag == .windows) and archive_source == .memory) {
         std.debug.print("\n✓ Saving tar file for Updater API...\n", .{});
@@ -2081,6 +2096,7 @@ fn readEmbeddedMetadata(allocator: std.mem.Allocator, metadata_bytes: []const u8
         .name = try allocator.dupe(u8, parsed.value.name),
         .channel = try allocator.dupe(u8, parsed.value.channel),
         .hash = if (parsed.value.hash) |h| try allocator.dupe(u8, h) else null,
+        .linuxTarget = if (parsed.value.linuxTarget) |target| try allocator.dupe(u8, target) else null,
     };
 }
 
@@ -2098,6 +2114,11 @@ fn getAppDataDir(allocator: std.mem.Allocator) ![]const u8 {
         },
         .linux => blk: {
             break :blk try linuxXdgRoot(allocator, "XDG_DATA_HOME", &.{ ".local", "share" });
+        },
+        .macos => blk: {
+            const home = try getEnvOwned(allocator, "HOME");
+            defer allocator.free(home);
+            break :blk try std.fs.path.join(allocator, &.{ home, "Library", "Application Support" });
         },
         else => @compileError("Unsupported platform for app data directory"),
     };
@@ -2218,6 +2239,267 @@ fn escapeDesktopString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
     }
 
     return escaped;
+}
+
+
+fn isWpeEmbedded(metadata: AppMetadata) bool {
+    if (builtin.os.tag != .linux) return false;
+    const target = metadata.linuxTarget orelse return false;
+    return std.mem.eql(u8, target, "embedded");
+}
+
+fn appInstallDirectoryName(allocator: std.mem.Allocator, metadata: AppMetadata) ![]u8 {
+    if (isWpeEmbedded(metadata)) {
+        if (metadata.hash) |hash| {
+            return std.fmt.allocPrint(allocator, "app.{s}", .{hash});
+        }
+    }
+    return allocator.dupe(u8, "app");
+}
+
+// Installer action selection for embedded kiosk builds.
+const Action = enum { install, uninstall, help };
+
+var g_skip_kiosk: bool = false;
+var g_keep_data: bool = false;
+
+fn printHelp() void {
+    std.debug.print(
+        \\Usage: ./installer [FLAGS]
+        \\
+        \\Flags:
+        \\  (no flags)              Install the bundled app and set up the kiosk.
+        \\  --no-kiosk              Install files only; skip systemd integration.
+        \\  --uninstall             Remove the service and app installation.
+        \\  --uninstall --keep-data Remove the service but preserve app data.
+        \\  --help, -h              Show this help.
+        \\
+    , .{});
+}
+
+fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Action {
+    var iterator = try std.process.Args.Iterator.initAllocator(args, allocator);
+    defer iterator.deinit();
+    _ = iterator.next(); // executable name
+
+    var action: Action = .install;
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return .help;
+        } else if (std.mem.eql(u8, arg, "--no-kiosk")) {
+            g_skip_kiosk = true;
+        } else if (std.mem.eql(u8, arg, "--uninstall")) {
+            action = .uninstall;
+        } else if (std.mem.eql(u8, arg, "--keep-data")) {
+            g_keep_data = true;
+        } else {
+            std.debug.print("Unknown flag: {s}\nRun with --help to see usage.\n", .{arg});
+            return error.UnknownFlag;
+        }
+    }
+    if (g_keep_data and action != .uninstall) {
+        std.debug.print("Note: --keep-data is only meaningful with --uninstall (ignored).\n", .{});
+    }
+    return action;
+}
+
+// Best-effort external command runner. Installation remains usable when the
+// host has no user-systemd session or does not permit lingering.
+fn runBestEffort(allocator: std.mem.Allocator, argv: []const []const u8, label: []const u8) void {
+    _ = allocator;
+    var child = std.process.spawn(g_io, .{
+        .argv = argv,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print("Warning: failed to run {s}: {}\n", .{ label, err });
+        return;
+    };
+    const term = child.wait(g_io) catch |err| {
+        std.debug.print("Warning: failed to wait for {s}: {}\n", .{ label, err });
+        return;
+    };
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("Warning: {s} exited with code {d}\n", .{ label, code });
+            }
+        },
+        else => std.debug.print("Warning: {s} terminated abnormally\n", .{label}),
+    }
+}
+
+// Read this installer's metadata without extracting its archive.
+fn readEmbeddedMetadataFromSelf(allocator: std.mem.Allocator) !AppMetadata {
+    const exe_path = try std.process.executablePathAlloc(g_io, allocator);
+    defer allocator.free(exe_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(g_io, exe_path, allocator, .unlimited);
+    defer allocator.free(bytes);
+
+    const first = std.mem.indexOf(u8, bytes, METADATA_MARKER) orelse return error.NoMetadataMarker;
+    const search_start = first + METADATA_MARKER.len;
+    const second_offset = std.mem.indexOf(u8, bytes[search_start..], METADATA_MARKER) orelse return error.NoSecondMetadataMarker;
+    const metadata_start = search_start + second_offset + METADATA_MARKER.len;
+    const archive_offset = std.mem.indexOf(u8, bytes[metadata_start..], ARCHIVE_MARKER) orelse return error.NoArchiveMarker;
+    return readEmbeddedMetadata(allocator, bytes[metadata_start .. metadata_start + archive_offset]);
+}
+
+fn doUninstall(allocator: std.mem.Allocator) !void {
+    const metadata = try readEmbeddedMetadataFromSelf(allocator);
+    defer {
+        allocator.free(metadata.identifier);
+        allocator.free(metadata.name);
+        allocator.free(metadata.channel);
+        if (metadata.hash) |hash| allocator.free(hash);
+        if (metadata.linuxTarget) |target| allocator.free(target);
+    }
+
+    if (builtin.os.tag == .linux) {
+        const unit_filename = try std.fmt.allocPrint(allocator, "{s}.service", .{metadata.identifier});
+        defer allocator.free(unit_filename);
+        runBestEffort(allocator, &.{ "systemctl", "--user", "stop", unit_filename }, "systemctl --user stop");
+        runBestEffort(allocator, &.{ "systemctl", "--user", "disable", unit_filename }, "systemctl --user disable");
+
+        const home = getEnvOwned(allocator, "HOME") catch null;
+        defer if (home) |value| allocator.free(value);
+        if (home) |value| {
+            const unit_path = try std.fs.path.join(allocator, &.{ value, ".config", "systemd", "user", unit_filename });
+            defer allocator.free(unit_path);
+            std.Io.Dir.cwd().deleteFile(g_io, unit_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => std.debug.print("Warning: could not remove unit at {s}: {}\n", .{ unit_path, err }),
+            };
+        }
+        runBestEffort(allocator, &.{ "systemctl", "--user", "daemon-reload" }, "systemctl --user daemon-reload");
+    }
+
+    if (!g_keep_data) {
+        const app_data_dir = try getAppDataDir(allocator);
+        defer allocator.free(app_data_dir);
+        const channel_dir = try std.fs.path.join(allocator, &.{ app_data_dir, metadata.identifier, metadata.channel });
+        defer allocator.free(channel_dir);
+        std.Io.Dir.cwd().deleteTree(g_io, channel_dir) catch |err| {
+            std.debug.print("Warning: could not remove {s}: {}\n", .{ channel_dir, err });
+        };
+        const identifier_dir = try std.fs.path.join(allocator, &.{ app_data_dir, metadata.identifier });
+        defer allocator.free(identifier_dir);
+        std.Io.Dir.cwd().deleteDir(g_io, identifier_dir) catch {};
+    }
+}
+
+// WPE WebKit's sandbox uses desktop portals. Disable external GUI portal
+// backends for a console-only embedded session to avoid startup timeouts.
+fn installEmbeddedPortalConfig(allocator: std.mem.Allocator) !void {
+    const home = getEnvOwned(allocator, "HOME") catch {
+        std.debug.print("Warning: HOME not set; skipping WPE portal configuration\n", .{});
+        return;
+    };
+    defer allocator.free(home);
+
+    const config_home = getEnvOwned(allocator, "XDG_CONFIG_HOME") catch
+        try std.fs.path.join(allocator, &.{ home, ".config" });
+    defer allocator.free(config_home);
+
+    const portal_dir = try std.fs.path.join(allocator, &.{ config_home, "xdg-desktop-portal" });
+    defer allocator.free(portal_dir);
+    try std.Io.Dir.cwd().createDirPath(g_io, portal_dir);
+
+    const portal_path = try std.fs.path.join(allocator, &.{ portal_dir, "electrobun-portals.conf" });
+    defer allocator.free(portal_path);
+    const portal_text =
+        \\[preferred]
+        \\default=none
+        \\
+    ;
+    const portal_file = try std.Io.Dir.cwd().createFile(g_io, portal_path, .{ .truncate = true });
+    defer portal_file.close(g_io);
+    try portal_file.writeStreamingAll(g_io, portal_text);
+    std.debug.print("✓ wrote headless portal config: {s}\n", .{portal_path});
+
+    // Never replace the account-wide portal policy or restart services used
+    // by unrelated desktop applications. This profile is kiosk-specific.
+}
+
+// Phase A: linux-wpe kiosk install.
+//   1. Point `<app_base>/current` at the extracted versioned directory.
+//   2. Configure xdg-desktop-portal for a headless console session.
+//   3. Install and start the templated systemd user service unless --no-kiosk.
+fn installEmbeddedKiosk(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
+    const app_base_dir = std.fs.path.dirname(app_dir) orelse {
+        std.debug.print("Warning: could not derive app base directory from {s}\n", .{app_dir});
+        return;
+    };
+    const app_dir_name = std.fs.path.basename(app_dir);
+
+    // Atomically selected version. The unit always launches through this
+    // stable path so a later OTA only needs to replace the symlink.
+    const current_link = try std.fs.path.join(allocator, &.{ app_base_dir, "current" });
+    defer allocator.free(current_link);
+    const next_link = try std.fmt.allocPrint(allocator, "{s}.new-{d}", .{ current_link, std.c.getpid() });
+    defer allocator.free(next_link);
+    try std.Io.Dir.cwd().symLink(g_io, app_dir_name, next_link, .{});
+    defer std.Io.Dir.cwd().deleteFile(g_io, next_link) catch {};
+    try std.Io.Dir.cwd().rename(next_link, std.Io.Dir.cwd(), current_link, g_io);
+
+    // --no-kiosk only selects the extracted files; no account configuration.
+    if (g_skip_kiosk) {
+        const launcher_hint = try std.fs.path.join(allocator, &.{ app_base_dir, "current", "bin", "launcher" });
+        defer allocator.free(launcher_hint);
+        std.debug.print("Installed without kiosk service. Run manually: {s}\n", .{launcher_hint});
+        return;
+    }
+
+    try installEmbeddedPortalConfig(allocator);
+
+    const home = getEnvOwned(allocator, "HOME") catch {
+        std.debug.print("Warning: HOME not set; skipping systemd unit install\n", .{});
+        return;
+    };
+    defer allocator.free(home);
+
+    const unit_dir = try std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user" });
+    defer allocator.free(unit_dir);
+    try std.Io.Dir.cwd().createDirPath(g_io, unit_dir);
+
+    const unit_filename = try std.fmt.allocPrint(allocator, "{s}.service", .{metadata.identifier});
+    defer allocator.free(unit_filename);
+    const unit_path = try std.fs.path.join(allocator, &.{ unit_dir, unit_filename });
+    defer allocator.free(unit_path);
+    const launcher_path = try std.fs.path.join(allocator, &.{ app_base_dir, "current", "bin", "launcher" });
+    defer allocator.free(launcher_path);
+
+    const unit_text = try std.fmt.allocPrint(allocator,
+        \\[Unit]
+        \\Description={s} (Electrobun kiosk)
+        \\After=graphical-session.target
+        \\StartLimitIntervalSec=30
+        \\StartLimitBurst=3
+        \\
+        \\[Service]
+        \\Type=simple
+        \\ExecStart={s}
+        \\Environment=XDG_CURRENT_DESKTOP=electrobun
+        \\Restart=on-failure
+        \\RestartSec=2
+        \\TimeoutStopSec=5
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+        \\
+    , .{ metadata.name, launcher_path });
+    defer allocator.free(unit_text);
+
+    const unit_file = try std.Io.Dir.cwd().createFile(g_io, unit_path, .{ .truncate = true });
+    defer unit_file.close(g_io);
+    try unit_file.writeStreamingAll(g_io, unit_text);
+
+    const user = getEnvOwned(allocator, "USER") catch null;
+    defer if (user) |value| allocator.free(value);
+    if (user) |value| {
+        runBestEffort(allocator, &.{ "loginctl", "enable-linger", value }, "loginctl enable-linger");
+    }
+    runBestEffort(allocator, &.{ "systemctl", "--user", "daemon-reload" }, "systemctl --user daemon-reload");
+    runBestEffort(allocator, &.{ "systemctl", "--user", "enable", "--now", unit_filename }, "systemctl --user enable --now");
 }
 
 fn desktopEntryInstallName(source_name: []const u8) ?[]const u8 {
@@ -8096,6 +8378,19 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
+    }
+
+    const action = try parseArgs(init.minimal.args, allocator);
+    switch (action) {
+        .help => {
+            printHelp();
+            return;
+        },
+        .uninstall => {
+            try doUninstall(allocator);
+            return;
+        },
+        .install => {},
     }
 
     std.debug.print("Self-extractor v1.3 starting...\n", .{});

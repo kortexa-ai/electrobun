@@ -142,6 +142,9 @@ const TrayState = struct {
 const WindowState = struct {
     ptr: WindowPtr,
     transparent: bool,
+    title_bar_style: TitleBarStyle,
+    frame_x: i32,
+    frame_y: i32,
     close_handler: ?WindowCloseHandler,
     should_close_handler: ?WindowShouldCloseHandler,
     move_handler: ?WindowMoveHandler,
@@ -150,6 +153,31 @@ const WindowState = struct {
     blur_handler: ?WindowBlurHandler,
     key_handler: ?WindowKeyHandler,
 };
+
+const TitleBarStyle = enum {
+    default,
+    hidden,
+    hidden_inset,
+};
+
+fn parseTitleBarStyle(value: [*:0]const u8) TitleBarStyle {
+    const style = std.mem.span(value);
+    if (std.mem.eql(u8, style, "hidden")) {
+        return .hidden;
+    }
+    if (std.mem.eql(u8, style, "hiddenInset")) {
+        return .hidden_inset;
+    }
+    return .default;
+}
+
+fn titleBarStyleName(style: TitleBarStyle) []const u8 {
+    return switch (style) {
+        .default => "default",
+        .hidden => "hidden",
+        .hidden_inset => "hiddenInset",
+    };
+}
 
 const WebviewRendererKind = enum {
     native,
@@ -185,6 +213,7 @@ const WebviewState = struct {
     socket_handle: ?std.posix.socket_t,
     transport_ready: bool,
     plaintext_transport: bool,
+    binary_transport: bool = false,
 };
 
 const WgpuViewState = struct {
@@ -196,6 +225,7 @@ const WebviewRuntimeState = struct {
     rpc_port: u32 = 0,
     preload_script: ?[:0]u8 = null,
     preload_script_sandboxed: ?[:0]u8 = null,
+    is_linux_embedded: bool = false,
     configured: bool = false,
 };
 
@@ -573,7 +603,13 @@ fn signalHostMessageWakeup() void {
 
 fn enqueuePendingHostMessage(webview_id: u32, message: [*:0]const u8) void {
     const owned_message = dupeZ(message) catch return;
+    enqueueOwnedHostMessage(webview_id, owned_message);
+}
 
+// Takes ownership of `owned_message` (frees it if the queue append fails).
+// Callers that already hold a heap copy use this to avoid a second full
+// duplicate on the per-message hot path.
+fn enqueueOwnedHostMessage(webview_id: u32, owned_message: [:0]u8) void {
     pending_host_messages_mutex.lockUncancelable(coreIo());
     defer pending_host_messages_mutex.unlock(coreIo());
 
@@ -934,7 +970,7 @@ fn closeAndClearWebviewSocketHandle(webview_id: u32) void {
     }
 }
 
-fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t) bool {
+fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t, binary: bool) bool {
     var handle_to_close: ?std.posix.socket_t = null;
 
     webview_registry_mutex.lockUncancelable(coreIo());
@@ -948,6 +984,7 @@ fn attachWebviewSocketHandle(webview_id: u32, handle: std.posix.socket_t) bool {
         }
     }
     state.socket_handle = handle;
+    state.binary_transport = binary;
     state.transport_ready = false;
     webview_registry_mutex.unlock(coreIo());
 
@@ -963,6 +1000,7 @@ const WebviewTransportContext = struct {
     socket_handle: ?std.posix.socket_t,
     transport_ready: bool,
     plaintext_transport: bool,
+    binary_transport: bool,
 };
 
 fn lookupWebviewTransportContext(webview_id: u32) ?WebviewTransportContext {
@@ -972,6 +1010,7 @@ fn lookupWebviewTransportContext(webview_id: u32) ?WebviewTransportContext {
         .socket_handle = state.socket_handle,
         .transport_ready = state.transport_ready,
         .plaintext_transport = state.plaintext_transport,
+        .binary_transport = state.binary_transport,
     };
 }
 
@@ -999,13 +1038,6 @@ fn decodeBase64Alloc(input: []const u8) ![]u8 {
     errdefer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, input);
     return decoded;
-}
-
-fn encodeBase64Alloc(input: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(input.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(encoded, input);
-    return encoded;
 }
 
 fn parseRequestHeaderValue(headers: []const u8, header_name: []const u8) ?[]const u8 {
@@ -1223,13 +1255,26 @@ fn writeWebSocketFrame(stream: std.Io.net.Stream, opcode: u8, payload: []const u
         }
     }
 
+    // Send header and payload through one logical write to avoid delayed-ACK
+    // latency, while retaining the current std.Io buffered-stream API.
+    const total = header_len + payload.len;
+    var stack_frame: [4096]u8 = undefined;
+    const frame = if (total <= stack_frame.len) blk: {
+        @memcpy(stack_frame[0..header_len], header[0..header_len]);
+        @memcpy(stack_frame[header_len..total], payload);
+        break :blk stack_frame[0..total];
+    } else blk: {
+        const allocated = try allocator.alloc(u8, total);
+        @memcpy(allocated[0..header_len], header[0..header_len]);
+        @memcpy(allocated[header_len..], payload);
+        break :blk allocated;
+    };
+    defer if (total > stack_frame.len) allocator.free(frame);
+
     var write_buffer: [1024]u8 = undefined;
     var stream_writer = stream.writer(coreIo(), &write_buffer);
     const out = &stream_writer.interface;
-    try out.writeAll(header[0..header_len]);
-    if (payload.len > 0) {
-        try out.writeAll(payload);
-    }
+    try out.writeAll(frame);
     try out.flush();
 }
 
@@ -1335,28 +1380,47 @@ fn enqueueHostTransportSend(webview_id: u32, socket_handle: std.posix.socket_t, 
     return true;
 }
 
-fn encryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
+// Binary transport packet: iv(12) | ciphertext | tag(16). The tag trails the
+// ciphertext because that's SubtleCrypto's native ciphertext||tag layout —
+// the webview side just prepends/strips the iv, no re-packing. Compared to
+// the legacy base64+JSON envelope this saves ~33% wire size and the
+// per-message base64/JSON CPU on both ends (the dominant per-byte cost on a
+// Pi; AES-GCM itself is nearly free on ARMv8 crypto extensions).
+fn encryptHostTransportPacketBinary(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
+    const iv_len = Aes256Gcm.nonce_length;
+    const tag_len = Aes256Gcm.tag_length;
+
+    const packet = try allocator.alloc(u8, iv_len + message_json.len + tag_len);
+    errdefer allocator.free(packet);
+
     var nonce: [Aes256Gcm.nonce_length]u8 = undefined;
     coreIo().random(&nonce);
-
-    const ciphertext = try allocator.alloc(u8, message_json.len);
-    defer allocator.free(ciphertext);
+    @memcpy(packet[0..iv_len], &nonce);
 
     var tag: [Aes256Gcm.tag_length]u8 = undefined;
-    Aes256Gcm.encrypt(ciphertext, &tag, message_json, "", nonce, secret_key);
+    Aes256Gcm.encrypt(packet[iv_len .. iv_len + message_json.len], &tag, message_json, "", nonce, secret_key);
+    @memcpy(packet[iv_len + message_json.len ..], &tag);
 
-    const encrypted_data_b64 = try encodeBase64Alloc(ciphertext);
-    defer allocator.free(encrypted_data_b64);
-    const nonce_b64 = try encodeBase64Alloc(&nonce);
-    defer allocator.free(nonce_b64);
-    const tag_b64 = try encodeBase64Alloc(&tag);
-    defer allocator.free(tag_b64);
+    return packet;
+}
 
-    return try std.json.Stringify.valueAlloc(allocator, .{
-        .encryptedData = encrypted_data_b64,
-        .iv = nonce_b64,
-        .tag = tag_b64,
-    }, .{});
+// Decrypts a binary packet (layout above) into a null-terminated buffer
+// ready for enqueueOwnedHostMessage — no intermediate copies.
+fn decryptHostTransportPacketBinary(packet: []const u8, secret_key: WebviewSecretKey) ![:0]u8 {
+    const iv_len = Aes256Gcm.nonce_length;
+    const tag_len = Aes256Gcm.tag_length;
+    if (packet.len < iv_len + tag_len) return error.InvalidTransportPacket;
+
+    var nonce: [Aes256Gcm.nonce_length]u8 = undefined;
+    @memcpy(&nonce, packet[0..iv_len]);
+    var tag: [Aes256Gcm.tag_length]u8 = undefined;
+    @memcpy(&tag, packet[packet.len - tag_len ..]);
+    const ciphertext = packet[iv_len .. packet.len - tag_len];
+
+    const plaintext = try allocator.allocSentinel(u8, ciphertext.len, 0);
+    errdefer allocator.free(plaintext);
+    try Aes256Gcm.decrypt(plaintext, ciphertext, tag, "", nonce, secret_key);
+    return plaintext;
 }
 
 fn decryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecretKey) ![]u8 {
@@ -1398,6 +1462,15 @@ fn decryptHostTransportPacket(message_json: []const u8, secret_key: WebviewSecre
     return plaintext;
 }
 
+fn finishHostTransportDispatch(webview_id: u32, context: WebviewTransportContext, owned_plaintext: [:0]u8) void {
+    if (!context.transport_ready) {
+        if (context.socket_handle) |socket_handle| {
+            markWebviewTransportReady(webview_id, socket_handle);
+        }
+    }
+    enqueueOwnedHostMessage(webview_id, owned_plaintext);
+}
+
 fn isPlaintextHostTransportPacket(message_json: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, message_json, .{}) catch return false;
     defer parsed.deinit();
@@ -1412,16 +1485,24 @@ fn isPlaintextHostTransportPacket(message_json: []const u8) bool {
 }
 
 fn enqueueHostTransportPlaintext(webview_id: u32, context: WebviewTransportContext, plaintext: []const u8) void {
-    if (context.socket_handle) |socket_handle| {
-        markWebviewTransportReady(webview_id, socket_handle);
-    }
-
     const message_z = allocator.dupeSentinel(u8, plaintext, 0) catch return;
-    defer allocator.free(message_z);
-
-    enqueuePendingHostMessage(webview_id, message_z.ptr);
+    finishHostTransportDispatch(webview_id, context, message_z);
 }
 
+fn dispatchHostTransportMessageBinary(webview_id: u32, packet: []const u8) void {
+    incrementHostTransportDebug("frames_dispatched");
+    const context = lookupWebviewTransportContext(webview_id) orelse return;
+
+    const plaintext = decryptHostTransportPacketBinary(packet, context.secret_key) catch {
+        incrementHostTransportDebug("decrypt_errors");
+        return;
+    };
+    incrementHostTransportDebug("decrypt_ok");
+    finishHostTransportDispatch(webview_id, context, plaintext);
+}
+
+// Legacy base64+JSON envelope (text WS frames, opcode 0x1). Plaintext mode
+// also uses text frames, guarded by an RPC-packet shape check.
 fn dispatchHostTransportMessage(webview_id: u32, encrypted_packet: []const u8) void {
     incrementHostTransportDebug("frames_dispatched");
     const context = lookupWebviewTransportContext(webview_id) orelse return;
@@ -1439,10 +1520,49 @@ fn dispatchHostTransportMessage(webview_id: u32, encrypted_packet: []const u8) v
     enqueueHostTransportPlaintext(webview_id, context, plaintext);
 }
 
+fn targetRequestsBinary(target: []const u8) bool {
+    const query = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    var fields = std.mem.splitScalar(u8, target[query + 1 ..], '&');
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field, "binary=1")) return true;
+    }
+    return false;
+}
+
+fn binaryPacketToText(packet: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const nonce = packet[0..Aes256Gcm.nonce_length];
+    const tag = packet[packet.len - Aes256Gcm.tag_length ..];
+    const ciphertext = packet[Aes256Gcm.nonce_length .. packet.len - Aes256Gcm.tag_length];
+    const data = try allocator.alloc(u8, encoder.calcSize(ciphertext.len));
+    defer allocator.free(data);
+    var iv: [16]u8 = undefined;
+    var tag_base64: [24]u8 = undefined;
+    return std.fmt.allocPrint(allocator,
+        "{{\"encryptedData\":\"{s}\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}",
+        .{ encoder.encode(data, ciphertext), encoder.encode(&iv, nonce), encoder.encode(&tag_base64, tag) });
+}
+
+test "binary transport requires explicit renderer capability" {
+    try std.testing.expect(!targetRequestsBinary("/socket?webviewId=1"));
+    try std.testing.expect(!targetRequestsBinary("/socket?webviewId=1&binary=10"));
+    try std.testing.expect(targetRequestsBinary("/socket?webviewId=1&binary=1"));
+}
+
 fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
     const io = coreIo();
     incrementHostTransportDebug("connections");
     defer stream.close(io);
+
+    // Small request/response frames on loopback — Nagle only adds delayed-ACK
+    // latency here (up to ~40ms per RPC round-trip). TCP_NODELAY == 1 and
+    // IPPROTO_TCP == 6 on every platform we build core for.
+    std.posix.setsockopt(
+        stream.socket.handle,
+        6, // IPPROTO_TCP
+        1, // TCP_NODELAY
+        &std.mem.toBytes(@as(c_int, 1)),
+    ) catch {};
 
     var read_buffer: [16 * 1024]u8 = undefined;
     var write_buffer: [1024]u8 = undefined;
@@ -1469,9 +1589,13 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
 
     writeWebSocketHandshake(out, websocket_key) catch return;
 
-    if (!attachWebviewSocketHandle(webview_id, stream.socket.handle)) {
+    if (!attachWebviewSocketHandle(webview_id, stream.socket.handle, targetRequestsBinary(request.head.target))) {
         return;
     }
+
+    // The browser installs its listener when the WebSocket handshake completes,
+    // so host-to-webview frames are ready before the first inbound message.
+    markWebviewTransportReady(webview_id, stream.socket.handle);
 
     // Any bytes the client sent after the HTTP head remain buffered in `in`,
     // so WebSocket frames are read from the same reader.
@@ -1485,6 +1609,7 @@ fn handleHostTransportConnection(stream: std.Io.net.Stream) void {
 
         switch (frame.opcode) {
             0x1 => dispatchHostTransportMessage(webview_id, frame.payload),
+            0x2 => dispatchHostTransportMessageBinary(webview_id, frame.payload),
             0x8 => {
                 writeWebSocketFrameSerialized(stream, 0x8, "") catch {};
                 break;
@@ -1600,23 +1725,39 @@ fn buildElectrobunPreload(
     window_id: u32,
     secret_key: [*:0]const u8,
     sandbox: bool,
+    title_bar_style: TitleBarStyle,
+    partition_identifier: [*:0]const u8,
 ) ?[:0]u8 {
     if (!ensureWebviewRuntimeConfigured()) {
         return null;
     }
 
-    if (sandbox) {
+    const partition = std.mem.span(partition_identifier);
+    const uses_composited_chrome = std.mem.eql(u8, partition, "__electrobun_content_with_chrome__");
+    const is_internal_chrome = webview_runtime_state.is_linux_embedded and
+        std.mem.eql(u8, partition, "__electrobun_chrome__");
+
+    // The trusted framework view retains its dedicated native action bridge.
+    // Its preload needs neither app RPC nor the legacy inline chrome injector.
+    if (sandbox or is_internal_chrome) {
         const sandboxed_preload_script = webview_runtime_state.preload_script_sandboxed.?;
         return allocPrintZ(
             allocator,
             \\window.__electrobunPlatform = "{s}";
             \\window.__electrobunWebviewId = {d};
             \\window.__electrobunWindowId = {d};
+            \\window.__electrobunCompositedChrome = {};
             \\window.__electrobunEventBridge = window.__electrobunEventBridge || window.webkit?.messageHandlers?.eventBridge || window.eventBridge || window.chrome?.webview?.hostObjects?.eventBridge;
             \\window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
             \\{s}
         ,
-            .{ @tagName(builtin.os.tag), webview_id, window_id, sandboxed_preload_script },
+            .{
+                @tagName(builtin.os.tag),
+                webview_id,
+                window_id,
+                uses_composited_chrome,
+                sandboxed_preload_script,
+            },
         ) catch |err| {
             setLastError("Failed to build sandboxed preload script: {s}", .{@errorName(err)});
             return null;
@@ -1636,6 +1777,9 @@ fn buildElectrobunPreload(
         \\window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
         \\window.__electrobunHostBridge = window.__electrobunHostBridge || window.__electrobunBunBridge || window.webkit?.messageHandlers?.hostBridge || window.webkit?.messageHandlers?.bunBridge || window.hostBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.hostBridge || window.chrome?.webview?.hostObjects?.bunBridge;
         \\window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
+        \\window.__electrobunTitleBarStyle = "{s}";
+        \\window.__electrobunAutoInjectChrome = {};
+        \\window.__electrobunCompositedChrome = {};
         \\{s}
     ,
         .{
@@ -1645,6 +1789,11 @@ fn buildElectrobunPreload(
             webview_runtime_state.rpc_port,
             webview_runtime_state.rpc_port,
             std.mem.span(secret_key),
+            titleBarStyleName(title_bar_style),
+            webview_runtime_state.is_linux_embedded and
+                title_bar_style == .default and
+                !uses_composited_chrome,
+            uses_composited_chrome,
             preload_script,
         },
     ) catch |err| {
@@ -1658,9 +1807,21 @@ export fn configureWebviewRuntime(
     preload_script: [*:0]const u8,
     preload_script_sandboxed: [*:0]const u8,
 ) bool {
+    return configureWebviewRuntimeV2(rpc_port, preload_script, preload_script_sandboxed, false);
+}
+
+// Preserve the published ABI used by the native-language SDKs. New optional
+// capabilities must never add arguments to an existing C entrypoint.
+export fn configureWebviewRuntimeV2(
+    rpc_port: u32,
+    preload_script: [*:0]const u8,
+    preload_script_sandboxed: [*:0]const u8,
+    is_linux_embedded: bool,
+) bool {
     clearLastError();
 
     webview_runtime_state.rpc_port = rpc_port;
+    webview_runtime_state.is_linux_embedded = is_linux_embedded;
 
     if (!replaceOptionalOwnedZ(&webview_runtime_state.preload_script, preload_script)) {
         return false;
@@ -1746,15 +1907,41 @@ fn ensureNativeWrapperLoaded() bool {
     return true;
 }
 
+fn NativeSymbolCache(comptime name: [:0]const u8) type {
+    return struct {
+        // Capture the name in the type itself. Otherwise Zig can intern the
+        // identical anonymous structs for different symbols of the same type.
+        const symbol_name = name;
+        var address = std.atomic.Value(usize).init(0);
+    };
+}
+
+test "native symbol caches are distinct even for identical function signatures" {
+    const Flags = NativeSymbolCache("setNextWebviewFlags");
+    const Protocols = NativeSymbolCache("setNextWebviewAllowedProtocols");
+    try std.testing.expect(Flags != Protocols);
+    Flags.address.store(42, .release);
+    defer Flags.address.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 0), Protocols.address.load(.acquire));
+}
+
 fn lookupNativeSymbol(comptime T: type, comptime name: [:0]const u8) ?T {
     if (!ensureNativeWrapperLoaded()) {
         return null;
     }
 
-    return native_wrapper_state.lib.lookup(T, name) orelse {
+    const Cache = NativeSymbolCache(name);
+    const cached = Cache.address.load(.acquire);
+    if (cached != 0) {
+        return @ptrFromInt(cached);
+    }
+
+    const resolved = native_wrapper_state.lib.lookup(T, name) orelse {
         setLastError("Native wrapper is missing {s}", .{name});
         return null;
     };
+    Cache.address.store(@intFromPtr(resolved), .release);
+    return resolved;
 }
 
 // Platform-specific wrapper capabilities are optional so adding one does not
@@ -2144,7 +2331,7 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         null;
     defer if (rules_json) |allocated| allocator.free(allocated);
 
-    const webview_id = createWebview(
+    const webview_id = createWebviewV2(
         window_id,
         host_webview_id,
         renderer_z.ptr,
@@ -2167,6 +2354,7 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         transparent,
         passthrough,
         spell_check,
+        "trusted",
     );
 
     if (webview_id == 0) {
@@ -2833,6 +3021,9 @@ export fn createWindow(
     window_registry.put(window_id, .{
         .ptr = null,
         .transparent = transparent,
+        .title_bar_style = parseTitleBarStyle(title_bar_style),
+        .frame_x = @intFromFloat(x),
+        .frame_y = @intFromFloat(y),
         .close_handler = close_handler,
         .should_close_handler = should_close_handler,
         .move_handler = move_handler,
@@ -3154,6 +3345,38 @@ export fn createWebview(
     navigation_callback: ?DecideNavigationHandler,
     webview_event_handler: ?WebviewEventHandler,
     event_bridge_handler: ?WebviewPostMessageHandler,
+    host_bridge_handler: ?WebviewPostMessageHandler,
+    internal_bridge_handler: ?WebviewPostMessageHandler,
+    secret_key: [*:0]const u8,
+    custom_preload_script: [*:0]const u8,
+    views_root: [*:0]const u8,
+    sandbox: bool,
+    start_transparent: bool,
+    start_passthrough: bool,
+    spell_check: bool,
+) u32 {
+    return createWebviewV2(window_id, host_webview_id, renderer, url,
+        x, y, width, height, auto_resize, partition_identifier,
+        navigation_callback, webview_event_handler, event_bridge_handler,
+        host_bridge_handler, internal_bridge_handler, secret_key,
+        custom_preload_script, views_root, sandbox, start_transparent,
+        start_passthrough, spell_check, if (sandbox) "untrusted" else "trusted");
+}
+
+export fn createWebviewV2(
+    window_id: u32,
+    host_webview_id: u32,
+    renderer: [*:0]const u8,
+    url: [*:0]const u8,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    auto_resize: bool,
+    partition_identifier: [*:0]const u8,
+    navigation_callback: ?DecideNavigationHandler,
+    webview_event_handler: ?WebviewEventHandler,
+    event_bridge_handler: ?WebviewPostMessageHandler,
     _host_bridge_handler: ?WebviewPostMessageHandler,
     _internal_bridge_handler: ?WebviewPostMessageHandler,
     secret_key: [*:0]const u8,
@@ -3163,6 +3386,7 @@ export fn createWebview(
     start_transparent: bool,
     start_passthrough: bool,
     spell_check: bool,
+    trust: [*:0]const u8,
 ) u32 {
     clearLastError();
     _ = _host_bridge_handler;
@@ -3173,6 +3397,8 @@ export fn createWebview(
     );
 
     const SetNextWebviewFlagsFn = *const fn (bool, bool) callconv(.c) void;
+    const SetNextWebviewTrustFn = *const fn ([*:0]const u8) callconv(.c) void;
+    const SetNextWebviewWindowFrameFn = *const fn (i32, i32) callconv(.c) void;
     const InitWebviewFn = *const fn (
         u32,
         WindowPtr,
@@ -3205,6 +3431,11 @@ export fn createWebview(
         return 0;
     };
     const set_next_webview_flags = lookupNativeSymbol(SetNextWebviewFlagsFn, "setNextWebviewFlags") orelse return 0;
+    const set_next_webview_trust = lookupNativeSymbol(SetNextWebviewTrustFn, "setNextWebviewTrust") orelse return 0;
+    const set_next_webview_window_frame = lookupNativeSymbol(
+        SetNextWebviewWindowFrameFn,
+        "setNextWebviewWindowFrame",
+    ) orelse return 0;
     const init_webview = lookupNativeSymbol(InitWebviewFn, "initWebview") orelse return 0;
     const parsed_secret_key = parseWebviewSecretKey(secret_key) orelse return 0;
 
@@ -3253,6 +3484,8 @@ export fn createWebview(
         window_id,
         secret_key,
         sandbox,
+        window_state.title_bar_style,
+        partition_identifier,
     ) orelse {
         webview_registry_mutex.lockUncancelable(coreIo());
         _ = webview_registry.remove(webview_id);
@@ -3262,6 +3495,8 @@ export fn createWebview(
     defer allocator.free(electrobun_preload_script);
 
     set_next_webview_flags(start_transparent, start_passthrough);
+    set_next_webview_trust(trust);
+    set_next_webview_window_frame(window_state.frame_x, window_state.frame_y);
 
     const webview_ptr = init_webview(
         webview_id,
@@ -3580,12 +3815,20 @@ export fn sendHostMessageToWebviewViaTransport(webview_id: u32, message_json: [*
         return enqueueHostTransportSend(webview_id, socket_handle, 0x1, plaintext_packet);
     }
 
-    const encrypted_packet = encryptHostTransportPacket(std.mem.span(message_json), context.secret_key) catch |err| {
+    const encrypted_packet = encryptHostTransportPacketBinary(std.mem.span(message_json), context.secret_key) catch |err| {
         setLastError("Failed to encrypt host transport packet: {s}", .{@errorName(err)});
         return false;
     };
 
-    return enqueueHostTransportSend(webview_id, socket_handle, 0x1, encrypted_packet);
+    if (context.binary_transport) {
+        return enqueueHostTransportSend(webview_id, socket_handle, 0x2, encrypted_packet);
+    }
+    defer allocator.free(encrypted_packet);
+    const text_packet = binaryPacketToText(encrypted_packet) catch |err| {
+        setLastError("Failed to encode legacy host transport packet: {s}", .{@errorName(err)});
+        return false;
+    };
+    return enqueueHostTransportSend(webview_id, socket_handle, 0x1, text_packet);
 }
 
 export fn sendPreEncryptedHostMessageToWebviewViaTransport(
@@ -4585,4 +4828,44 @@ test "contended asynchronous callbacks release their owned payloads" {
     try std.testing.expect(!Callbacks.failed.load(.monotonic));
     try std.testing.expectEqual(40_000, Callbacks.received.load(.monotonic));
     try std.testing.expectEqual(0, pending_runtime_callback_payloads.count());
+}
+
+test "embedded framework chrome omits app RPC while content retains it" {
+    const previous = webview_runtime_state;
+    defer webview_runtime_state = previous;
+    const full = try allocator.dupeSentinel(u8, "FULL_RPC_PRELOAD", 0);
+    defer allocator.free(full);
+    const events = try allocator.dupeSentinel(u8, "EVENT_ONLY_PRELOAD", 0);
+    defer allocator.free(events);
+    webview_runtime_state = .{
+        .preload_script = full,
+        .preload_script_sandboxed = events,
+        .configured = true,
+        .is_linux_embedded = true,
+    };
+
+    const chrome = buildElectrobunPreload(1, 1, "1,2,3", false, .default, "__electrobun_chrome__") orelse return error.MissingPreload;
+    defer allocator.free(chrome);
+    try std.testing.expect(std.mem.indexOf(u8, chrome, "EVENT_ONLY_PRELOAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chrome, "FULL_RPC_PRELOAD") == null);
+    try std.testing.expect(std.mem.indexOf(u8, chrome, "__electrobunAutoInjectChrome") == null);
+    try std.testing.expect(std.mem.indexOf(u8, chrome, "__electrobunSecretKeyBytes") == null);
+
+    const content = buildElectrobunPreload(2, 1, "1,2,3", false, .default, "__electrobun_content_with_chrome__") orelse return error.MissingPreload;
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "FULL_RPC_PRELOAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "__electrobunAutoInjectChrome = false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "__electrobunCompositedChrome = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "__electrobunSecretKeyBytes") != null);
+
+    const sandboxed = buildElectrobunPreload(3, 1, "1,2,3", true, .default, "") orelse return error.MissingPreload;
+    defer allocator.free(sandboxed);
+    try std.testing.expect(std.mem.indexOf(u8, sandboxed, "EVENT_ONLY_PRELOAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sandboxed, "__electrobunSecretKeyBytes") == null);
+
+    webview_runtime_state.is_linux_embedded = false;
+    const desktop = buildElectrobunPreload(4, 1, "1,2,3", false, .default, "__electrobun_chrome__") orelse return error.MissingPreload;
+    defer allocator.free(desktop);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "FULL_RPC_PRELOAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "__electrobunAutoInjectChrome = false") != null);
 }
